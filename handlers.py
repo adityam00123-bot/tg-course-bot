@@ -1800,6 +1800,37 @@ def register_handlers(bot: Client) -> None:
             await query.message.edit_text(text, reply_markup=kb, parse_mode=enums.ParseMode.HTML)
 
         # ---------------- Output Format & Auto-Unpack Toggles ----------------
+        
+        # ---------------- Clean Old Watermark Actions ----------------
+        elif data == "sub_clean_wm":
+            text = build_clean_wm_menu_text(engine)
+            kb = build_clean_wm_keyboard(engine)
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=enums.ParseMode.HTML)
+
+        elif data == "clean_wm_toggle":
+            engine.config.clean_old_watermark = not engine.config.clean_old_watermark
+            status = "ENABLED ✅" if engine.config.clean_old_watermark else "DISABLED ❌"
+            await query.answer(f"Old Watermark Cleaner: {status}")
+            text = build_clean_wm_menu_text(engine)
+            kb = build_clean_wm_keyboard(engine)
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=enums.ParseMode.HTML)
+
+        elif data == "clean_wm_cycle_pos":
+            positions = ["bottom_right", "top_right", "bottom_left", "top_left"]
+            cur_idx = positions.index(engine.config.clean_wm_position) if engine.config.clean_wm_position in positions else 0
+            engine.config.clean_wm_position = positions[(cur_idx + 1) % len(positions)]
+            await query.answer(f"Position: {engine.config.clean_wm_position}")
+            text = build_clean_wm_menu_text(engine)
+            kb = build_clean_wm_keyboard(engine)
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=enums.ParseMode.HTML)
+
+        elif data == "clean_wm_cycle_style":
+            engine.config.clean_wm_style = "brand_cover" if engine.config.clean_wm_style == "delogo" else "delogo"
+            await query.answer(f"Style: {engine.config.clean_wm_style}")
+            text = build_clean_wm_menu_text(engine)
+            kb = build_clean_wm_keyboard(engine)
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=enums.ParseMode.HTML)
+
         elif data == "opt_toggle_format":
             new_fmt = engine.toggle_output_format()
             fmt_str = "🎬 Streamable Video" if new_fmt == OutputFormat.VIDEO else "📁 Document File"

@@ -203,3 +203,52 @@ async def remux_to_streamable_mp4(input_path: Union[str, Path], output_path: Uni
         logger.debug(f"Remux failed, falling back to original: {e}")
 
     return str(input_path)
+
+
+async def remove_or_mask_watermark(
+    input_path: Union[str, Path],
+    output_path: Union[str, Path],
+    position: str = "bottom_right",
+    style: str = "delogo",
+    brand_text: str = "@CourseVerseHere"
+) -> str:
+    ffmpeg_bin = get_ffmpeg_cmd()
+    if not ffmpeg_bin:
+        return str(input_path)
+
+    in_p = Path(input_path).resolve()
+    out_p = Path(output_path).resolve().with_suffix(".mp4")
+
+    pos_coords = {
+        "bottom_right": "x=main_w-260:y=main_h-90:w=250:h=80",
+        "top_right": "x=main_w-260:y=10:w=250:h=80",
+        "bottom_left": "x=10:y=main_h-90:w=250:h=80",
+        "top_left": "x=10:y=10:w=250:h=80"
+    }
+    box_coords = pos_coords.get(position, pos_coords["bottom_right"])
+
+    if style == "delogo":
+        vf_filter = f"delogo={box_coords}:show=0"
+    else:
+        safe_brand = brand_text.replace(":", "\\:").replace("'", "\\'")
+        bx, by = ("W-tw-30", "H-th-30") if position == "bottom_right" else ("30", "30")
+        vf_filter = f"drawtext=text='{safe_brand}':fontsize=22:fontcolor=white:box=1:boxcolor=black@0.90:boxborderw=10:x={bx}:y={by}"
+
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-i", str(in_p),
+        "-vf", vf_filter,
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "23",
+        "-c:a", "copy",
+        str(out_p)
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await proc.wait()
+        if out_p.exists() and out_p.stat().st_size > 0:
+            return str(out_p)
+    except Exception:
+        pass
+    return str(input_path)

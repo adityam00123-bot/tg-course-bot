@@ -40,6 +40,7 @@ from utils import (
     format_progress_bar
 )
 from watermark import (
+    remove_or_mask_watermark,
     apply_video_watermark,
     extract_video_thumbnail,
     remux_to_streamable_mp4,
@@ -151,6 +152,9 @@ class MigrationConfig:
     enable_custom_thumbnail: bool = False
     strip_existing_thumbnail: bool = False
     enable_watermark: bool = False
+    clean_old_watermark: bool = False
+    clean_wm_position: str = 'bottom_right'
+    clean_wm_style: str = 'delogo'
     custom_thumbnail_path: Optional[str] = None
     watermark_text: str = ""
     watermark_mode: str = "moving"
