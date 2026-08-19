@@ -1,0 +1,6 @@
+﻿downloads/
+*.zip
+.venv/
+__pycache__/
+*.log
+*.temp
