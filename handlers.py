@@ -38,6 +38,7 @@ from client import (
     logout_user
 )
 from migration import (
+    OutputFormat,
     MigrationEngine,
     MigrationMode,
     CaptionMode,
