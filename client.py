@@ -139,6 +139,10 @@ def create_userbot_client(user_id: int = Config.OWNER_ID) -> Client:
     )
 
 
+# Profile cache per user ID to prevent Telegram GetFullUser flood waits: {user_id: Dict[str, Any]}
+USER_PROFILE_CACHE: Dict[int, Dict[str, Any]] = {}
+
+
 async def get_or_create_user_client(user_id: int) -> Optional[Client]:
     """Retrieve an active Userbot Client for user_id or load from disk if session exists."""
     global USER_CLIENTS
@@ -150,11 +154,6 @@ async def get_or_create_user_client(user_id: int) -> Optional[Client]:
                 await cl.connect()
             except Exception as e:
                 logger.debug(f"Could not connect existing client for user {user_id}: {e}")
-        if not getattr(cl, "me", None):
-            try:
-                cl.me = await cl.get_me()
-            except Exception:
-                pass
         return cl
 
     sess_path = get_user_session_path(user_id)
@@ -165,9 +164,11 @@ async def get_or_create_user_client(user_id: int) -> Optional[Client]:
         cl = create_userbot_client(user_id)
         if not cl.is_connected:
             await cl.connect()
-        me = await cl.get_me()
+        me = getattr(cl, "_cached_me", None)
+        if not me:
+            me = await cl.get_me()
+            cl._cached_me = me
         if me:
-            cl.me = me
             USER_CLIENTS[user_id] = cl
             logger.info(f"Loaded active userbot session for user {user_id} (@{me.username or me.id})")
             return cl
@@ -183,15 +184,22 @@ async def is_user_logged_in(user_id: int) -> bool:
     return cl is not None
 
 
-async def get_user_profile(user_id: int) -> Dict[str, Any]:
-    """Inspects the user's specific Userbot client to retrieve profile details."""
+async def get_user_profile(user_id: int, force_refresh: bool = False) -> Dict[str, Any]:
+    """Inspects the user's specific Userbot client to retrieve profile details (cached)."""
+    global USER_PROFILE_CACHE
+    if not force_refresh and user_id in USER_PROFILE_CACHE:
+        return USER_PROFILE_CACHE[user_id]
+
     try:
         cl = await get_or_create_user_client(user_id)
         if cl:
-            me = await cl.get_me()
+            me = getattr(cl, "_cached_me", None)
+            if not me or force_refresh:
+                me = await cl.get_me()
+                cl._cached_me = me
             if me:
                 name = f"{me.first_name or ''} {me.last_name or ''}".strip()
-                return {
+                profile = {
                     "is_logged_in": True,
                     "id": me.id,
                     "name": name or "Telegram User",
@@ -199,10 +207,12 @@ async def get_user_profile(user_id: int) -> Dict[str, Any]:
                     "is_premium": getattr(me, "is_premium", False),
                     "phone": getattr(me, "phone_number", "Hidden")
                 }
+                USER_PROFILE_CACHE[user_id] = profile
+                return profile
     except Exception as e:
         logger.debug(f"User {user_id} userbot not authorized: {e}")
 
-    return {
+    profile = {
         "is_logged_in": False,
         "id": 0,
         "name": "Not Logged In",
@@ -210,6 +220,8 @@ async def get_user_profile(user_id: int) -> Dict[str, Any]:
         "is_premium": False,
         "phone": "None"
     }
+    USER_PROFILE_CACHE[user_id] = profile
+    return profile
 
 
 async def send_user_login_code(user_id: int, phone_number: str) -> Dict[str, Any]:
@@ -325,6 +337,7 @@ async def logout_user(user_id: int) -> bool:
             sess_path.unlink()
 
         USER_CACHED_CHANNELS.pop(user_id, None)
+        USER_PROFILE_CACHE.pop(user_id, None)
         from database import save_or_update_user
         save_or_update_user(user_id=user_id, name="", is_logged_in=False)
         return True

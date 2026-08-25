@@ -142,8 +142,10 @@ async def apply_video_watermark(
         "-i", str(in_p),
         "-vf", filter_str,
         "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "24",
+        "-preset", "veryfast",
+        "-crf", "26",
+        "-pix_fmt", "yuv420p",
+        "-threads", "0",
         "-c:a", "copy",
         "-f", "mp4",
         str(out_p)
@@ -239,8 +241,10 @@ async def remove_or_mask_watermark(
         "-i", str(in_p),
         "-vf", vf_filter,
         "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "23",
+        "-preset", "veryfast",
+        "-crf", "26",
+        "-pix_fmt", "yuv420p",
+        "-threads", "0",
         "-c:a", "copy",
         str(out_p)
     ]

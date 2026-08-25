@@ -148,7 +148,7 @@ class MigrationConfig:
     start_msg_id: Optional[int] = None
     end_msg_id: Optional[int] = None
     output_format: OutputFormat = OutputFormat.VIDEO
-    auto_extract_zip: bool = True
+    auto_extract_zip: bool = False
     enable_custom_thumbnail: bool = False
     strip_existing_thumbnail: bool = False
     enable_watermark: bool = False
@@ -156,7 +156,7 @@ class MigrationConfig:
     clean_wm_position: str = 'bottom_right'
     clean_wm_style: str = 'delogo'
     custom_thumbnail_path: Optional[str] = None
-    watermark_text: str = ""
+    watermark_text: str = "@CourseVerseHere"
     watermark_mode: str = "moving"
     caption_mode: CaptionMode = CaptionMode.OFF
     custom_caption_text: str = ""
@@ -237,14 +237,22 @@ class MigrationEngine:
         self.deletion_cancel_event = asyncio.Event()
         self._deletion_task: Optional[asyncio.Task] = None
 
-        # Pre-set default branding for Master Owner only
-        if self.owner_id == Config.OWNER_ID:
+        # Cache resolved peers across MTProto operations
+        self._resolved_peers: Dict[Union[int, str], Any] = {}
+
+        # Initialize default watermark & branding strictly from Config / filesystem (disabled by default for max throughput)
+        self.config.enable_watermark = Config.ENABLE_WATERMARK
+        self.config.watermark_text = Config.WATERMARK_TEXT or "@CourseVerseHere"
+        self.config.watermark_mode = Config.WATERMARK_MODE or "moving"
+        if Config.CUSTOM_THUMBNAIL_PATH and os.path.exists(Config.CUSTOM_THUMBNAIL_PATH):
+            self.config.custom_thumbnail_path = Config.CUSTOM_THUMBNAIL_PATH
+            self.config.enable_custom_thumbnail = True
+        else:
             thumb_path = Config.BASE_DIR / "thumb.jpg"
-            if thumb_path.exists():
+            if thumb_path.exists() and self.owner_id == Config.OWNER_ID:
                 self.config.custom_thumbnail_path = str(thumb_path)
-                self.config.enable_custom_thumbnail = True
-            self.config.watermark_text = "@CourseVerseHere"
-            self.config.enable_watermark = True
+                # Keep custom thumbnail False by default unless toggled in UI
+                self.config.enable_custom_thumbnail = False
 
         if self.userbot:
             install_fast_uploader(self.userbot, max_workers=Config.MAX_UPLOAD_WORKERS)
@@ -382,11 +390,6 @@ class MigrationEngine:
             self.userbot = await get_or_create_user_client(self.owner_id)
             if not self.userbot:
                 raise ValueError("⚠️ Userbot session is not active! Please log in using /settings or tap 'Login with Phone Number'.")
-            if not getattr(self.userbot, "me", None):
-                try:
-                    self.userbot.me = await self.userbot.get_me()
-                except Exception:
-                    pass
             install_fast_uploader(self.userbot, max_workers=Config.MAX_UPLOAD_WORKERS)
 
         self.cancel_event.clear()
@@ -400,6 +403,12 @@ class MigrationEngine:
 
     # Alias for start_migration
     start_job = start_migration
+
+    async def _resolve_peer_cached(self, chat_id: Union[int, str]) -> Any:
+        """Cache MTProto peer resolution in memory to prevent flood-waits."""
+        if chat_id not in self._resolved_peers:
+            self._resolved_peers[chat_id] = await self.client.resolve_peer(chat_id)
+        return self._resolved_peers[chat_id]
 
     async def _execute_with_flood_retry(self, coro_fn: Callable, *args, **kwargs) -> Any:
         """
@@ -441,6 +450,9 @@ class MigrationEngine:
 
             except (RPCError, TimeoutError, ConnectionError) as e:
                 err_str = str(e).upper()
+                if "MESSAGE_NOT_MODIFIED" in err_str:
+                    return None
+
                 non_retryable = [
                     "MESSAGE_ID_INVALID",
                     "MESSAGE_EMPTY",
@@ -450,7 +462,8 @@ class MigrationEngine:
                     "USER_BANNED_IN_CHANNEL",
                     "CHANNEL_PRIVATE",
                     "PEER_ID_INVALID",
-                    "FILE_REFERENCE_EXPIRED"
+                    "FILE_REFERENCE_EXPIRED",
+                    "MESSAGE_NOT_MODIFIED"
                 ]
                 if any(nr in err_str for nr in non_retryable):
                     raise
@@ -552,8 +565,8 @@ class MigrationEngine:
         Completely strips the 'Forwarded from...' tag, making it appear as a 100% native post.
         """
         try:
-            peer_to = await self.client.resolve_peer(dest_chat)
-            peer_from = await self.client.resolve_peer(source_chat)
+            peer_to = await self._resolve_peer_cached(dest_chat)
+            peer_from = await self._resolve_peer_cached(source_chat)
 
             await self.client.invoke(
                 raw.functions.messages.ForwardMessages(
@@ -789,12 +802,6 @@ class MigrationEngine:
         extra_temp_files: List[Path] = []
         caption, caption_entities = self._apply_caption(msg.caption, msg.caption_entities)
 
-        if not getattr(self.client, "me", None):
-            try:
-                self.client.me = await self.client.get_me()
-            except Exception as me_err:
-                logger.debug(f"Could not fetch client.me: {me_err}")
-
         try:
             file_bytes = local_file_path.stat().st_size
             self.stats.total_bytes_migrated += file_bytes
@@ -805,12 +812,25 @@ class MigrationEngine:
             if msg.video or (is_doc_video and self.config.output_format == OutputFormat.VIDEO):
                 thumb_path = None
 
+                # A0. Clean/Mask old watermark if enabled
+                if self.config.clean_old_watermark:
+                    cleaned_path = local_file_path.with_name(f"cleaned_{local_file_path.name}")
+                    extra_temp_files.append(cleaned_path)
+                    clean_res = await remove_or_mask_watermark(
+                        input_path=Path(upload_video_path),
+                        output_path=cleaned_path,
+                        position=self.config.clean_wm_position,
+                        style=self.config.clean_wm_style
+                    )
+                    if clean_res:
+                        upload_video_path = clean_res
+
                 # A. Apply anti-theft watermark if enabled
                 if self.config.enable_watermark:
                     watermarked_path = local_file_path.with_name(f"wm_{local_file_path.name}")
                     extra_temp_files.append(watermarked_path)
                     upload_video_path = await apply_video_watermark(
-                        input_path=local_file_path,
+                        input_path=Path(upload_video_path),
                         output_path=watermarked_path,
                         watermark_text=self.config.watermark_text,
                         mode=self.config.watermark_mode
@@ -829,7 +849,7 @@ class MigrationEngine:
                     else:
                         thumb_path = None
                 else:
-                    # Download original Telegram thumbnail directly from source
+                    # Download original Telegram thumbnail directly from source if present
                     thumbs = getattr(msg.video, 'thumbs', None) or getattr(msg.document, 'thumbs', None)
                     if thumbs:
                         try:
@@ -844,14 +864,6 @@ class MigrationEngine:
                                 extra_temp_files.append(Path(thumb_path))
                         except Exception as th_err:
                             logger.debug(f"Could not download source thumbnail: {th_err}")
-
-                    # Fallback to FFmpeg thumbnail extraction if source had none
-                    if not thumb_path:
-                        extracted_thumb = local_file_path.with_name(f"thumb_{local_file_path.stem}.jpg")
-                        extra_temp_files.append(extracted_thumb)
-                        thumb_res = await extract_video_thumbnail(upload_video_path, extracted_thumb)
-                        if thumb_res and os.path.exists(thumb_res):
-                            thumb_path = thumb_res
 
                 safe_thumb = thumb_path if (thumb_path and os.path.exists(thumb_path)) else None
 
@@ -1058,7 +1070,7 @@ class MigrationEngine:
                 thumb_path = None
                 if self.config.enable_custom_thumbnail and self.config.custom_thumbnail_path and os.path.exists(self.config.custom_thumbnail_path):
                     thumb_path = str(Path(self.config.custom_thumbnail_path).resolve())
-                else:
+                elif self.config.strip_existing_thumbnail:
                     extracted_thumb = file_path.with_name(f"thumb_{file_path.stem}.jpg")
                     extra_temp_files.append(extracted_thumb)
                     thumb_res = await extract_video_thumbnail(upload_video_path, extracted_thumb)
@@ -1242,6 +1254,7 @@ class MigrationEngine:
             (msg.video or is_doc_video) and (
                 self.config.enable_custom_thumbnail or
                 self.config.enable_watermark or
+                self.config.clean_old_watermark or
                 self.config.strip_existing_thumbnail or
                 (msg.video and self.config.output_format == OutputFormat.FILE) or
                 (is_doc_video and self.config.output_format == OutputFormat.VIDEO)
@@ -1300,6 +1313,13 @@ class MigrationEngine:
             self.config.source_chat_title = source_peer.title or str(source_peer.id)
             self.config.dest_chat_title = dest_peer.title or str(dest_peer.id)
 
+            # Pre-cache resolved MTProto raw peers for rapid forwarding
+            try:
+                await self._resolve_peer_cached(self.config.source_chat_id)
+                await self._resolve_peer_cached(self.config.dest_chat_id)
+            except Exception:
+                pass
+
             # Check for existing checkpoint for auto-resume
             checkpoint_id = load_checkpoint(self.config.source_chat_id, self.config.dest_chat_id)
 
@@ -1347,8 +1367,8 @@ class MigrationEngine:
             # Send immediate initial progress update
             await self._send_progress_update(is_final=False)
 
-            # Streaming batch size
-            chunk_size = 30
+            # Streaming batch size (50 IDs per roundtrip for optimal throughput)
+            chunk_size = 50
             last_progress_count = 0
 
             for i in range(0, len(msg_ids), chunk_size):
