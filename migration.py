@@ -1601,8 +1601,8 @@ class MigrationEngine:
             # Send immediate initial progress update
             await self._send_progress_update(is_final=False)
 
-            # Streaming batch size (50 IDs per roundtrip for optimal throughput)
-            chunk_size = 50
+            # Streaming batch size (reduced to 8 to prevent disk budget deadlocks with large videos)
+            chunk_size = 8
             last_progress_count = 0
 
             # ── Detect pipeline mode ──────────────────────────────────
