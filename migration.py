@@ -235,6 +235,8 @@ class _PipelineSlot:
     disk_bytes: int = 0
     error: Optional[Exception] = None
     ready: asyncio.Event = field(default_factory=asyncio.Event)
+    raw_input_file: Any = None
+    raw_thumb_file: Any = None
 
 
 class MigrationEngine:
@@ -1216,6 +1218,7 @@ class MigrationEngine:
         self,
         slot: _PipelineSlot,
         download_sem: asyncio.Semaphore,
+        upload_sem: asyncio.Semaphore,
         ffmpeg_sem: asyncio.Semaphore,
         disk_state: dict,
         disk_lock: asyncio.Lock,
@@ -1334,7 +1337,48 @@ class MigrationEngine:
                 slot.upload_path = upload_path
                 slot.thumb_path = thumb_path
                 slot.extra_temps = extra_temps
-                logger.info(f"✅ [Pipeline] #{msg.id} ready for upload")
+
+                # --- Stage 3: Concurrent Cloud Pre-Upload (Telegram Server Direct) ---
+                async with upload_sem:
+                    if self.cancel_event.is_set():
+                        return
+                    logger.info(f"🔼 [Pipeline] Pre-uploading #{msg.id} to Telegram Cloud...")
+                    
+                    last_up_log = {"time": 0}
+                    def _cloud_up_prog(current: int, total: int):
+                        now = time.time()
+                        if now - last_up_log["time"] >= 5 or current == total:
+                            last_up_log["time"] = now
+                            pct = (current / total * 100) if total else 0
+                            logger.info(f"🔼 [Cloud Upload #{msg.id}] {current / 1048576:.1f} / {total / 1048576:.1f} MB ({pct:.1f}%)")
+
+                    raw_file = await self.client.save_file(upload_path, progress=_cloud_up_prog)
+                    raw_thumb = None
+                    if thumb_path and os.path.exists(thumb_path):
+                        try:
+                            raw_thumb = await self.client.save_file(thumb_path)
+                        except Exception:
+                            raw_thumb = None
+
+                    slot.raw_input_file = raw_file
+                    slot.raw_thumb_file = raw_thumb
+
+                    if os.path.exists(upload_path):
+                        file_bytes = Path(upload_path).stat().st_size
+                        self.stats.total_bytes_migrated += file_bytes
+
+                # Clean local disk IMMEDIATELY because file is safely stored on Telegram Cloud!
+                if slot.local_path:
+                    cleanup_temp_file(slot.local_path)
+                for p in slot.extra_temps:
+                    cleanup_temp_file(p)
+
+                async with disk_lock:
+                    disk_state["used"] = max(0, disk_state["used"] - slot.disk_bytes)
+                    slot.disk_bytes = 0
+                disk_freed.set()
+
+                logger.info(f"✅ [Pipeline] #{msg.id} uploaded to Cloud & ready for fast-publish")
 
         except asyncio.CancelledError:
             pass
@@ -1344,69 +1388,99 @@ class MigrationEngine:
         finally:
             slot.ready.set()
 
+    async def _send_pre_uploaded_media(
+        self,
+        slot: _PipelineSlot,
+        dest_chat: Union[int, str],
+        caption: Optional[str],
+        caption_entities: Optional[list]
+    ) -> None:
+        """Instantly publishes an already-uploaded InputFileBig/InputFile to the destination channel in <50ms."""
+        peer = await self._resolve_peer_cached(dest_chat)
+        msg = slot.msg
+        doc_name = (getattr(msg.document, "file_name", None) if msg.document else None) or f"{slot.local_path.stem if slot.local_path else 'video'}.mp4"
+
+        # Prepare entities
+        raw_entities = None
+        if caption_entities:
+            try:
+                raw_entities = []
+                for entity in caption_entities:
+                    if hasattr(entity, "write"): raw_entities.append(entity.write())
+                    else: raw_entities.append(entity)
+            except Exception: raw_entities = None
+
+        if self.config.output_format == OutputFormat.VIDEO:
+            v_dur = getattr(msg.video, "duration", 0) or 0
+            v_w = getattr(msg.video, "width", 0) or 0
+            v_h = getattr(msg.video, "height", 0) or 0
+
+            attributes = [
+                raw.types.DocumentAttributeVideo(
+                    duration=v_dur,
+                    w=v_w,
+                    h=v_h,
+                    supports_streaming=True
+                ),
+                raw.types.DocumentAttributeFilename(file_name=doc_name)
+            ]
+            media = raw.types.InputMediaUploadedDocument(
+                file=slot.raw_input_file,
+                thumb=slot.raw_thumb_file,
+                mime_type="video/mp4",
+                attributes=attributes,
+                force_file=False
+            )
+        else:
+            attributes = [raw.types.DocumentAttributeFilename(file_name=doc_name)]
+            media = raw.types.InputMediaUploadedDocument(
+                file=slot.raw_input_file,
+                thumb=slot.raw_thumb_file,
+                mime_type="application/octet-stream",
+                attributes=attributes,
+                force_file=True
+            )
+
+        await self._execute_with_flood_retry(
+            self.client.invoke,
+            raw.functions.messages.SendMedia(
+                peer=peer, media=media, message=caption or "", entities=raw_entities, random_id=self.client.rnd_id()
+            )
+        )
+
     async def _pipeline_upload_slot(self, slot: _PipelineSlot) -> None:
-        """Upload a pre-processed pipeline video to the destination channel."""
+        """Upload a pre-processed pipeline video to the destination channel in strict sequence."""
         msg = slot.msg
         dest_chat = self.config.dest_chat_id
         caption, caption_entities = self._apply_caption(msg.caption, msg.caption_entities)
 
         try:
-            upload_path = slot.upload_path or str(slot.local_path)
-            safe_thumb = slot.thumb_path if (slot.thumb_path and os.path.exists(slot.thumb_path)) else None
-
-            if os.path.exists(upload_path):
-                file_bytes = Path(upload_path).stat().st_size
-                self.stats.total_bytes_migrated += file_bytes
-
-            if self.config.output_format == OutputFormat.VIDEO:
-                v_dur = getattr(msg.video, "duration", 0) or 0
-                v_w = getattr(msg.video, "width", 0) or 0
-                v_h = getattr(msg.video, "height", 0) or 0
-
-                last_up_log = {"time": 0}
-                def _up_prog(current: int, total: int):
-                    now = time.time()
-                    if now - last_up_log["time"] >= 5 or current == total:
-                        last_up_log["time"] = now
-                        pct = (current / total * 100) if total else 0
-                        logger.info(f"🔼 [Upload #{msg.id}] {current / 1048576:.1f} / {total / 1048576:.1f} MB ({pct:.1f}%)")
-
-                await self._execute_with_flood_retry(
-                    self.client.send_video,
-                    chat_id=dest_chat,
-                    video=upload_path,
-                    caption=caption,
-                    caption_entities=caption_entities,
-                    thumb=safe_thumb,
-                    duration=v_dur,
-                    width=v_w,
-                    height=v_h,
-                    supports_streaming=True,
-                    progress=_up_prog
-                )
+            if slot.raw_input_file:
+                await self._send_pre_uploaded_media(slot, dest_chat, caption, caption_entities)
+                self.stats.media_count += 1
+                logger.info(f"⚡ [Pipeline] Fast-Published video #{msg.id} → Dest in ~50ms")
+            else:
+                upload_path = slot.upload_path or str(slot.local_path)
+                safe_thumb = slot.thumb_path if (slot.thumb_path and os.path.exists(slot.thumb_path)) else None
+                if os.path.exists(upload_path):
+                    self.stats.total_bytes_migrated += Path(upload_path).stat().st_size
+                if self.config.output_format == OutputFormat.VIDEO:
+                    v_dur = getattr(msg.video, "duration", 0) or 0
+                    v_w = getattr(msg.video, "width", 0) or 0
+                    v_h = getattr(msg.video, "height", 0) or 0
+                    await self._execute_with_flood_retry(
+                        self.client.send_video, chat_id=dest_chat, video=upload_path, caption=caption, caption_entities=caption_entities, thumb=safe_thumb, duration=v_dur, width=v_w, height=v_h, supports_streaming=True
+                    )
+                else:
+                    doc_name = (getattr(msg.document, "file_name", None) if msg.document else None) or f"{slot.local_path.stem if slot.local_path else 'file'}.mp4"
+                    await self._execute_with_flood_retry(
+                        self.client.send_document, chat_id=dest_chat, document=upload_path, caption=caption, caption_entities=caption_entities, thumb=safe_thumb, file_name=doc_name, force_document=True
+                    )
                 self.stats.media_count += 1
                 logger.info(f"✅ [Pipeline] Uploaded video #{msg.id} → Dest")
-            else:
-                doc_name = (getattr(msg.document, "file_name", None) if msg.document else None) or f"{slot.local_path.stem}.mp4"
-                await self._execute_with_flood_retry(
-                    self.client.send_document,
-                    chat_id=dest_chat,
-                    document=upload_path,
-                    caption=caption,
-                    caption_entities=caption_entities,
-                    thumb=safe_thumb,
-                    file_name=doc_name,
-                    force_document=True,
-                )
-                self.stats.media_count += 1
-                logger.info(f"✅ [Pipeline] Uploaded doc #{msg.id} → Dest")
-
         finally:
-            # Cleanup ALL temp files immediately to reclaim disk
-            if slot.local_path:
-                cleanup_temp_file(slot.local_path)
-            for p in slot.extra_temps:
-                cleanup_temp_file(p)
+            if slot.local_path: cleanup_temp_file(slot.local_path)
+            for p in slot.extra_temps: cleanup_temp_file(p)
 
     async def _migrate_single_message(self, msg: Message) -> None:
         """
@@ -1640,6 +1714,7 @@ class MigrationEngine:
                 cpu_cores = max(1, (os.cpu_count() or 2) - 1)
                 download_sem = asyncio.Semaphore(2)
                 ffmpeg_sem = asyncio.Semaphore(max(1, cpu_cores))
+                upload_sem = asyncio.Semaphore(2)
                 disk_lock = asyncio.Lock()
                 disk_state = {"used": 0}
                 disk_freed = asyncio.Event()
@@ -1690,7 +1765,7 @@ class MigrationEngine:
                                 # Launch the background task exactly when it enters the sliding window
                                 slot.prefetch_task = asyncio.create_task(
                                     self._pipeline_prefetch(
-                                        slot, download_sem, ffmpeg_sem,
+                                        slot, download_sem, ffmpeg_sem, upload_sem,
                                         disk_state, disk_lock, disk_freed,
                                     )
                                 )
