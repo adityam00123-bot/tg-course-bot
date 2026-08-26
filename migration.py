@@ -52,6 +52,18 @@ logger = logging.getLogger("migration_bot.migration")
 
 CHECKPOINT_FILE = Config.BASE_DIR / "migration_progress.json"
 
+# ---------------------------------------------------------------------------
+# Pipeline Helpers
+# ---------------------------------------------------------------------------
+
+def _get_disk_budget(download_dir: Path) -> int:
+    """Returns 60% of available free disk space in bytes for the pipeline buffer."""
+    try:
+        usage = shutil.disk_usage(str(download_dir))
+        return int(usage.free * 0.6)
+    except Exception:
+        return 2 * 1024 * 1024 * 1024  # 2 GB fallback
+
 
 def natural_sort_key(s: str) -> list:
     """Sort strings containing numbers naturally (e.g. 1, 2, 10 instead of 1, 10, 2)."""
@@ -209,6 +221,20 @@ class DeletionStats:
             return 0.0
         end = self.end_time if self.end_time else time.time()
         return max(0.0, end - self.start_time)
+
+
+@dataclass
+class _PipelineSlot:
+    """Tracks one video message through the concurrent download→process→upload pipeline."""
+    seq: int = 0
+    msg: Optional[Message] = None
+    local_path: Optional[Path] = None
+    upload_path: Optional[str] = None
+    thumb_path: Optional[str] = None
+    extra_temps: List[Path] = field(default_factory=list)
+    disk_bytes: int = 0
+    error: Optional[Exception] = None
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class MigrationEngine:
@@ -1151,6 +1177,214 @@ class MigrationEngine:
             for extra_p in extra_temp_files:
                 cleanup_temp_file(extra_p)
 
+    # ===================================================================
+    #   CONCURRENT PIPELINE — Download + Watermark in parallel
+    # ===================================================================
+
+    _VIDEO_EXTS = frozenset([".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts", ".flv", ".m4v", ".3gp"])
+
+    def _msg_needs_pipeline(self, msg: Message) -> bool:
+        """Check if a message requires the concurrent download→process→upload pipeline."""
+        if not msg or not msg.media:
+            return False
+
+        is_doc_video = bool(
+            msg.document and msg.document.file_name and
+            any(msg.document.file_name.lower().endswith(v) for v in self._VIDEO_EXTS)
+        )
+        if not (msg.video or is_doc_video):
+            return False
+
+        return bool(
+            self.config.enable_watermark or
+            self.config.clean_old_watermark or
+            self.config.enable_custom_thumbnail or
+            self.config.strip_existing_thumbnail
+        )
+
+    async def _pipeline_prefetch(
+        self,
+        slot: _PipelineSlot,
+        download_sem: asyncio.Semaphore,
+        ffmpeg_sem: asyncio.Semaphore,
+        disk_state: dict,
+        disk_lock: asyncio.Lock,
+        disk_freed: asyncio.Event,
+    ) -> None:
+        """Background task: download media + apply watermark/thumbnail for one message."""
+        msg = slot.msg
+        try:
+            # --- Estimate disk space needed (original + processed + margin) ---
+            file_size = 0
+            if msg.video:
+                file_size = msg.video.file_size or 0
+            elif msg.document:
+                file_size = msg.document.file_size or 0
+            estimated_need = max(int(file_size * 3), 150 * 1024 * 1024)  # 3× or 150 MB min
+
+            # --- Wait for disk budget ---
+            while True:
+                if self.cancel_event.is_set():
+                    return
+                async with disk_lock:
+                    budget = _get_disk_budget(Config.DOWNLOAD_DIR)
+                    if disk_state["used"] + estimated_need <= budget:
+                        disk_state["used"] += estimated_need
+                        slot.disk_bytes = estimated_need
+                        break
+                # Budget full — wait until an upload frees space
+                disk_freed.clear()
+                try:
+                    await asyncio.wait_for(disk_freed.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass  # Re-check budget (disk may have been freed externally)
+
+            # --- Stage 1: Download ---
+            async with download_sem:
+                if self.cancel_event.is_set():
+                    return
+                logger.info(f"🔽 [Pipeline] Downloading #{msg.id}...")
+                slot.local_path = await self._download_media_to_file(msg)
+
+            if not slot.local_path or not slot.local_path.exists():
+                slot.error = RuntimeError(f"Download failed for #{msg.id}")
+                return
+
+            # --- Stage 2: FFmpeg processing (watermark + thumbnail) ---
+            async with ffmpeg_sem:
+                if self.cancel_event.is_set():
+                    return
+
+                upload_path = str(slot.local_path)
+                extra_temps: List[Path] = []
+
+                # A0. Clean/Mask old watermark
+                if self.config.clean_old_watermark:
+                    cleaned_path = slot.local_path.with_name(f"cleaned_{slot.local_path.name}")
+                    extra_temps.append(cleaned_path)
+                    clean_res = await remove_or_mask_watermark(
+                        input_path=Path(upload_path),
+                        output_path=cleaned_path,
+                        position=self.config.clean_wm_position,
+                        style=self.config.clean_wm_style,
+                    )
+                    if clean_res:
+                        upload_path = clean_res
+
+                # A. Apply anti-theft watermark
+                if self.config.enable_watermark:
+                    wm_path = slot.local_path.with_name(f"wm_{slot.local_path.name}")
+                    extra_temps.append(wm_path)
+                    logger.info(f"🎨 [Pipeline] Watermarking #{msg.id}...")
+                    upload_path = await apply_video_watermark(
+                        input_path=Path(upload_path),
+                        output_path=wm_path,
+                        watermark_text=self.config.watermark_text,
+                        mode=self.config.watermark_mode,
+                    )
+
+                # B. Thumbnail resolution
+                thumb_path = None
+                if (self.config.enable_custom_thumbnail
+                        and self.config.custom_thumbnail_path
+                        and os.path.exists(self.config.custom_thumbnail_path)):
+                    thumb_path = str(Path(self.config.custom_thumbnail_path).resolve())
+                elif self.config.strip_existing_thumbnail:
+                    extracted = slot.local_path.with_name(f"clean_thumb_{slot.local_path.stem}.jpg")
+                    extra_temps.append(extracted)
+                    thumb_res = await extract_video_thumbnail(upload_path, extracted)
+                    if thumb_res and os.path.exists(thumb_res):
+                        thumb_path = str(thumb_res)
+                else:
+                    thumbs = getattr(msg.video, "thumbs", None) or getattr(msg.document, "thumbs", None)
+                    if thumbs:
+                        try:
+                            biggest = thumbs[-1]
+                            tf = await self._execute_with_flood_retry(
+                                self.client.download_media,
+                                message=biggest.file_id,
+                                file_name=str(Config.DOWNLOAD_DIR / f"thumb_{msg.chat.id}_{msg.id}.jpg"),
+                            )
+                            if tf and os.path.exists(tf):
+                                thumb_path = str(tf)
+                                extra_temps.append(Path(thumb_path))
+                        except Exception:
+                            pass
+
+                # C. Remux to streamable MP4 if needed
+                if self.config.output_format == OutputFormat.VIDEO and not upload_path.lower().endswith(".mp4"):
+                    remuxed = slot.local_path.with_name(f"stream_{slot.local_path.stem}.mp4")
+                    extra_temps.append(remuxed)
+                    upload_path = await remux_to_streamable_mp4(upload_path, remuxed)
+
+                slot.upload_path = upload_path
+                slot.thumb_path = thumb_path
+                slot.extra_temps = extra_temps
+                logger.info(f"✅ [Pipeline] #{msg.id} ready for upload")
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            slot.error = e
+            logger.warning(f"[Pipeline] Prefetch error for #{msg.id}: {e}")
+        finally:
+            slot.ready.set()
+
+    async def _pipeline_upload_slot(self, slot: _PipelineSlot) -> None:
+        """Upload a pre-processed pipeline video to the destination channel."""
+        msg = slot.msg
+        dest_chat = self.config.dest_chat_id
+        caption, caption_entities = self._apply_caption(msg.caption, msg.caption_entities)
+
+        try:
+            upload_path = slot.upload_path or str(slot.local_path)
+            safe_thumb = slot.thumb_path if (slot.thumb_path and os.path.exists(slot.thumb_path)) else None
+
+            if os.path.exists(upload_path):
+                file_bytes = Path(upload_path).stat().st_size
+                self.stats.total_bytes_migrated += file_bytes
+
+            if self.config.output_format == OutputFormat.VIDEO:
+                v_dur = getattr(msg.video, "duration", 0) or 0
+                v_w = getattr(msg.video, "width", 0) or 0
+                v_h = getattr(msg.video, "height", 0) or 0
+
+                await self._execute_with_flood_retry(
+                    self.client.send_video,
+                    chat_id=dest_chat,
+                    video=upload_path,
+                    caption=caption,
+                    caption_entities=caption_entities,
+                    thumb=safe_thumb,
+                    duration=v_dur,
+                    width=v_w,
+                    height=v_h,
+                    supports_streaming=True,
+                )
+                self.stats.media_count += 1
+                logger.info(f"✅ [Pipeline] Uploaded video #{msg.id} → Dest")
+            else:
+                doc_name = (getattr(msg.document, "file_name", None) if msg.document else None) or f"{slot.local_path.stem}.mp4"
+                await self._execute_with_flood_retry(
+                    self.client.send_document,
+                    chat_id=dest_chat,
+                    document=upload_path,
+                    caption=caption,
+                    caption_entities=caption_entities,
+                    thumb=safe_thumb,
+                    file_name=doc_name,
+                    force_document=True,
+                )
+                self.stats.media_count += 1
+                logger.info(f"✅ [Pipeline] Uploaded doc #{msg.id} → Dest")
+
+        finally:
+            # Cleanup ALL temp files immediately to reclaim disk
+            if slot.local_path:
+                cleanup_temp_file(slot.local_path)
+            for p in slot.extra_temps:
+                cleanup_temp_file(p)
+
     async def _migrate_single_message(self, msg: Message) -> None:
         """
         Migrates a single message of ANY format (Text, Links, Polls, GIFs, Stickers, Media, Contacts).
@@ -1371,6 +1605,29 @@ class MigrationEngine:
             chunk_size = 50
             last_progress_count = 0
 
+            # ── Detect pipeline mode ──────────────────────────────────
+            pipeline_active = bool(
+                self.config.enable_watermark or
+                self.config.clean_old_watermark or
+                self.config.enable_custom_thumbnail or
+                self.config.strip_existing_thumbnail
+            )
+
+            if pipeline_active:
+                cpu_cores = max(1, (os.cpu_count() or 2) - 1)
+                download_sem = asyncio.Semaphore(3)
+                ffmpeg_sem = asyncio.Semaphore(max(1, cpu_cores))
+                disk_lock = asyncio.Lock()
+                disk_state = {"used": 0}
+                disk_freed = asyncio.Event()
+                disk_freed.set()
+                budget_mb = _get_disk_budget(Config.DOWNLOAD_DIR) // (1024 * 1024)
+                logger.info(
+                    f"🚀 [Pipeline] Concurrent mode ON — "
+                    f"{3} downloaders, {max(1, cpu_cores)} FFmpeg workers, "
+                    f"disk budget ~{budget_mb} MB"
+                )
+
             for i in range(0, len(msg_ids), chunk_size):
                 if self.cancel_event.is_set():
                     logger.info("Migration cancelled by user signal.")
@@ -1387,6 +1644,31 @@ class MigrationEngine:
                 if not isinstance(batch_msgs, list):
                     batch_msgs = [batch_msgs] if batch_msgs else []
 
+                # ── Pipeline: launch prefetch tasks for video messages ──
+                pipeline_slots: Dict[int, _PipelineSlot] = {}
+                prefetch_tasks: Dict[int, asyncio.Task] = {}
+
+                if pipeline_active:
+                    for idx, msg in enumerate(batch_msgs):
+                        if not msg or msg.empty or msg.service:
+                            continue
+                        if self._msg_needs_pipeline(msg):
+                            slot = _PipelineSlot(seq=idx, msg=msg)
+                            pipeline_slots[idx] = slot
+                            task = asyncio.create_task(
+                                self._pipeline_prefetch(
+                                    slot, download_sem, ffmpeg_sem,
+                                    disk_state, disk_lock, disk_freed,
+                                )
+                            )
+                            prefetch_tasks[idx] = task
+                    if pipeline_slots:
+                        logger.info(
+                            f"🔄 [Pipeline] Launched {len(pipeline_slots)} "
+                            f"prefetch tasks for batch {i // chunk_size + 1}"
+                        )
+
+                # ── Process ALL messages in strict original order ──
                 for idx, msg in enumerate(batch_msgs):
                     if self.cancel_event.is_set():
                         break
@@ -1403,9 +1685,25 @@ class MigrationEngine:
                     self.stats.current_msg_id = msg.id
 
                     try:
-                        await self._migrate_single_message(msg)
+                        if idx in pipeline_slots:
+                            # ── Pipeline path: wait for prefetch, then upload ──
+                            slot = pipeline_slots[idx]
+                            await slot.ready.wait()
+
+                            if slot.error:
+                                raise slot.error
+
+                            await self._pipeline_upload_slot(slot)
+
+                            # Release disk budget so next prefetches can start
+                            async with disk_lock:
+                                disk_state["used"] = max(0, disk_state["used"] - slot.disk_bytes)
+                            disk_freed.set()
+                        else:
+                            # ── Standard path (text, photo, instant copy, etc.) ──
+                            await self._migrate_single_message(msg)
+
                         self.stats.processed_count += 1
-                        # Save checkpoint on successful progress
                         save_checkpoint(self.config.source_chat_id, self.config.dest_chat_id, msg.id)
                     except Exception as msg_err:
                         self.stats.failed_count += 1
@@ -1413,15 +1711,36 @@ class MigrationEngine:
                         save_checkpoint(self.config.source_chat_id, self.config.dest_chat_id, msg.id)
                         logger.error(f"❌ Error migrating message #{msg.id}: {msg_err}", exc_info=True)
 
+                        # Release disk budget on error too
+                        if idx in pipeline_slots:
+                            slot = pipeline_slots[idx]
+                            if slot.local_path:
+                                cleanup_temp_file(slot.local_path)
+                            for p in slot.extra_temps:
+                                cleanup_temp_file(p)
+                            async with disk_lock:
+                                disk_state["used"] = max(0, disk_state["used"] - slot.disk_bytes)
+                            disk_freed.set()
+
                     # Send progress update every PROGRESS_INTERVAL messages
                     if (self.stats.processed_count - last_progress_count) >= Config.PROGRESS_INTERVAL:
                         last_progress_count = self.stats.processed_count
                         await self._send_progress_update(is_final=False)
 
-                    # Golden Cruise Pacing (1.15s - 1.25s for instant copy = ~3000 msgs/hr with 0 floodwaits)
-                    is_instant = not self.config.enable_custom_thumbnail and not self.config.enable_watermark
+                    # Pacing: shorter delay when pipeline handles heavy lifting
+                    is_instant = not pipeline_active
                     delay = random.uniform(1.15, 1.25) if is_instant else 0.5
                     await asyncio.sleep(delay)
+
+                # ── Cleanup unfinished prefetch tasks at end of batch ──
+                if pipeline_active:
+                    for task in prefetch_tasks.values():
+                        if not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except (asyncio.CancelledError, Exception):
+                                pass
 
             if not self.cancel_event.is_set() and self.stats.status == JobStatus.RUNNING:
                 self.stats.status = JobStatus.COMPLETED
