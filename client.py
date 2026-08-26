@@ -164,10 +164,15 @@ async def get_or_create_user_client(user_id: int) -> Optional[Client]:
         cl = create_userbot_client(user_id)
         if not cl.is_connected:
             await cl.connect()
-        me = getattr(cl, "_cached_me", None)
+            
+        me = getattr(cl, "me", None) or getattr(cl, "_cached_me", None)
         if not me:
             me = await cl.get_me()
-            cl._cached_me = me
+            
+        # VERY IMPORTANT: Pyrogram's send_video relies on `self.me` existing.
+        cl.me = me
+        cl._cached_me = me
+        
         if me:
             USER_CLIENTS[user_id] = cl
             logger.info(f"Loaded active userbot session for user {user_id} (@{me.username or me.id})")
