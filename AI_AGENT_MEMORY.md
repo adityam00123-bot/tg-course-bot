@@ -16,13 +16,16 @@ A Telegram Content Migration Bot that copies content from restricted and unrestr
 - **Auto-Resume**: Uses `migration_progress.json` to resume from the last message if the bot restarts.
 - **OutputFormat**: Allows switching between `OutputFormat.VIDEO` (streamable MP4) and `OutputFormat.FILE` (Telegram document).
 - **Session Management**: Userbot sessions are created locally via Pyrogram and stored as `.session` files. Memory cache `USER_CLIENTS` prevents redundant DB lookups.
+- **Concurrent 3-Stage Pipeline**: When watermark/thumbnails are enabled, the bot uses a concurrent pipeline (`Download` -> `Watermark` -> `Upload`). It uses `asyncio.Semaphore` to run multiple downloads (max 3) and FFmpeg jobs (max CPU cores) in the background while maintaining strictly sequential uploads to Telegram.
+- **Dynamic Disk Budgeting**: The pipeline dynamically calculates free disk space (using 60% of available space) to decide how many videos to prefetch, preventing "disk out of space" errors when handling huge files.
 
 ## 3. Critical Constraints
 - **Avoid Flood Waits**: Do NOT introduce new API calls per message if they are not absolutely necessary. Avoid `GetFullUser` inside loops.
 - **GitHub Codespaces & Render**: The bot runs on GitHub Codespaces (during dev) and Render Free Tier (in production). Render has very low CPU resources (0.1 core). Keep FFmpeg processes as lightweight as possible.
 - **Zero FFmpeg Overhead**: When watermark is disabled, the code must purely route through instant server-side copy. Do not accidentally force downloads.
+- **Sequential Uploads are Mandatory**: Telegram uploads MUST happen in original sequence. The pipeline handles this by awaiting a slot's `ready` event in order. DO NOT parallelize the final `send_video` step.
 - **Do not overwrite `OutputFormat` enum**: It must be imported correctly in `handlers.py` and `migration.py` from `migration.py` or a shared `config.py` depending on structure. (Currently located in `migration.py`).
 
 ## 4. Current State
-As of August 25, 2026:
-The codebase is highly optimized. Speed is back to 4-5 MB/s (and instant for unmodified files). Telemetry issues were resolved. The bot is stable.
+As of August 26, 2026:
+The codebase is highly optimized with a new concurrent processing pipeline for watermarking. Speed is significantly faster as downloads and processing happen concurrently while uploads happen sequentially. The bot is stable and adapts dynamically to disk/CPU limits.
