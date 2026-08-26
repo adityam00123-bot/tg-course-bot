@@ -804,10 +804,20 @@ class MigrationEngine:
             ext = ".dat"
 
         temp_target = Config.DOWNLOAD_DIR / f"media_{msg.chat.id}_{msg.id}{ext}"
+        
+        last_log = {"time": 0}
+        def _prog(current: int, total: int):
+            now = time.time()
+            if now - last_log["time"] >= 5 or current == total:
+                last_log["time"] = now
+                pct = (current / total * 100) if total else 0
+                logger.info(f"🔽 [Download #{msg.id}] {current / 1048576:.1f} / {total / 1048576:.1f} MB ({pct:.1f}%)")
+
         downloaded = await self._execute_with_flood_retry(
             self.client.download_media,
             message=msg,
-            file_name=str(temp_target)
+            file_name=str(temp_target),
+            progress=_prog
         )
         if downloaded and os.path.exists(downloaded):
             p = Path(downloaded)
@@ -1220,7 +1230,11 @@ class MigrationEngine:
                 file_size = msg.video.file_size or 0
             elif msg.document:
                 file_size = msg.document.file_size or 0
-            estimated_need = max(int(file_size * 3), 150 * 1024 * 1024)  # 3× or 150 MB min
+            # Watermark transcode needs 2.5x, fast thumbnail mode only needs 1.1x space
+            if self.config.enable_watermark or self.config.clean_old_watermark:
+                estimated_need = max(int(file_size * 2.5), 150 * 1024 * 1024)
+            else:
+                estimated_need = max(int(file_size * 1.1), 50 * 1024 * 1024)
 
             # --- Wait for disk budget ---
             while True:
@@ -1349,6 +1363,14 @@ class MigrationEngine:
                 v_w = getattr(msg.video, "width", 0) or 0
                 v_h = getattr(msg.video, "height", 0) or 0
 
+                last_up_log = {"time": 0}
+                def _up_prog(current: int, total: int):
+                    now = time.time()
+                    if now - last_up_log["time"] >= 5 or current == total:
+                        last_up_log["time"] = now
+                        pct = (current / total * 100) if total else 0
+                        logger.info(f"🔼 [Upload #{msg.id}] {current / 1048576:.1f} / {total / 1048576:.1f} MB ({pct:.1f}%)")
+
                 await self._execute_with_flood_retry(
                     self.client.send_video,
                     chat_id=dest_chat,
@@ -1360,6 +1382,7 @@ class MigrationEngine:
                     width=v_w,
                     height=v_h,
                     supports_streaming=True,
+                    progress=_up_prog
                 )
                 self.stats.media_count += 1
                 logger.info(f"✅ [Pipeline] Uploaded video #{msg.id} → Dest")
@@ -1615,7 +1638,7 @@ class MigrationEngine:
 
             if pipeline_active:
                 cpu_cores = max(1, (os.cpu_count() or 2) - 1)
-                download_sem = asyncio.Semaphore(3)
+                download_sem = asyncio.Semaphore(2)
                 ffmpeg_sem = asyncio.Semaphore(max(1, cpu_cores))
                 disk_lock = asyncio.Lock()
                 disk_state = {"used": 0}
@@ -1624,7 +1647,7 @@ class MigrationEngine:
                 budget_mb = _get_disk_budget(Config.DOWNLOAD_DIR) // (1024 * 1024)
                 logger.info(
                     f"🚀 [Pipeline] Concurrent mode ON — "
-                    f"{3} downloaders, {max(1, cpu_cores)} FFmpeg workers, "
+                    f"{2} downloaders, {max(1, cpu_cores)} FFmpeg workers, "
                     f"disk budget ~{budget_mb} MB"
                 )
 
@@ -1680,10 +1703,10 @@ class MigrationEngine:
 
             if pipeline_active:
                 prod_task = asyncio.create_task(pipeline_producer())
-                logger.info("?? [Pipeline] Sliding Window Conveyor Belt Started (Max 10 active downloads ahead)")
+                logger.info("🔄 [Pipeline] Sliding Window Conveyor Belt Started (Max 10 active downloads ahead)")
             else:
                 prod_task = asyncio.create_task(pipeline_producer())
-                logger.info("?? [Pipeline] Direct Mode Stream Started")
+                logger.info("🔄 [Pipeline] Direct Mode Stream Started")
 
             # -- Consumer Loop: Process in strict sequence --
             while True:
