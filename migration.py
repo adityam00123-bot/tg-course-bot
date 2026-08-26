@@ -1,4 +1,4 @@
-﻿"""
+"""
 Core migration engine for transferring Telegram content between channels.
 Executes a download-then-upload pipeline to bypass channel forwarding/copy restrictions,
 sanitizes captions, respects flood limits, and provides real-time progress updates.
@@ -225,7 +225,7 @@ class DeletionStats:
 
 @dataclass
 class _PipelineSlot:
-    """Tracks one video message through the concurrent downloadâ†’processâ†’upload pipeline."""
+    """Tracks one video message through the concurrent download→process→upload pipeline."""
     seq: int = 0
     msg: Optional[Message] = None
     local_path: Optional[Path] = None
@@ -415,7 +415,7 @@ class MigrationEngine:
             from client import get_or_create_user_client
             self.userbot = await get_or_create_user_client(self.owner_id)
             if not self.userbot:
-                raise ValueError("âš ï¸ Userbot session is not active! Please log in using /settings or tap 'Login with Phone Number'.")
+                raise ValueError("⚠️ Userbot session is not active! Please log in using /settings or tap 'Login with Phone Number'.")
             install_fast_uploader(self.userbot, max_workers=Config.MAX_UPLOAD_WORKERS)
 
         self.cancel_event.clear()
@@ -455,7 +455,7 @@ class MigrationEngine:
                 attempt += 1
                 sleep_duration = min(e.value + 1, Config.FLOOD_WAIT_MAX_SLEEP)
                 logger.warning(
-                    f"âš ï¸ Telegram FloodWait: Sleeping for {sleep_duration}s "
+                    f"⚠️ Telegram FloodWait: Sleeping for {sleep_duration}s "
                     f"(Attempt {attempt}/{max_attempts}). Action: {coro_fn.__name__}"
                 )
 
@@ -463,7 +463,7 @@ class MigrationEngine:
                     await self.bot.send_message(
                         chat_id=self.owner_id,
                         text=(
-                            f"âŒ› <b>Telegram Rate-Limit Notice</b>\n\n"
+                            f"⌛ <b>Telegram Rate-Limit Notice</b>\n\n"
                             f"Telegram requested a temporary pause. Sleeping for <b>{sleep_duration}s</b>.\n"
                             f"<i>Migration will automatically resume.</i>"
                         ),
@@ -496,7 +496,7 @@ class MigrationEngine:
 
                 attempt += 1
                 if attempt >= max_attempts:
-                    logger.error(f"âŒ Permanent RPC failure on {coro_fn.__name__}: {e}")
+                    logger.error(f"❌ Permanent RPC failure on {coro_fn.__name__}: {e}")
                     raise
                 wait_sec = min(2 ** attempt, 30)
                 logger.warning(f"Transient Telegram error on {coro_fn.__name__}: {e}. Retrying in {wait_sec}s...")
@@ -528,30 +528,30 @@ class MigrationEngine:
 
             elapsed = format_seconds(self.stats.elapsed_seconds)
             total_str = str(total) if total > 0 else "Detecting..."
-            title = "ðŸ“Š <b>Migration Status Update (Live)</b>" if not is_final else "ðŸ <b>Migration Finished</b>"
+            title = "📊 <b>Migration Status Update (Live)</b>" if not is_final else "🏁 <b>Migration Finished</b>"
 
             text = (
                 f"{title}\n"
-                f"â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
-                f"ðŸ“¥ <b>Source:</b> {self.config.source_chat_title}\n"
-                f"ðŸ“¤ <b>Destination:</b> {self.config.dest_chat_title}\n"
-                f"ðŸ“ˆ <b>Progress:</b> {progress_bar} ({self.stats.processed_count}/{total_str})\n"
-                f"âš¡ <b>Speed:</b> {speed_str}\n"
-                f"â³ <b>ETA:</b> ~{eta_str}\n"
-                f"ðŸŽ¬ <b>Media Uploaded:</b> {self.stats.media_count}\n"
-                f"ðŸ“ <b>Text Messages:</b> {self.stats.text_count}\n"
-                f"â­ï¸ <b>Skipped:</b> {self.stats.skipped_count}\n"
-                f"âŒ <b>Errors:</b> {self.stats.failed_count}\n"
-                f"â±ï¸ <b>Elapsed:</b> {elapsed}\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"📥 <b>Source:</b> {self.config.source_chat_title}\n"
+                f"📤 <b>Destination:</b> {self.config.dest_chat_title}\n"
+                f"📈 <b>Progress:</b> {progress_bar} ({self.stats.processed_count}/{total_str})\n"
+                f"⚡ <b>Speed:</b> {speed_str}\n"
+                f"⏳ <b>ETA:</b> ~{eta_str}\n"
+                f"🎬 <b>Media Uploaded:</b> {self.stats.media_count}\n"
+                f"📝 <b>Text Messages:</b> {self.stats.text_count}\n"
+                f"⏭️ <b>Skipped:</b> {self.stats.skipped_count}\n"
+                f"❌ <b>Errors:</b> {self.stats.failed_count}\n"
+                f"⏱️ <b>Elapsed:</b> {elapsed}\n"
             )
 
             if not is_final and self.stats.current_msg_id:
-                text += f"ðŸ“ <b>Current Message ID:</b> #{self.stats.current_msg_id}\n"
+                text += f"📍 <b>Current Message ID:</b> #{self.stats.current_msg_id}\n"
 
             if is_final:
-                text += f"ðŸ“Œ <b>Final Status:</b> {self.stats.status.value}\n"
+                text += f"📌 <b>Final Status:</b> {self.stats.status.value}\n"
                 if self.stats.error_message:
-                    text += f"âš ï¸ <b>Error Details:</b> {self.stats.error_message}\n"
+                    text += f"⚠️ <b>Error Details:</b> {self.stats.error_message}\n"
 
             # In-Place Live Message Editing
             if not self.progress_msg_id:
@@ -635,7 +635,7 @@ class MigrationEngine:
                 self.stats.media_count += 1
                 if msg.video.file_size:
                     self.stats.total_bytes_migrated += msg.video.file_size
-                logger.info(f"âš¡ [Instant Copy] Migrated video #{msg.id} instantly!")
+                logger.info(f"⚡ [Instant Copy] Migrated video #{msg.id} instantly!")
                 return True
 
             elif msg.document:
@@ -650,7 +650,7 @@ class MigrationEngine:
                 self.stats.media_count += 1
                 if msg.document.file_size:
                     self.stats.total_bytes_migrated += msg.document.file_size
-                logger.info(f"âš¡ [Instant Copy] Migrated document #{msg.id} instantly!")
+                logger.info(f"⚡ [Instant Copy] Migrated document #{msg.id} instantly!")
                 return True
 
             elif msg.photo:
@@ -664,7 +664,7 @@ class MigrationEngine:
                 self.stats.media_count += 1
                 if msg.photo.file_size:
                     self.stats.total_bytes_migrated += msg.photo.file_size
-                logger.info(f"âš¡ [Instant Copy] Migrated photo #{msg.id} instantly!")
+                logger.info(f"⚡ [Instant Copy] Migrated photo #{msg.id} instantly!")
                 return True
 
             elif msg.animation:
@@ -678,7 +678,7 @@ class MigrationEngine:
                 self.stats.media_count += 1
                 if msg.animation.file_size:
                     self.stats.total_bytes_migrated += msg.animation.file_size
-                logger.info(f"âš¡ [Instant Copy] Migrated GIF animation #{msg.id} instantly!")
+                logger.info(f"⚡ [Instant Copy] Migrated GIF animation #{msg.id} instantly!")
                 return True
 
             elif msg.sticker:
@@ -688,7 +688,7 @@ class MigrationEngine:
                     sticker=msg.sticker.file_id
                 )
                 self.stats.media_count += 1
-                logger.info(f"âš¡ [Instant Copy] Migrated sticker #{msg.id} instantly!")
+                logger.info(f"⚡ [Instant Copy] Migrated sticker #{msg.id} instantly!")
                 return True
 
             elif msg.audio:
@@ -705,7 +705,7 @@ class MigrationEngine:
                 self.stats.media_count += 1
                 if msg.audio.file_size:
                     self.stats.total_bytes_migrated += msg.audio.file_size
-                logger.info(f"âš¡ [Instant Copy] Migrated audio #{msg.id} instantly!")
+                logger.info(f"⚡ [Instant Copy] Migrated audio #{msg.id} instantly!")
                 return True
 
             elif msg.voice:
@@ -720,7 +720,7 @@ class MigrationEngine:
                 self.stats.media_count += 1
                 if msg.voice.file_size:
                     self.stats.total_bytes_migrated += msg.voice.file_size
-                logger.info(f"âš¡ [Instant Copy] Migrated voice #{msg.id} instantly!")
+                logger.info(f"⚡ [Instant Copy] Migrated voice #{msg.id} instantly!")
                 return True
 
             elif msg.video_note:
@@ -734,7 +734,7 @@ class MigrationEngine:
                 self.stats.media_count += 1
                 if msg.video_note.file_size:
                     self.stats.total_bytes_migrated += msg.video_note.file_size
-                logger.info(f"âš¡ [Instant Copy] Migrated video note #{msg.id} instantly!")
+                logger.info(f"⚡ [Instant Copy] Migrated video note #{msg.id} instantly!")
                 return True
 
             elif msg.contact:
@@ -747,7 +747,7 @@ class MigrationEngine:
                     vcard=msg.contact.vcard
                 )
                 self.stats.text_count += 1
-                logger.info(f"âš¡ [Instant Copy] Migrated contact #{msg.id} instantly!")
+                logger.info(f"⚡ [Instant Copy] Migrated contact #{msg.id} instantly!")
                 return True
 
             elif msg.location:
@@ -758,7 +758,7 @@ class MigrationEngine:
                     longitude=msg.location.longitude
                 )
                 self.stats.text_count += 1
-                logger.info(f"âš¡ [Instant Copy] Migrated location #{msg.id} instantly!")
+                logger.info(f"⚡ [Instant Copy] Migrated location #{msg.id} instantly!")
                 return True
 
             elif msg.dice:
@@ -768,7 +768,7 @@ class MigrationEngine:
                     emoji=msg.dice.emoji
                 )
                 self.stats.text_count += 1
-                logger.info(f"âš¡ [Instant Copy] Migrated dice #{msg.id} instantly!")
+                logger.info(f"⚡ [Instant Copy] Migrated dice #{msg.id} instantly!")
                 return True
 
         except Exception as e:
@@ -918,7 +918,7 @@ class MigrationEngine:
                         supports_streaming=True
                     )
                     self.stats.media_count += 1
-                    logger.info(f"âœ… Migrated streamable video #{msg.id} -> Dest Channel")
+                    logger.info(f"✅ Migrated streamable video #{msg.id} -> Dest Channel")
                 else:
                     # OutputFormat == OutputFormat.FILE (send as document)
                     doc_name = getattr(msg.document, 'file_name', None) or f"{local_file_path.stem}.mp4"
@@ -933,7 +933,7 @@ class MigrationEngine:
                         force_document=True
                     )
                     self.stats.media_count += 1
-                    logger.info(f"âœ… Migrated video as document file #{msg.id} -> Dest Channel")
+                    logger.info(f"✅ Migrated video as document file #{msg.id} -> Dest Channel")
 
             elif msg.document:
                 # Check for ZIP archive auto-extraction
@@ -952,7 +952,7 @@ class MigrationEngine:
                     file_name=msg.document.file_name
                 )
                 self.stats.media_count += 1
-                logger.info(f"âœ… Migrated document message #{msg.id} -> Dest Channel")
+                logger.info(f"✅ Migrated document message #{msg.id} -> Dest Channel")
 
             elif msg.photo:
                 await self._execute_with_flood_retry(
@@ -963,7 +963,7 @@ class MigrationEngine:
                     caption_entities=caption_entities
                 )
                 self.stats.media_count += 1
-                logger.info(f"âœ… Migrated photo message #{msg.id} -> Dest Channel")
+                logger.info(f"✅ Migrated photo message #{msg.id} -> Dest Channel")
 
             elif msg.audio:
                 await self._execute_with_flood_retry(
@@ -977,7 +977,7 @@ class MigrationEngine:
                     title=msg.audio.title
                 )
                 self.stats.media_count += 1
-                logger.info(f"âœ… Migrated audio message #{msg.id} -> Dest Channel")
+                logger.info(f"✅ Migrated audio message #{msg.id} -> Dest Channel")
 
             elif msg.voice:
                 await self._execute_with_flood_retry(
@@ -989,7 +989,7 @@ class MigrationEngine:
                     duration=msg.voice.duration or 0
                 )
                 self.stats.media_count += 1
-                logger.info(f"âœ… Migrated voice message #{msg.id} -> Dest Channel")
+                logger.info(f"✅ Migrated voice message #{msg.id} -> Dest Channel")
 
             elif msg.video_note:
                 await self._execute_with_flood_retry(
@@ -1000,7 +1000,7 @@ class MigrationEngine:
                     length=msg.video_note.length or 0
                 )
                 self.stats.media_count += 1
-                logger.info(f"âœ… Migrated video note message #{msg.id} -> Dest Channel")
+                logger.info(f"✅ Migrated video note message #{msg.id} -> Dest Channel")
 
             elif msg.animation:
                 await self._execute_with_flood_retry(
@@ -1011,7 +1011,7 @@ class MigrationEngine:
                     caption_entities=caption_entities
                 )
                 self.stats.media_count += 1
-                logger.info(f"âœ… Migrated GIF animation message #{msg.id} -> Dest Channel")
+                logger.info(f"✅ Migrated GIF animation message #{msg.id} -> Dest Channel")
 
             elif msg.sticker:
                 await self._execute_with_flood_retry(
@@ -1020,7 +1020,7 @@ class MigrationEngine:
                     sticker=str(local_file_path)
                 )
                 self.stats.media_count += 1
-                logger.info(f"âœ… Migrated sticker message #{msg.id} -> Dest Channel")
+                logger.info(f"✅ Migrated sticker message #{msg.id} -> Dest Channel")
 
         finally:
             # Clean up all temporary files immediately to conserve disk space
@@ -1052,7 +1052,7 @@ class MigrationEngine:
 
             # Natural alphanumeric sort for lecture sequence (01.mp4, 02.mp4, 10.mp4)
             extracted_files.sort(key=lambda p: natural_sort_key(p.name))
-            logger.info(f"ðŸ“¦ Successfully unpacked ZIP #{msg.id}: {len(extracted_files)} files found in archive.")
+            logger.info(f"📦 Successfully unpacked ZIP #{msg.id}: {len(extracted_files)} files found in archive.")
 
             for sub_file in extracted_files:
                 if self.cancel_event.is_set():
@@ -1133,7 +1133,7 @@ class MigrationEngine:
                     )
 
                 self.stats.media_count += 1
-                logger.info(f"âœ… Migrated unzipped video: {file_path.name}")
+                logger.info(f"✅ Migrated unzipped video: {file_path.name}")
 
             # 2. Audio files
             elif ext in [".mp3", ".m4a", ".ogg", ".flac", ".wav", ".aac"]:
@@ -1145,7 +1145,7 @@ class MigrationEngine:
                     caption_entities=caption_entities
                 )
                 self.stats.media_count += 1
-                logger.info(f"âœ… Migrated unzipped audio: {file_path.name}")
+                logger.info(f"✅ Migrated unzipped audio: {file_path.name}")
 
             # 3. Photo files
             elif ext in [".jpg", ".jpeg", ".png", ".webp"]:
@@ -1157,7 +1157,7 @@ class MigrationEngine:
                     caption_entities=caption_entities
                 )
                 self.stats.media_count += 1
-                logger.info(f"âœ… Migrated unzipped image: {file_path.name}")
+                logger.info(f"✅ Migrated unzipped image: {file_path.name}")
 
             # 4. Documents / PDFs / Other files
             else:
@@ -1171,20 +1171,20 @@ class MigrationEngine:
                     force_document=True
                 )
                 self.stats.media_count += 1
-                logger.info(f"âœ… Migrated unzipped document: {file_path.name}")
+                logger.info(f"✅ Migrated unzipped document: {file_path.name}")
 
         finally:
             for extra_p in extra_temp_files:
                 cleanup_temp_file(extra_p)
 
     # ===================================================================
-    #   CONCURRENT PIPELINE â€” Download + Watermark in parallel
+    #   CONCURRENT PIPELINE — Download + Watermark in parallel
     # ===================================================================
 
     _VIDEO_EXTS = frozenset([".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts", ".flv", ".m4v", ".3gp"])
 
     def _msg_needs_pipeline(self, msg: Message) -> bool:
-        """Check if a message requires the concurrent downloadâ†’processâ†’upload pipeline."""
+        """Check if a message requires the concurrent download→process→upload pipeline."""
         if not msg or not msg.media:
             return False
 
@@ -1220,7 +1220,7 @@ class MigrationEngine:
                 file_size = msg.video.file_size or 0
             elif msg.document:
                 file_size = msg.document.file_size or 0
-            estimated_need = max(int(file_size * 3), 150 * 1024 * 1024)  # 3Ã— or 150 MB min
+            estimated_need = max(int(file_size * 3), 150 * 1024 * 1024)  # 3× or 150 MB min
 
             # --- Wait for disk budget ---
             while True:
@@ -1232,7 +1232,7 @@ class MigrationEngine:
                         disk_state["used"] += estimated_need
                         slot.disk_bytes = estimated_need
                         break
-                # Budget full â€” wait until an upload frees space
+                # Budget full — wait until an upload frees space
                 disk_freed.clear()
                 try:
                     await asyncio.wait_for(disk_freed.wait(), timeout=30)
@@ -1243,7 +1243,7 @@ class MigrationEngine:
             async with download_sem:
                 if self.cancel_event.is_set():
                     return
-                logger.info(f"ðŸ”½ [Pipeline] Downloading #{msg.id}...")
+                logger.info(f"🔽 [Pipeline] Downloading #{msg.id}...")
                 slot.local_path = await self._download_media_to_file(msg)
 
             if not slot.local_path or not slot.local_path.exists():
@@ -1275,7 +1275,7 @@ class MigrationEngine:
                 if self.config.enable_watermark:
                     wm_path = slot.local_path.with_name(f"wm_{slot.local_path.name}")
                     extra_temps.append(wm_path)
-                    logger.info(f"ðŸŽ¨ [Pipeline] Watermarking #{msg.id}...")
+                    logger.info(f"🎨 [Pipeline] Watermarking #{msg.id}...")
                     upload_path = await apply_video_watermark(
                         input_path=Path(upload_path),
                         output_path=wm_path,
@@ -1320,7 +1320,7 @@ class MigrationEngine:
                 slot.upload_path = upload_path
                 slot.thumb_path = thumb_path
                 slot.extra_temps = extra_temps
-                logger.info(f"âœ… [Pipeline] #{msg.id} ready for upload")
+                logger.info(f"✅ [Pipeline] #{msg.id} ready for upload")
 
         except asyncio.CancelledError:
             pass
@@ -1362,7 +1362,7 @@ class MigrationEngine:
                     supports_streaming=True,
                 )
                 self.stats.media_count += 1
-                logger.info(f"âœ… [Pipeline] Uploaded video #{msg.id} â†’ Dest")
+                logger.info(f"✅ [Pipeline] Uploaded video #{msg.id} → Dest")
             else:
                 doc_name = (getattr(msg.document, "file_name", None) if msg.document else None) or f"{slot.local_path.stem}.mp4"
                 await self._execute_with_flood_retry(
@@ -1376,7 +1376,7 @@ class MigrationEngine:
                     force_document=True,
                 )
                 self.stats.media_count += 1
-                logger.info(f"âœ… [Pipeline] Uploaded doc #{msg.id} â†’ Dest")
+                logger.info(f"✅ [Pipeline] Uploaded doc #{msg.id} → Dest")
 
         finally:
             # Cleanup ALL temp files immediately to reclaim disk
@@ -1407,7 +1407,7 @@ class MigrationEngine:
                         self.stats.media_count += 1
                     else:
                         self.stats.text_count += 1
-                    logger.info(f"ðŸ¤– [Bot Mode] Copied message #{msg.id} -> Dest Channel")
+                    logger.info(f"🤖 [Bot Mode] Copied message #{msg.id} -> Dest Channel")
                     return
             except Exception as bot_err:
                 logger.debug(f"Bot copy_message failed for #{msg.id}: {bot_err}. Falling back to bot forward...")
@@ -1421,7 +1421,7 @@ class MigrationEngine:
                     )
                     if fwd:
                         self.stats.media_count += 1
-                        logger.info(f"ðŸ¤– [Bot Mode] Forwarded message #{msg.id} -> Dest Channel")
+                        logger.info(f"🤖 [Bot Mode] Forwarded message #{msg.id} -> Dest Channel")
                         return
                 except Exception as fwd_err:
                     logger.warning(f"Bot Admin forward failed for #{msg.id}: {fwd_err}")
@@ -1443,7 +1443,7 @@ class MigrationEngine:
                     explanation=poll.explanation
                 )
                 self.stats.text_count += 1
-                logger.info(f"âœ… Migrated poll message #{msg.id} -> Dest Channel")
+                logger.info(f"✅ Migrated poll message #{msg.id} -> Dest Channel")
             except Exception as poll_err:
                 logger.error(f"Failed to migrate poll #{msg.id}: {poll_err}")
                 self.stats.failed_count += 1
@@ -1474,7 +1474,7 @@ class MigrationEngine:
                     )
                     if fwd_ok:
                         self.stats.media_count += 1
-                        logger.info(f"âš¡ [Smart Clean Forward] Migrated premium message #{msg.id} without forward tag!")
+                        logger.info(f"⚡ [Smart Clean Forward] Migrated premium message #{msg.id} without forward tag!")
                         return
                 except Exception:
                     self.stats.skipped_count += 1
@@ -1518,7 +1518,7 @@ class MigrationEngine:
     async def _run_migration_pipeline(self, progress_callback: Optional[Callable[[str], Awaitable[None]]] = None) -> None:
         """Internal worker executing the message download and upload loop."""
         logger.info(
-            f"ðŸš€ Starting migration pipeline. Source: {self.config.source_chat_id} -> "
+            f"🚀 Starting migration pipeline. Source: {self.config.source_chat_id} -> "
             f"Dest: {self.config.dest_chat_id} (Mode: {self.config.mode.value})"
         )
 
@@ -1580,12 +1580,12 @@ class MigrationEngine:
 
                 if checkpoint_id > 0 and checkpoint_id < max_id:
                     effective_start = checkpoint_id + 1
-                    logger.info(f"ðŸ”„ Auto-Resuming from checkpoint message #{effective_start} (out of #{max_id}).")
+                    logger.info(f"🔄 Auto-Resuming from checkpoint message #{effective_start} (out of #{max_id}).")
                     try:
                         await self.bot.send_message(
                             chat_id=self.owner_id,
                             text=(
-                                f"ðŸ”„ <b>Auto-Resume Activated</b>\n\n"
+                                f"🔄 <b>Auto-Resume Activated</b>\n\n"
                                 f"Resuming migration from Checkpoint: <b>Message #{effective_start}</b> "
                                 f"(Total: #{max_id})."
                             ),
@@ -1605,7 +1605,7 @@ class MigrationEngine:
             chunk_size = 8
             last_progress_count = 0
 
-            # â”€â”€ Detect pipeline mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # ── Detect pipeline mode ──────────────────────────────────
             pipeline_active = bool(
                 self.config.enable_watermark or
                 self.config.clean_old_watermark or
@@ -1623,7 +1623,7 @@ class MigrationEngine:
                 disk_freed.set()
                 budget_mb = _get_disk_budget(Config.DOWNLOAD_DIR) // (1024 * 1024)
                 logger.info(
-                    f"ðŸš€ [Pipeline] Concurrent mode ON â€” "
+                    f"🚀 [Pipeline] Concurrent mode ON — "
                     f"{3} downloaders, {max(1, cpu_cores)} FFmpeg workers, "
                     f"disk budget ~{budget_mb} MB"
                 )
@@ -1767,6 +1767,7 @@ class MigrationEngine:
                     await prod_task
                 except asyncio.CancelledError:
                     pass
+
             if not self.cancel_event.is_set() and self.stats.status == JobStatus.RUNNING:
                 self.stats.status = JobStatus.COMPLETED
 
@@ -1776,11 +1777,11 @@ class MigrationEngine:
         except Exception as e:
             self.stats.status = JobStatus.FAILED
             self.stats.error_message = str(e)
-            logger.error(f"âŒ Fatal error during migration: {e}", exc_info=True)
+            logger.error(f"❌ Fatal error during migration: {e}", exc_info=True)
         finally:
             self.stats.end_time = time.time()
             logger.info(
-                f"ðŸ Migration finished with status '{self.stats.status.value}'. "
+                f"🏁 Migration finished with status '{self.stats.status.value}'. "
                 f"Processed: {self.stats.processed_count}, Media: {self.stats.media_count}, "
                 f"Text: {self.stats.text_count}, Skipped: {self.stats.skipped_count}, "
                 f"Failed: {self.stats.failed_count} in {format_seconds(self.stats.elapsed_seconds)}."
@@ -1808,7 +1809,7 @@ class MigrationEngine:
             from client import get_or_create_user_client
             self.userbot = await get_or_create_user_client(self.owner_id)
             if not self.userbot:
-                raise ValueError("âš ï¸ Userbot session is not active! Please log in using /settings.")
+                raise ValueError("⚠️ Userbot session is not active! Please log in using /settings.")
 
         self.deletion_cancel_event.clear()
         self.deletion_progress_msg_id = None
@@ -1821,32 +1822,32 @@ class MigrationEngine:
         stats = self.deletion_stats
         target_display = self.deletion_target_title or str(self.deletion_target_chat)
         if stats.status == JobStatus.RUNNING:
-            header = "ðŸ—‘ï¸ <b>Channel Deletion in Progress...</b>"
+            header = "🗑️ <b>Channel Deletion in Progress...</b>"
             pbar = format_progress_bar(stats.deleted_count, stats.total_messages)
-            status_line = f"ðŸŸ¢ <b>RUNNING</b> ({stats.deleted_count}/{stats.total_messages})"
+            status_line = f"🟢 <b>RUNNING</b> ({stats.deleted_count}/{stats.total_messages})"
         elif stats.status == JobStatus.COMPLETED:
-            header = "ðŸ <b>Channel Deletion Completed!</b>"
+            header = "🏁 <b>Channel Deletion Completed!</b>"
             pbar = format_progress_bar(stats.total_messages, stats.total_messages)
-            status_line = "âœ… <b>COMPLETED</b>"
+            status_line = "✅ <b>COMPLETED</b>"
         elif stats.status == JobStatus.CANCELLED:
-            header = "â¹ï¸ <b>Channel Deletion Cancelled</b>"
+            header = "⏹️ <b>Channel Deletion Cancelled</b>"
             pbar = format_progress_bar(stats.deleted_count, stats.total_messages)
-            status_line = "â¹ï¸ <b>CANCELLED</b>"
+            status_line = "⏹️ <b>CANCELLED</b>"
         else:
-            header = "âŒ <b>Channel Deletion Failed</b>"
+            header = "❌ <b>Channel Deletion Failed</b>"
             pbar = format_progress_bar(stats.deleted_count, stats.total_messages)
-            status_line = f"âŒ <b>FAILED:</b> {stats.error_message}"
+            status_line = f"❌ <b>FAILED:</b> {stats.error_message}"
 
         text = (
             f"{header}\n"
-            "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”\n"
-            f"ðŸŽ¯ <b>Target Channel:</b> {target_display}\n"
-            f"ðŸ“Š <b>Progress:</b> {pbar}\n"
-            f"ðŸ—‘ï¸ <b>Deleted:</b> <b>{stats.deleted_count}</b> messages\n"
-            f"âŒ <b>Errors:</b> <b>{stats.failed_count}</b>\n"
-            f"â±ï¸ <b>Elapsed:</b> {format_seconds(stats.elapsed_seconds)}\n"
-            f"ðŸ“Œ <b>Status:</b> {status_line}\n"
-            "â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 <b>Target Channel:</b> {target_display}\n"
+            f"📊 <b>Progress:</b> {pbar}\n"
+            f"🗑️ <b>Deleted:</b> <b>{stats.deleted_count}</b> messages\n"
+            f"❌ <b>Errors:</b> <b>{stats.failed_count}</b>\n"
+            f"⏱️ <b>Elapsed:</b> {format_seconds(stats.elapsed_seconds)}\n"
+            f"📌 <b>Status:</b> {status_line}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
         try:
             if not self.deletion_progress_msg_id or is_final:
@@ -1874,7 +1875,7 @@ class MigrationEngine:
 
     async def _run_deletion_pipeline(self) -> None:
         """High-speed batch deletion worker."""
-        logger.info(f"ðŸ—‘ï¸ Starting deletion pipeline on {self.deletion_target_chat}")
+        logger.info(f"🗑️ Starting deletion pipeline on {self.deletion_target_chat}")
         target_chat = self.deletion_target_chat
 
         try:
@@ -1884,10 +1885,10 @@ class MigrationEngine:
                 if self.config.engine_type == EngineType.BOT_ADMIN:
                     privs = getattr(member, "privileges", None)
                     if not (privs and getattr(privs, "can_delete_messages", False)):
-                        raise PermissionError("âš ï¸ @CV_AUTOFORWARD_bot is not an Administrator with 'Delete Messages' permission in this channel!")
+                        raise PermissionError("⚠️ @CV_AUTOFORWARD_bot is not an Administrator with 'Delete Messages' permission in this channel!")
                 else:
                     if member.status not in [enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR]:
-                        raise PermissionError("âš ï¸ Your account is not an Administrator in this channel!")
+                        raise PermissionError("⚠️ Your account is not an Administrator in this channel!")
             except Exception as perm_err:
                 raise PermissionError(f"Admin Verification Failed: {perm_err}")
 
@@ -1939,7 +1940,7 @@ class MigrationEngine:
         except Exception as e:
             self.deletion_stats.status = JobStatus.FAILED
             self.deletion_stats.error_message = str(e)
-            logger.error(f"âŒ Deletion failed: {e}", exc_info=True)
+            logger.error(f"❌ Deletion failed: {e}", exc_info=True)
         finally:
             self.deletion_stats.end_time = time.time()
             await self._send_deletion_progress_update(is_final=True)
@@ -1958,5 +1959,4 @@ def get_user_engine(user_id: int, bot: Client, userbot: Optional[Client] = None)
     elif userbot and not USER_ENGINES[user_id].userbot:
         USER_ENGINES[user_id].userbot = userbot
     return USER_ENGINES[user_id]
-
 
