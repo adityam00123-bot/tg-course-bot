@@ -279,7 +279,20 @@ async def complete_user_login(
             )
             me = await temp_client.get_me()
             temp_client.me = me
+            temp_client._cached_me = me
             USER_CLIENTS[user_id] = temp_client
+            
+            import handlers
+            name = f"{me.first_name or ''} {me.last_name or ''}".strip()
+            handlers.USER_PROFILE_CACHE[user_id] = {
+                "is_logged_in": True,
+                "id": me.id,
+                "name": name or "Telegram User",
+                "username": me.username or "None",
+                "is_premium": getattr(me, "is_premium", False),
+                "phone": phone_number
+            }
+
             from database import save_or_update_user
             user_full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
             save_or_update_user(
@@ -301,7 +314,20 @@ async def complete_user_login(
             await temp_client.check_password(password)
             me = await temp_client.get_me()
             temp_client.me = me
+            temp_client._cached_me = me
             USER_CLIENTS[user_id] = temp_client
+            
+            import handlers
+            name = f"{me.first_name or ''} {me.last_name or ''}".strip()
+            handlers.USER_PROFILE_CACHE[user_id] = {
+                "is_logged_in": True,
+                "id": me.id,
+                "name": name or "Telegram User",
+                "username": me.username or "None",
+                "is_premium": getattr(me, "is_premium", False),
+                "phone": phone_number
+            }
+            
             from database import save_or_update_user
             user_full_name = f"{me.first_name or ''} {me.last_name or ''}".strip()
             save_or_update_user(
