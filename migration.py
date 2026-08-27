@@ -1753,9 +1753,9 @@ class MigrationEngine:
 
             if pipeline_active:
                 cpu_cores = max(1, (os.cpu_count() or 2) - 1)
-                download_sem = asyncio.Semaphore(2)
+                download_sem = asyncio.Semaphore(1)
                 ffmpeg_sem = asyncio.Semaphore(max(1, cpu_cores))
-                upload_sem = asyncio.Semaphore(2)
+                upload_sem = asyncio.Semaphore(1)
                 disk_lock = asyncio.Lock()
                 disk_state = {"used": 0}
                 disk_freed = asyncio.Event()
