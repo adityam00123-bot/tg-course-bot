@@ -46,6 +46,7 @@ jobs:
           SESSION_STRING: ${{ secrets.SESSION_STRING }}
           SOURCE_CHAT_ID: ${{ secrets.SOURCE_CHAT_ID }}
           DEST_CHAT_ID: ${{ secrets.DEST_CHAT_ID }}
+          START_MSG_ID: ${{ secrets.START_MSG_ID }}
           MAX_RUN_SECONDS: 19200
         run: |
           python headless_runner.py

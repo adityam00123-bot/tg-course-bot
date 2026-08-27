@@ -79,11 +79,23 @@ async def run_headless():
     user_me = await userbot.get_me()
     logger.info(f"✅ Userbot Online: {user_me.first_name} (@{user_me.username}, ID: {user_me.id})")
 
+    from migration import MigrationMode, save_checkpoint
+
+    # Support custom START_MSG_ID from environment
+    start_msg_id_env = (os.getenv("START_MSG_ID") or "").strip()
+    if start_msg_id_env and start_msg_id_env.isdigit():
+        custom_start = int(start_msg_id_env)
+        save_checkpoint(source_chat, dest_chat, custom_start - 1)
+        logger.info(f"🎯 Overriding Start Message ID to #{custom_start} from environment!")
+
     # Check last checkpoint
     last_checkpoint = load_checkpoint(source_chat, dest_chat)
-    logger.info(f"🔄 Current Checkpoint: Message #{last_checkpoint}")
+    logger.info(f"🔄 Current Checkpoint: Message #{last_checkpoint} (Starting from #{last_checkpoint + 1})")
 
-    from migration import MigrationMode
+    thumb_file = Config.BASE_DIR / "thumb.jpg"
+    has_custom_thumb = thumb_file.exists()
+    if has_custom_thumb:
+        logger.info(f"🖼️ Custom Thumbnail Found: {thumb_file}")
 
     # Build Migration Configuration
     mig_config = MigrationConfig(
@@ -95,7 +107,8 @@ async def run_headless():
         mode=MigrationMode.FULL,
         output_format=OutputFormat.VIDEO,
         enable_watermark=False,
-        enable_custom_thumbnail=False
+        enable_custom_thumbnail=has_custom_thumb,
+        custom_thumbnail_path=str(thumb_file) if has_custom_thumb else None
     )
 
     engine = MigrationEngine(
