@@ -1673,10 +1673,10 @@ class MigrationEngine:
                     raise ValueError("Source channel appears to be empty or inaccessible.")
 
                 max_id = latest_msg.id
-                effective_start = 1
+                effective_start = self.config.start_msg_id or 1
 
                 if checkpoint_id > 0 and checkpoint_id < max_id:
-                    effective_start = checkpoint_id + 1
+                    effective_start = max(effective_start, checkpoint_id + 1)
                     logger.info(f"🔄 Auto-Resuming from checkpoint message #{effective_start} (out of #{max_id}).")
                     try:
                         await self.bot.send_message(
