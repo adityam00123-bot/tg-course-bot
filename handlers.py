@@ -949,8 +949,10 @@ def register_handlers(bot: Client) -> None:
     # -------------------------------------------------------------
     # Interactive Text Input State Machine (Links, Watermarks, Captions, Deletion)
     # -------------------------------------------------------------
-    @bot.on_message(filters.private & filters.text & ~filters.command(["start", "dashboard", "forward", "settings", "bots", "help", "cancel", "run", "stop", "range", "setrange"]))
+    @bot.on_message(filters.private & filters.incoming & ~filters.bot & ~filters.me & filters.text & ~filters.command(["start", "dashboard", "forward", "settings", "bots", "help", "cancel", "run", "stop", "range", "setrange"]))
     async def handle_user_text_input(_, message: Message):
+        if not message.from_user or message.from_user.is_bot:
+            return
         user_id = message.from_user.id
         engine = get_user_engine(user_id, bot)
         state_data = USER_STATES.get(user_id, {"state": STATE_NONE})
@@ -1298,8 +1300,9 @@ def register_handlers(bot: Client) -> None:
             await sync_user_dialogs(user_id, limit=100)
             return
 
-        # Default fallback
-        await message.reply_text("Please use the dashboard buttons or send /start to control the bot.")
+        # Default fallback - ignore unknown background texts when state is None to prevent spam loops
+        if curr_state != STATE_NONE:
+            await message.reply_text("ℹ️ Unrecognized input. Please use dashboard buttons or send /start to control the bot.")
 
     # -------------------------------------------------------------
     # Inline Callback Queries Handler
