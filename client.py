@@ -126,7 +126,18 @@ def create_bot_client() -> Client:
 
 
 def create_userbot_client(user_id: int = Config.OWNER_ID) -> Client:
-    """Create a userbot client for a specific user ID."""
+    """Create a userbot client for a specific user ID or Pyrogram StringSession."""
+    session_string = os.getenv("SESSION_STRING", "").strip() or os.getenv("USERBOT_SESSION_STRING", "").strip()
+    if session_string:
+        return Client(
+            name="userbot_session",
+            api_id=Config.API_ID,
+            api_hash=Config.API_HASH,
+            session_string=session_string,
+            in_memory=True,
+            max_concurrent_transmissions=Config.MAX_UPLOAD_WORKERS,
+            workers=16
+        )
     sess_name = get_user_session_name(user_id)
     return Client(
         name=sess_name,
@@ -144,7 +155,7 @@ USER_PROFILE_CACHE: Dict[int, Dict[str, Any]] = {}
 
 
 async def get_or_create_user_client(user_id: int) -> Optional[Client]:
-    """Retrieve an active Userbot Client for user_id or load from disk if session exists."""
+    """Retrieve an active Userbot Client for user_id or load from disk/env if session exists."""
     global USER_CLIENTS
 
     if user_id in USER_CLIENTS:
@@ -156,8 +167,9 @@ async def get_or_create_user_client(user_id: int) -> Optional[Client]:
                 logger.debug(f"Could not connect existing client for user {user_id}: {e}")
         return cl
 
+    session_string = os.getenv("SESSION_STRING", "").strip() or os.getenv("USERBOT_SESSION_STRING", "").strip()
     sess_path = get_user_session_path(user_id)
-    if not sess_path.exists():
+    if not session_string and not sess_path.exists():
         return None
 
     try:

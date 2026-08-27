@@ -1,0 +1,61 @@
+﻿name: 24/7 Telegram Auto-Migration Pipeline
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Trigger automatically every 6 hours
+  workflow_dispatch:        # Manual "Run workflow" button in GitHub Actions tab
+
+# Prevent duplicate concurrent migrations
+concurrency:
+  group: tg-migration-group
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    name: Run Telegram Migration Batch (5.5 Hours)
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install FFmpeg & Python Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute Headless Migration Pipeline
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+          SOURCE_CHAT_ID: ${{ secrets.SOURCE_CHAT_ID }}
+          DEST_CHAT_ID: ${{ secrets.DEST_CHAT_ID }}
+          MAX_RUN_SECONDS: 19200
+        run: |
+          python headless_runner.py
+
+      - name: Save Checkpoint Progress & Sync to Repo
+        if: always()
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase || true
+          git add migration_progress.json migration.log || true
+          git commit -m "chore: save migration checkpoint progress [skip ci]" || true
+          git push || true
