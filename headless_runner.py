@@ -1,4 +1,4 @@
-﻿"""
+"""
 Headless Telegram Migration Runner for GitHub Actions / 24/7 Cloud Automation.
 Runs non-interactively, auto-resumes from migration_progress.json, and gracefully
 stops before GitHub Actions 6-hour job timeout to save checkpoint.
@@ -42,8 +42,8 @@ async def run_headless():
     logger.info("  >> 24/7 GITHUB ACTIONS HEADLESS MIGRATION ENGINE <<  ")
     logger.info("=" * 65)
 
-    source_chat_id = os.getenv("SOURCE_CHAT_ID", "-1001895806383").strip()
-    dest_chat_id = os.getenv("DEST_CHAT_ID", "-1004317253896").strip()
+    source_chat_id = (os.getenv("SOURCE_CHAT_ID") or "").strip() or "-1001895806383"
+    dest_chat_id = (os.getenv("DEST_CHAT_ID") or "").strip() or "-1004317253896"
 
     # Convert numeric chat IDs if applicable
     try:

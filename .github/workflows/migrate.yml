@@ -1,4 +1,4 @@
-﻿name: 24/7 Telegram Auto-Migration Pipeline
+name: 24/7 Telegram Auto-Migration Pipeline
 
 on:
   schedule:
@@ -55,7 +55,5 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase || true
           git add migration_progress.json migration.log || true
-          git commit -m "chore: save migration checkpoint progress [skip ci]" || true
-          git push || true
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: save migration checkpoint progress [skip ci]" && git push) || true
