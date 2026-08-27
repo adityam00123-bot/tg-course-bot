@@ -287,9 +287,8 @@ async def complete_user_login(
             temp_client._cached_me = me
             USER_CLIENTS[user_id] = temp_client
             
-            import handlers
             name = f"{me.first_name or ''} {me.last_name or ''}".strip()
-            handlers.USER_PROFILE_CACHE[user_id] = {
+            USER_PROFILE_CACHE[user_id] = {
                 "is_logged_in": True,
                 "id": me.id,
                 "name": name or "Telegram User",
@@ -322,9 +321,8 @@ async def complete_user_login(
             temp_client._cached_me = me
             USER_CLIENTS[user_id] = temp_client
             
-            import handlers
             name = f"{me.first_name or ''} {me.last_name or ''}".strip()
-            handlers.USER_PROFILE_CACHE[user_id] = {
+            USER_PROFILE_CACHE[user_id] = {
                 "is_logged_in": True,
                 "id": me.id,
                 "name": name or "Telegram User",
