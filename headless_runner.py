@@ -93,12 +93,15 @@ async def run_headless():
     # Check last checkpoint
     last_checkpoint = load_checkpoint(source_chat, dest_chat)
 
-    # Support custom START_MSG_ID from environment (default to 266)
+    # Support custom START_MSG_ID from environment
     start_msg_id_env = (os.getenv("START_MSG_ID") or "").strip()
-    custom_start = int(start_msg_id_env) if (start_msg_id_env and start_msg_id_env.isdigit()) else 266
-    if last_checkpoint < custom_start:
+    if start_msg_id_env and start_msg_id_env.isdigit():
+        custom_start = int(start_msg_id_env)
         save_checkpoint(source_chat, dest_chat, custom_start - 1)
         last_checkpoint = custom_start - 1
+    elif last_checkpoint == 0:
+        save_checkpoint(source_chat, dest_chat, 265)
+        last_checkpoint = 265
 
     logger.info(f"🔄 Current Checkpoint: Message #{last_checkpoint} (Starting from #{last_checkpoint + 1})")
 
@@ -115,7 +118,7 @@ async def run_headless():
         dest_chat_id=dest_chat,
         dest_chat_title=f"Dest [{dest_chat}]",
         mode=MigrationMode.FULL,
-        start_msg_id=custom_start,
+        start_msg_id=last_checkpoint + 1,
         output_format=OutputFormat.VIDEO,
         enable_watermark=False,
         enable_custom_thumbnail=has_custom_thumb,
