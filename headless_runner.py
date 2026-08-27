@@ -63,21 +63,30 @@ async def run_headless():
     logger.info(f"📌 Max Duration:   {MAX_RUN_SECONDS // 60} minutes")
     logger.info("=" * 65)
 
-    # Initialize Bot Client (in-memory to prevent SQLite lock collisions)
-    bot = create_bot_client(in_memory=True)
-    await bot.start()
-    bot_me = await bot.get_me()
-    logger.info(f"✅ Bot Online: @{bot_me.username} (ID: {bot_me.id})")
-
     # Initialize Userbot Client (via SESSION_STRING or session file)
     userbot = await get_or_create_user_client(owner_id)
     if not userbot:
         logger.error("❌ Failed to initialize Userbot! Please ensure SESSION_STRING is set in GitHub Secrets.")
-        await bot.stop()
         sys.exit(1)
 
-    user_me = await userbot.get_me()
-    logger.info(f"✅ Userbot Online: {user_me.first_name} (@{user_me.username}, ID: {user_me.id})")
+    try:
+        user_me = await userbot.get_me()
+        user_name = getattr(user_me, "username", None) or getattr(user_me, "id", "User")
+        logger.info(f"✅ Userbot Online: (ID: {user_me.id}, @{user_name})")
+    except Exception:
+        pass
+
+    # Initialize Bot Client (with fallback to userbot if FloodWait or token error occurs)
+    bot = None
+    try:
+        b_client = create_bot_client(in_memory=True)
+        await b_client.start()
+        bot_me = await b_client.get_me()
+        logger.info(f"✅ Bot Online: @{bot_me.username} (ID: {bot_me.id})")
+        bot = b_client
+    except Exception as e:
+        logger.warning(f"⚠️ Bot client warning: {e}. Falling back to userbot client for notifications.")
+        bot = userbot
 
     from migration import MigrationMode, save_checkpoint
 
@@ -152,11 +161,13 @@ async def run_headless():
     logger.info("=" * 65)
 
     try:
-        await bot.stop()
+        if bot and bot != userbot:
+            await bot.stop()
     except Exception:
         pass
     try:
-        await userbot.stop()
+        if userbot:
+            await userbot.stop()
     except Exception:
         pass
 
