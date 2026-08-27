@@ -162,4 +162,10 @@ async def run_headless():
 
 
 if __name__ == "__main__":
-    asyncio.run(run_headless())
+    try:
+        asyncio.run(run_headless())
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    except Exception as e:
+        logger.exception(f"Unhandled exception in headless runner: {e}")
+        sys.exit(1)
