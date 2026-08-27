@@ -805,33 +805,72 @@ class MigrationEngine:
         else:
             ext = ".dat"
 
-        temp_target = Config.DOWNLOAD_DIR / f"media_{msg.chat.id}_{msg.id}{ext}"
-        
-        last_log = {"time": 0}
-        def _prog(current: int, total: int):
-            now = time.time()
-            if now - last_log["time"] >= 5 or current == total:
-                last_log["time"] = now
-                pct = (current / total * 100) if total else 0
-                logger.info(f"🔽 [Download #{msg.id}] {current / 1048576:.1f} / {total / 1048576:.1f} MB ({pct:.1f}%)")
+        expected_size = 0
+        if msg.video and msg.video.file_size:
+            expected_size = msg.video.file_size
+        elif msg.document and msg.document.file_size:
+            expected_size = msg.document.file_size
+        elif msg.audio and msg.audio.file_size:
+            expected_size = msg.audio.file_size
 
-        downloaded = await self._execute_with_flood_retry(
-            self.client.download_media,
-            message=msg,
-            file_name=str(temp_target),
-            progress=_prog
-        )
-        if downloaded and os.path.exists(downloaded):
-            p = Path(downloaded)
-            # Ensure the downloaded file has a valid photo extension for Telegram send_photo
-            if msg.photo and p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp"):
-                fixed_p = p.with_suffix(".jpg")
+        for attempt in range(1, 4):
+            if self.cancel_event.is_set():
+                return None
+
+            # Clean any stale partial file before attempting
+            if temp_target.exists():
                 try:
-                    p.rename(fixed_p)
-                    return fixed_p
+                    temp_target.unlink()
                 except Exception:
-                    return p
-            return p
+                    pass
+
+            last_log = {"time": 0}
+            def _prog(current: int, total: int):
+                now = time.time()
+                if now - last_log["time"] >= 5 or current == total:
+                    last_log["time"] = now
+                    pct = (current / total * 100) if total else 0
+                    logger.info(f"🔽 [Download #{msg.id}] {current / 1048576:.1f} / {total / 1048576:.1f} MB ({pct:.1f}%)")
+
+            try:
+                downloaded = await self._execute_with_flood_retry(
+                    self.client.download_media,
+                    message=msg,
+                    file_name=str(temp_target),
+                    progress=_prog
+                )
+            except Exception as dl_err:
+                logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/3 failed: {dl_err}")
+                downloaded = None
+
+            if downloaded and os.path.exists(downloaded):
+                actual_size = os.path.getsize(downloaded)
+                # Verify complete download (within 99% margin for metadata)
+                if expected_size > 0 and actual_size < (expected_size * 0.99):
+                    logger.warning(
+                        f"⚠️ [Download #{msg.id}] Incomplete file detected: "
+                        f"Got {actual_size / 1048576:.1f} MB / expected {expected_size / 1048576:.1f} MB. "
+                        f"Retrying download (Attempt {attempt}/3)..."
+                    )
+                    try:
+                        os.unlink(downloaded)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2)
+                    continue
+
+                p = Path(downloaded)
+                # Ensure the downloaded file has a valid photo extension for Telegram send_photo
+                if msg.photo and p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp"):
+                    fixed_p = p.with_suffix(".jpg")
+                    try:
+                        p.rename(fixed_p)
+                        return fixed_p
+                    except Exception:
+                        return p
+                return p
+
+        logger.error(f"❌ [Download #{msg.id}] Failed completely after 3 download attempts.")
         return None
 
     async def _upload_and_post_media(self, msg: Message, local_file_path: Path) -> None:
