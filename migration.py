@@ -805,6 +805,8 @@ class MigrationEngine:
         else:
             ext = ".dat"
 
+        temp_target = Config.DOWNLOAD_DIR / f"media_{msg.chat.id}_{msg.id}{ext}"
+
         expected_size = 0
         if msg.video and msg.video.file_size:
             expected_size = msg.video.file_size
