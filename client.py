@@ -113,7 +113,7 @@ def get_user_session_path(user_id: int) -> Path:
     return Config.SESSION_DIR / f"{sess_name}.session"
 
 
-def create_bot_client() -> Client:
+def create_bot_client(in_memory: bool = False) -> Client:
     """Create and configure the Pyrogram bot client instance."""
     return Client(
         name=Config.BOT_SESSION_NAME,
@@ -121,7 +121,7 @@ def create_bot_client() -> Client:
         api_hash=Config.API_HASH,
         bot_token=Config.BOT_TOKEN,
         workdir=str(Config.SESSION_DIR),
-        in_memory=False
+        in_memory=in_memory
     )
 
 
@@ -162,9 +162,9 @@ async def get_or_create_user_client(user_id: int) -> Optional[Client]:
         cl = USER_CLIENTS[user_id]
         if not cl.is_connected:
             try:
-                await cl.connect()
+                await cl.start()
             except Exception as e:
-                logger.debug(f"Could not connect existing client for user {user_id}: {e}")
+                logger.debug(f"Could not start existing client for user {user_id}: {e}")
         return cl
 
     session_string = os.getenv("SESSION_STRING", "").strip() or os.getenv("USERBOT_SESSION_STRING", "").strip()
@@ -175,7 +175,7 @@ async def get_or_create_user_client(user_id: int) -> Optional[Client]:
     try:
         cl = create_userbot_client(user_id)
         if not cl.is_connected:
-            await cl.connect()
+            await cl.start()
             
         me = getattr(cl, "me", None) or getattr(cl, "_cached_me", None)
         if not me:

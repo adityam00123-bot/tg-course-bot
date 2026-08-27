@@ -63,8 +63,8 @@ async def run_headless():
     logger.info(f"📌 Max Duration:   {MAX_RUN_SECONDS // 60} minutes")
     logger.info("=" * 65)
 
-    # Initialize Bot Client
-    bot = create_bot_client()
+    # Initialize Bot Client (in-memory to prevent SQLite lock collisions)
+    bot = create_bot_client(in_memory=True)
     await bot.start()
     bot_me = await bot.get_me()
     logger.info(f"✅ Bot Online: @{bot_me.username} (ID: {bot_me.id})")
@@ -83,27 +83,27 @@ async def run_headless():
     last_checkpoint = load_checkpoint(source_chat, dest_chat)
     logger.info(f"🔄 Current Checkpoint: Message #{last_checkpoint}")
 
+    from migration import MigrationMode
+
     # Build Migration Configuration
     mig_config = MigrationConfig(
         engine_type=EngineType.USERBOT,
         source_chat_id=source_chat,
-        source_title=f"Source [{source_chat}]",
+        source_chat_title=f"Source [{source_chat}]",
         dest_chat_id=dest_chat,
-        dest_title=f"Dest [{dest_chat}]",
+        dest_chat_title=f"Dest [{dest_chat}]",
+        mode=MigrationMode.FULL,
         output_format=OutputFormat.VIDEO,
-        replace_original_caption=False,
-        caption_template="",
-        start_msg_id=0,
-        end_msg_id=0,
-        full_channel=True
+        enable_watermark=False,
+        enable_custom_thumbnail=False
     )
 
     engine = MigrationEngine(
-        bot_client=bot,
-        userbot_client=userbot,
-        owner_id=owner_id,
-        config=mig_config
+        userbot=userbot,
+        bot=bot,
+        owner_id=owner_id
     )
+    engine.config = mig_config
 
     # Launch migration job
     logger.info("🚀 Launching Streaming Migration Pipeline...")
@@ -126,7 +126,7 @@ async def run_headless():
     if engine._running_task and not engine._running_task.done():
         try:
             await asyncio.wait_for(engine._running_task, timeout=15)
-        except Exception:
+        except (asyncio.CancelledError, Exception):
             pass
 
     # Save final logs & shutdown clients
