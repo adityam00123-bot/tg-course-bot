@@ -619,6 +619,9 @@ class MigrationEngine:
         Preserves 100% of Telegram Premium Custom Emojis, Entities, and Blockquotes.
         Returns True if successfully sent, False if restricted or unsupported.
         """
+        if getattr(self, "_chat_forwards_restricted", False):
+            return False
+
         try:
             caption, caption_entities = self._apply_caption(msg.caption, msg.caption_entities)
 
@@ -774,7 +777,12 @@ class MigrationEngine:
                 return True
 
         except Exception as e:
-            logger.info(f"Instant server copy skipped for #{msg.id} ({e}). Seamlessly switching to local stream...")
+            err_str = str(e).upper()
+            if "CHAT_FORWARDS_RESTRICTED" in err_str or "USER_BANNED_IN_CHANNEL" in err_str:
+                self._chat_forwards_restricted = True
+                logger.info(f"🔒 Source channel is forward-restricted. Bypassing instant server copy for all future messages (Turbo Mode ON)!")
+            else:
+                logger.info(f"Instant server copy skipped for #{msg.id} ({e}). Seamlessly switching to local stream...")
             return False
 
         return False
@@ -1256,8 +1264,11 @@ class MigrationEngine:
             msg.document and msg.document.file_name and
             any(msg.document.file_name.lower().endswith(v) for v in self._VIDEO_EXTS)
         )
-        if not (msg.video or is_doc_video):
-            return False
+        if msg.video or is_doc_video:
+            return True
+
+        if msg.document and (msg.document.file_size or 0) > 10 * 1024 * 1024:
+            return True
 
         return bool(
             self.config.enable_watermark or
@@ -1755,12 +1766,7 @@ class MigrationEngine:
             last_progress_count = 0
 
             # ── Detect pipeline mode ──────────────────────────────────
-            pipeline_active = bool(
-                self.config.enable_watermark or
-                self.config.clean_old_watermark or
-                self.config.enable_custom_thumbnail or
-                self.config.strip_existing_thumbnail
-            )
+            pipeline_active = True
 
             if pipeline_active:
                 cpu_cores = max(1, (os.cpu_count() or 2) - 1)
