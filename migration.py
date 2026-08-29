@@ -851,8 +851,22 @@ class MigrationEngine:
                     progress=_prog
                 )
             except Exception as dl_err:
-                logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/3 failed: {dl_err}")
-                downloaded = None
+                # Fallback: if userbot fails (AUTH_BYTES_INVALID on different DC), try bot client
+                if self.userbot and self.client and "AUTH_BYTES_INVALID" in str(dl_err):
+                    logger.info(f"🔄 [Download #{msg.id}] Retrying via Bot client (DC auth fallback)...")
+                    try:
+                        downloaded = await self._execute_with_flood_retry(
+                            self.client.download_media,
+                            message=msg,
+                            file_name=str(temp_target),
+                            progress=_prog
+                        )
+                    except Exception as bot_dl_err:
+                        logger.warning(f"⚠️ [Download #{msg.id}] Bot fallback also failed: {bot_dl_err}")
+                        downloaded = None
+                else:
+                    logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/3 failed: {dl_err}")
+                    downloaded = None
 
             if not downloaded or not os.path.exists(downloaded):
                 await asyncio.sleep(3)
@@ -1262,18 +1276,20 @@ class MigrationEngine:
     _VIDEO_EXTS = frozenset([".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts", ".flv", ".m4v", ".3gp"])
 
     def _msg_needs_pipeline(self, msg: Message) -> bool:
-        """Check if a message requires the concurrent download→process→upload pipeline."""
+        """Check if a message requires the concurrent download→process→upload pipeline.
+        Route ALL media through pipeline for maximum parallel throughput."""
         if not msg or not msg.media:
             return False
+
+        # Route ALL downloadable media through pipeline for parallel processing
+        if msg.video or msg.photo or msg.document or msg.audio or msg.animation:
+            return True
 
         is_doc_video = bool(
             msg.document and msg.document.file_name and
             any(msg.document.file_name.lower().endswith(v) for v in self._VIDEO_EXTS)
         )
-        if msg.video or is_doc_video:
-            return True
-
-        if msg.document and (msg.document.file_size or 0) > 10 * 1024 * 1024:
+        if is_doc_video:
             return True
 
         return bool(
@@ -1489,35 +1505,75 @@ class MigrationEngine:
             except Exception:
                 raw_entities = None
 
-        if self.config.output_format == OutputFormat.VIDEO:
-            v_dur = getattr(msg.video, "duration", 0) or 0
-            v_w = getattr(msg.video, "width", 0) or 0
-            v_h = getattr(msg.video, "height", 0) or 0
+        if msg.photo:
+            # Photos use InputMediaUploadedPhoto (not Document)
+            media = raw.types.InputMediaUploadedPhoto(
+                file=slot.raw_input_file,
+            )
+        elif msg.video or (msg.document and msg.document.file_name and any(msg.document.file_name.lower().endswith(v) for v in self._VIDEO_EXTS)):
+            if self.config.output_format == OutputFormat.VIDEO:
+                v_dur = getattr(msg.video, "duration", 0) or 0
+                v_w = getattr(msg.video, "width", 0) or 0
+                v_h = getattr(msg.video, "height", 0) or 0
 
+                attributes = [
+                    raw.types.DocumentAttributeVideo(
+                        duration=v_dur,
+                        w=v_w,
+                        h=v_h,
+                        supports_streaming=True
+                    ),
+                    raw.types.DocumentAttributeFilename(file_name=doc_name)
+                ]
+                media = raw.types.InputMediaUploadedDocument(
+                    file=slot.raw_input_file,
+                    thumb=slot.raw_thumb_file,
+                    mime_type="video/mp4",
+                    attributes=attributes,
+                    force_file=False
+                )
+            else:
+                attributes = [raw.types.DocumentAttributeFilename(file_name=doc_name)]
+                media = raw.types.InputMediaUploadedDocument(
+                    file=slot.raw_input_file,
+                    thumb=slot.raw_thumb_file,
+                    mime_type="application/octet-stream",
+                    attributes=attributes,
+                    force_file=True
+                )
+        elif msg.audio:
+            mime = getattr(msg.audio, "mime_type", "audio/mpeg") or "audio/mpeg"
             attributes = [
-                raw.types.DocumentAttributeVideo(
-                    duration=v_dur,
-                    w=v_w,
-                    h=v_h,
-                    supports_streaming=True
+                raw.types.DocumentAttributeAudio(
+                    duration=msg.audio.duration or 0,
+                    performer=msg.audio.performer or "",
+                    title=msg.audio.title or ""
                 ),
                 raw.types.DocumentAttributeFilename(file_name=doc_name)
             ]
             media = raw.types.InputMediaUploadedDocument(
                 file=slot.raw_input_file,
                 thumb=slot.raw_thumb_file,
-                mime_type="video/mp4",
+                mime_type=mime,
                 attributes=attributes,
                 force_file=False
             )
         else:
+            # Generic document / animation
+            mime = "application/octet-stream"
+            if msg.animation:
+                mime = "video/mp4"
+            elif msg.document and msg.document.mime_type:
+                mime = msg.document.mime_type
             attributes = [raw.types.DocumentAttributeFilename(file_name=doc_name)]
+            if msg.animation:
+                attributes.append(raw.types.DocumentAttributeAnimated())
             media = raw.types.InputMediaUploadedDocument(
                 file=slot.raw_input_file,
                 thumb=slot.raw_thumb_file,
-                mime_type="application/octet-stream",
+                mime_type=mime,
                 attributes=attributes,
-                force_file=True
+                force_file=bool(msg.document and not msg.animation)
             )
 
         try:
@@ -1540,7 +1596,7 @@ class MigrationEngine:
                 raise send_err
 
     async def _pipeline_upload_slot(self, slot: _PipelineSlot) -> None:
-        """Upload a pre-processed pipeline video to the destination channel in strict sequence."""
+        """Upload a pre-processed pipeline media to the destination channel in strict sequence."""
         msg = slot.msg
         dest_chat = self.config.dest_chat_id
         caption, caption_entities = self._apply_caption(msg.caption, msg.caption_entities)
@@ -1549,26 +1605,57 @@ class MigrationEngine:
             if slot.raw_input_file:
                 await self._send_pre_uploaded_media(slot, dest_chat, caption, caption_entities)
                 self.stats.media_count += 1
-                logger.info(f"⚡ [Pipeline] Fast-Published video #{msg.id} → Dest in ~50ms")
+                media_type = "video" if msg.video else "photo" if msg.photo else "document" if msg.document else "media"
+                logger.info(f"⚡ [Pipeline] Fast-Published {media_type} #{msg.id} → Dest in ~50ms")
             else:
                 upload_path = slot.upload_path or str(slot.local_path)
                 safe_thumb = slot.thumb_path if (slot.thumb_path and os.path.exists(slot.thumb_path)) else None
                 if os.path.exists(upload_path):
                     self.stats.total_bytes_migrated += Path(upload_path).stat().st_size
-                if self.config.output_format == OutputFormat.VIDEO:
-                    v_dur = getattr(msg.video, "duration", 0) or 0
-                    v_w = getattr(msg.video, "width", 0) or 0
-                    v_h = getattr(msg.video, "height", 0) or 0
+
+                if msg.photo:
                     await self._execute_with_flood_retry(
-                        self.client.send_video, chat_id=dest_chat, video=upload_path, caption=caption, caption_entities=caption_entities, thumb=safe_thumb, duration=v_dur, width=v_w, height=v_h, supports_streaming=True
+                        self.client.send_photo, chat_id=dest_chat, photo=upload_path,
+                        caption=caption, caption_entities=caption_entities
+                    )
+                elif msg.video or (msg.document and msg.document.file_name and any(msg.document.file_name.lower().endswith(v) for v in self._VIDEO_EXTS)):
+                    if self.config.output_format == OutputFormat.VIDEO:
+                        v_dur = getattr(msg.video, "duration", 0) or 0
+                        v_w = getattr(msg.video, "width", 0) or 0
+                        v_h = getattr(msg.video, "height", 0) or 0
+                        await self._execute_with_flood_retry(
+                            self.client.send_video, chat_id=dest_chat, video=upload_path, caption=caption, caption_entities=caption_entities, thumb=safe_thumb, duration=v_dur, width=v_w, height=v_h, supports_streaming=True
+                        )
+                    else:
+                        doc_name = (getattr(msg.document, "file_name", None) if msg.document else None) or f"{slot.local_path.stem if slot.local_path else 'file'}.mp4"
+                        await self._execute_with_flood_retry(
+                            self.client.send_document, chat_id=dest_chat, document=upload_path, caption=caption, caption_entities=caption_entities, thumb=safe_thumb, file_name=doc_name, force_document=True
+                        )
+                elif msg.audio:
+                    await self._execute_with_flood_retry(
+                        self.client.send_audio, chat_id=dest_chat, audio=upload_path,
+                        caption=caption, caption_entities=caption_entities,
+                        duration=msg.audio.duration or 0, performer=msg.audio.performer, title=msg.audio.title
+                    )
+                elif msg.document:
+                    doc_name = getattr(msg.document, "file_name", None) or "file.bin"
+                    await self._execute_with_flood_retry(
+                        self.client.send_document, chat_id=dest_chat, document=upload_path,
+                        caption=caption, caption_entities=caption_entities, file_name=doc_name
+                    )
+                elif msg.animation:
+                    await self._execute_with_flood_retry(
+                        self.client.send_animation, chat_id=dest_chat, animation=upload_path,
+                        caption=caption, caption_entities=caption_entities
                     )
                 else:
-                    doc_name = (getattr(msg.document, "file_name", None) if msg.document else None) or f"{slot.local_path.stem if slot.local_path else 'file'}.mp4"
                     await self._execute_with_flood_retry(
-                        self.client.send_document, chat_id=dest_chat, document=upload_path, caption=caption, caption_entities=caption_entities, thumb=safe_thumb, file_name=doc_name, force_document=True
+                        self.client.send_document, chat_id=dest_chat, document=upload_path,
+                        caption=caption, caption_entities=caption_entities
                     )
                 self.stats.media_count += 1
-                logger.info(f"✅ [Pipeline] Uploaded video #{msg.id} → Dest")
+                media_type = "video" if msg.video else "photo" if msg.photo else "document" if msg.document else "media"
+                logger.info(f"✅ [Pipeline] Uploaded {media_type} #{msg.id} → Dest")
         finally:
             if slot.local_path: cleanup_temp_file(slot.local_path)
             for p in slot.extra_temps: cleanup_temp_file(p)
