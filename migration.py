@@ -1786,8 +1786,8 @@ class MigrationEngine:
             # Send immediate initial progress update
             await self._send_progress_update(is_final=False)
 
-            # Streaming batch size (reduced to 8 to prevent disk budget deadlocks with large videos)
-            chunk_size = 8
+            # Streaming batch size
+            chunk_size = 16
             last_progress_count = 0
 
             # ── Detect pipeline mode ──────────────────────────────────
@@ -1795,18 +1795,18 @@ class MigrationEngine:
 
             if pipeline_active:
                 cpu_cores = max(1, (os.cpu_count() or 2) - 1)
-                download_sem = asyncio.Semaphore(2)
+                download_sem = asyncio.Semaphore(4)
                 ffmpeg_sem = asyncio.Semaphore(max(1, cpu_cores))
-                upload_sem = asyncio.Semaphore(2)
+                upload_sem = asyncio.Semaphore(4)
                 disk_lock = asyncio.Lock()
                 disk_state = {"used": 0}
                 disk_freed = asyncio.Event()
                 disk_freed.set()
                 budget_mb = _get_disk_budget(Config.DOWNLOAD_DIR) // (1024 * 1024)
                 logger.info(
-                    f"🚀 [Pipeline] Concurrent mode ON — "
-                    f"{2} downloaders, {max(1, cpu_cores)} FFmpeg workers, "
-                    f"disk budget ~{budget_mb} MB"
+                    f"🚀 [Pipeline] Turbo Hardware Mode ON — "
+                    f"4 parallel downloaders, {max(1, cpu_cores)} FFmpeg workers, 4 parallel uploaders, "
+                    f"disk buffer budget ~{budget_mb} MB"
                 )
 
             # -- Dynamic Sliding Window Streaming Pipeline --
