@@ -1469,9 +1469,18 @@ class MigrationEngine:
             try:
                 raw_entities = []
                 for entity in caption_entities:
-                    if hasattr(entity, "write"): raw_entities.append(entity.write())
-                    else: raw_entities.append(entity)
-            except Exception: raw_entities = None
+                    if hasattr(entity, "write") and not isinstance(entity, raw.core.TLObject):
+                        try:
+                            w = entity.write()
+                            if asyncio.iscoroutine(w):
+                                w = await w
+                            raw_entities.append(w)
+                        except Exception:
+                            raw_entities.append(entity)
+                    else:
+                        raw_entities.append(entity)
+            except Exception:
+                raw_entities = None
 
         if self.config.output_format == OutputFormat.VIDEO:
             v_dur = getattr(msg.video, "duration", 0) or 0
@@ -1504,12 +1513,24 @@ class MigrationEngine:
                 force_file=True
             )
 
-        await self._execute_with_flood_retry(
-            self.client.invoke,
-            raw.functions.messages.SendMedia(
-                peer=peer, media=media, message=caption or "", entities=raw_entities, random_id=self.client.rnd_id()
+        try:
+            await self._execute_with_flood_retry(
+                self.client.invoke,
+                raw.functions.messages.SendMedia(
+                    peer=peer, media=media, message=caption or "", entities=raw_entities, random_id=self.client.rnd_id()
+                )
             )
-        )
+        except Exception as send_err:
+            if raw_entities:
+                logger.warning(f"SendMedia entity formatting fallback for #{msg.id}: {send_err}. Publishing with plain caption...")
+                await self._execute_with_flood_retry(
+                    self.client.invoke,
+                    raw.functions.messages.SendMedia(
+                        peer=peer, media=media, message=caption or "", entities=None, random_id=self.client.rnd_id()
+                    )
+                )
+            else:
+                raise send_err
 
     async def _pipeline_upload_slot(self, slot: _PipelineSlot) -> None:
         """Upload a pre-processed pipeline video to the destination channel in strict sequence."""
