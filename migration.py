@@ -881,6 +881,14 @@ class MigrationEngine:
         extra_temp_files: List[Path] = []
         caption, caption_entities = self._apply_caption(msg.caption, msg.caption_entities)
 
+        up_log = {"time": 0}
+        def _up_prog(current: int, total: int):
+            now = time.time()
+            if now - up_log["time"] >= 5 or current == total:
+                up_log["time"] = now
+                pct = (current / total * 100) if total else 0
+                logger.info(f"🔼 [Upload #{msg.id}] {current / 1048576:.1f} / {total / 1048576:.1f} MB ({pct:.1f}%)")
+
         try:
             file_bytes = local_file_path.stat().st_size
             self.stats.total_bytes_migrated += file_bytes
@@ -968,7 +976,8 @@ class MigrationEngine:
                         duration=v_dur,
                         width=v_w,
                         height=v_h,
-                        supports_streaming=True
+                        supports_streaming=True,
+                        progress=_up_prog
                     )
                     self.stats.media_count += 1
                     logger.info(f"✅ Migrated streamable video #{msg.id} -> Dest Channel")
@@ -983,7 +992,8 @@ class MigrationEngine:
                         caption_entities=caption_entities,
                         thumb=safe_thumb,
                         file_name=doc_name,
-                        force_document=True
+                        force_document=True,
+                        progress=_up_prog
                     )
                     self.stats.media_count += 1
                     logger.info(f"✅ Migrated video as document file #{msg.id} -> Dest Channel")
@@ -1002,7 +1012,8 @@ class MigrationEngine:
                     document=str(local_file_path),
                     caption=caption,
                     caption_entities=caption_entities,
-                    file_name=msg.document.file_name
+                    file_name=msg.document.file_name,
+                    progress=_up_prog
                 )
                 self.stats.media_count += 1
                 logger.info(f"✅ Migrated document message #{msg.id} -> Dest Channel")
