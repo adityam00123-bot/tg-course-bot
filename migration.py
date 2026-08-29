@@ -874,6 +874,31 @@ class MigrationEngine:
 
             if downloaded and os.path.exists(downloaded):
                 actual_size = os.path.getsize(downloaded)
+                
+                if actual_size == 0:
+                    logger.warning(f"⚠️ [Download #{msg.id}] Pyrogram returned 0-byte file (possible AUTH_BYTES_INVALID).")
+                    try:
+                        os.unlink(downloaded)
+                    except Exception:
+                        pass
+                    if dl_client == self.userbot and self.client:
+                        logger.info(f"🔄 [Download #{msg.id}] Retrying via Bot client (DC auth fallback)...")
+                        try:
+                            downloaded = await self._execute_with_flood_retry(
+                                self.client.download_media, message=msg, file_name=str(temp_target), progress=_prog
+                            )
+                            if downloaded and os.path.exists(downloaded):
+                                actual_size = os.path.getsize(downloaded)
+                                if actual_size == 0:
+                                    os.unlink(downloaded)
+                                    downloaded = None
+                        except Exception as bot_dl_err:
+                            logger.warning(f"⚠️ [Download #{msg.id}] Bot fallback also failed: {bot_dl_err}")
+                            downloaded = None
+                    if not downloaded or actual_size == 0:
+                        await asyncio.sleep(2)
+                        continue
+
                 # Verify complete download (within 99% margin for metadata)
                 if expected_size > 0 and actual_size < (expected_size * 0.99):
                     logger.warning(
@@ -1360,8 +1385,10 @@ class MigrationEngine:
                 upload_path = str(slot.local_path)
                 extra_temps: List[Path] = []
 
+                is_video = bool(msg.video or (msg.document and msg.document.file_name and any(msg.document.file_name.lower().endswith(v) for v in self._VIDEO_EXTS)))
+
                 # A0. Clean/Mask old watermark
-                if self.config.clean_old_watermark:
+                if is_video and self.config.clean_old_watermark:
                     cleaned_path = slot.local_path.with_name(f"cleaned_{slot.local_path.name}")
                     extra_temps.append(cleaned_path)
                     clean_res = await remove_or_mask_watermark(
@@ -1374,7 +1401,7 @@ class MigrationEngine:
                         upload_path = clean_res
 
                 # A. Apply anti-theft watermark
-                if self.config.enable_watermark:
+                if is_video and self.config.enable_watermark:
                     wm_path = slot.local_path.with_name(f"wm_{slot.local_path.name}")
                     extra_temps.append(wm_path)
                     logger.info(f"🎨 [Pipeline] Watermarking #{msg.id}...")
@@ -1392,11 +1419,12 @@ class MigrationEngine:
                         and os.path.exists(self.config.custom_thumbnail_path)):
                     thumb_path = str(Path(self.config.custom_thumbnail_path).resolve())
                 elif self.config.strip_existing_thumbnail:
-                    extracted = slot.local_path.with_name(f"clean_thumb_{slot.local_path.stem}.jpg")
-                    extra_temps.append(extracted)
-                    thumb_res = await extract_video_thumbnail(upload_path, extracted)
-                    if thumb_res and os.path.exists(thumb_res):
-                        thumb_path = str(thumb_res)
+                    if is_video:
+                        extracted = slot.local_path.with_name(f"clean_thumb_{slot.local_path.stem}.jpg")
+                        extra_temps.append(extracted)
+                        thumb_res = await extract_video_thumbnail(upload_path, extracted)
+                        if thumb_res and os.path.exists(thumb_res):
+                            thumb_path = str(thumb_res)
                 else:
                     thumbs = getattr(msg.video, "thumbs", None) or getattr(msg.document, "thumbs", None)
                     if thumbs:
@@ -1415,7 +1443,7 @@ class MigrationEngine:
                             pass
 
                 # C. Remux to streamable MP4 if needed
-                if self.config.output_format == OutputFormat.VIDEO and not upload_path.lower().endswith(".mp4"):
+                if is_video and self.config.output_format == OutputFormat.VIDEO and not upload_path.lower().endswith(".mp4"):
                     remuxed = slot.local_path.with_name(f"stream_{slot.local_path.stem}.mp4")
                     extra_temps.append(remuxed)
                     upload_path = await remux_to_streamable_mp4(upload_path, remuxed)
