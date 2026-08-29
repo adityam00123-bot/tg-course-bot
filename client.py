@@ -114,14 +114,16 @@ def get_user_session_path(user_id: int) -> Path:
 
 
 def create_bot_client(in_memory: bool = False) -> Client:
-    """Create and configure the Pyrogram bot client instance."""
+    """Create and configure the Pyrogram bot client instance with ultra-fast multi-worker MTProto sockets."""
     return Client(
         name=Config.BOT_SESSION_NAME,
         api_id=Config.API_ID,
         api_hash=Config.API_HASH,
         bot_token=Config.BOT_TOKEN,
         workdir=str(Config.SESSION_DIR),
-        in_memory=in_memory
+        in_memory=in_memory,
+        max_concurrent_transmissions=Config.MAX_UPLOAD_WORKERS,
+        workers=16
     )
 
 

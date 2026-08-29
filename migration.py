@@ -842,9 +842,10 @@ class MigrationEngine:
                     pct = (current / total * 100) if total else 0
                     logger.info(f"🔽 [Download #{msg.id}] {current / 1048576:.1f} / {total / 1048576:.1f} MB ({pct:.1f}%)")
 
+            dl_client = self.userbot or self.client
             try:
                 downloaded = await self._execute_with_flood_retry(
-                    self.client.download_media,
+                    dl_client.download_media,
                     message=msg,
                     file_name=str(temp_target),
                     progress=_prog
@@ -953,8 +954,9 @@ class MigrationEngine:
                     if thumbs:
                         try:
                             biggest_thumb = thumbs[-1]
+                            dl_client = self.userbot or self.client
                             thumb_file = await self._execute_with_flood_retry(
-                                self.client.download_media,
+                                dl_client.download_media,
                                 message=biggest_thumb.file_id,
                                 file_name=str(Config.DOWNLOAD_DIR / f"thumb_{msg.chat.id}_{msg.id}.jpg")
                             )
@@ -1384,8 +1386,9 @@ class MigrationEngine:
                     if thumbs:
                         try:
                             biggest = thumbs[-1]
+                            dl_client = self.userbot or self.client
                             tf = await self._execute_with_flood_retry(
-                                self.client.download_media,
+                                dl_client.download_media,
                                 message=biggest.file_id,
                                 file_name=str(Config.DOWNLOAD_DIR / f"thumb_{msg.chat.id}_{msg.id}.jpg"),
                             )

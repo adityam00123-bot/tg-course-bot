@@ -161,9 +161,9 @@ def format_chat_display(chat_id: Union[int, str], title: Optional[str] = None, u
     return f"Chat [{chat_id}]"
 
 
-def cleanup_temp_file(path: Union[str, Path, None]) -> None:
+def cleanup_temp_file(path: Union[str, Path]) -> None:
     """
-    Safely delete a temporary downloaded file.
+    Safely delete a temporary downloaded file with Windows retry support.
     """
     if not path:
         return
@@ -171,10 +171,15 @@ def cleanup_temp_file(path: Union[str, Path, None]) -> None:
     try:
         p = Path(path)
         if p.exists() and p.is_file():
-            p.unlink()
-            logger.debug(f"Removed temporary file: {p}")
+            for _ in range(3):
+                try:
+                    p.unlink(missing_ok=True)
+                    logger.debug(f"Removed temporary file: {p}")
+                    return
+                except (PermissionError, OSError):
+                    time.sleep(0.1)
     except Exception as e:
-        logger.warning(f"Failed to delete temp file '{path}': {e}")
+        logger.debug(f"Temporary file cleanup deferred for '{path}': {e}")
 
 
 def format_seconds(seconds: float) -> str:
