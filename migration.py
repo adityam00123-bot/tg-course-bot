@@ -853,6 +853,10 @@ class MigrationEngine:
                 logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/3 failed: {dl_err}")
                 downloaded = None
 
+            if not downloaded or not os.path.exists(downloaded):
+                await asyncio.sleep(3)
+                continue
+
             if downloaded and os.path.exists(downloaded):
                 actual_size = os.path.getsize(downloaded)
                 # Verify complete download (within 99% margin for metadata)
