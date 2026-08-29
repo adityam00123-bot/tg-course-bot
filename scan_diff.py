@@ -32,6 +32,10 @@ async def scan():
     await app.start()
     print("✅ Logged in successfully!")
 
+    print("🔄 Syncing dialogs to load channel access keys...")
+    async for dialog in app.get_dialogs(limit=100):
+        pass
+
     try:
         print(f"\n[2/3] 📥 Scanning Source Channel ({source_id})...")
         source_msgs = {}
