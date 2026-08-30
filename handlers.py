@@ -46,7 +46,9 @@ from migration import (
     EngineType,
     get_user_engine,
     load_checkpoint,
-    reset_checkpoint
+    reset_checkpoint,
+    get_failed_messages,
+    remove_failed_message
 )
 import database
 
@@ -999,6 +1001,72 @@ def register_handlers(bot: Client) -> None:
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]]),
                 parse_mode=enums.ParseMode.HTML
             )
+
+    # -------------------------------------------------------------
+    # /failed or /retry_failed Command Handler (Recover Missed Messages)
+    # -------------------------------------------------------------
+    @bot.on_message(filters.private & filters.command(["failed", "retry_failed", "recover"]))
+    async def handle_failed_messages_command(_, message: Message):
+        user_id = message.from_user.id
+        engine = get_user_engine(user_id, bot)
+
+        if not engine.config.source_chat_id or not engine.config.dest_chat_id:
+            await message.reply_text("⚠️ <b>Please select source and destination channels first in /dashboard.</b>", parse_mode=enums.ParseMode.HTML)
+            return
+
+        failed_ids = get_failed_messages(engine.config.source_chat_id, engine.config.dest_chat_id)
+        if not failed_ids:
+            await message.reply_text("✅ <b>0 Failed Messages!</b>\nAll messages have been migrated with 100% data integrity.", parse_mode=enums.ParseMode.HTML)
+            return
+
+        if engine.is_busy():
+            await message.reply_text(
+                f"ℹ️ <b>Migration is currently running.</b>\n"
+                f"<b>{len(failed_ids)}</b> missed message(s) are queued in the Vault and will be <b>automatically backfilled</b> at the end of the run.",
+                parse_mode=enums.ParseMode.HTML
+            )
+            return
+
+        engine.owner_id = user_id
+        if engine.config.engine_type == EngineType.USERBOT:
+            from client import get_or_create_user_client
+            engine.userbot = await get_or_create_user_client(user_id)
+
+        status_msg = await message.reply_text(
+            f"🔄 <b>Starting Recovery for {len(failed_ids)} Missed Message(s)...</b>\n\n"
+            f"📋 <b>Queue:</b> <code>{failed_ids[:20]}</code>\n"
+            f"⏳ <i>Connecting fresh MTProto session...</i>",
+            parse_mode=enums.ParseMode.HTML
+        )
+
+        recovered = 0
+        still_failed = 0
+        retry_client = engine.userbot or engine.client
+
+        for fid in list(failed_ids):
+            try:
+                fetch_res = await retry_client.get_messages(engine.config.source_chat_id, message_ids=[fid])
+                target_msg = fetch_res[0] if isinstance(fetch_res, list) and len(fetch_res) > 0 else fetch_res
+                if target_msg and not target_msg.empty:
+                    await engine._migrate_single_message(target_msg)
+                    remove_failed_message(engine.config.source_chat_id, engine.config.dest_chat_id, fid)
+                    recovered += 1
+                else:
+                    remove_failed_message(engine.config.source_chat_id, engine.config.dest_chat_id, fid)
+            except Exception as r_err:
+                still_failed += 1
+                logger.warning(f"Manual retry for #{fid} failed: {r_err}")
+
+        await status_msg.edit_text(
+            f"🏁 <b>Missed Messages Recovery Pass Finished!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ <b>Successfully Recovered:</b> {recovered}\n"
+            f"❌ <b>Remaining Errors:</b> {still_failed}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<i>Destination channel is now 100% up to date.</i>",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]]),
+            parse_mode=enums.ParseMode.HTML
+        )
 
     # -------------------------------------------------------------
     # Photo & Document Upload Handler (Custom Thumbnail Cover)

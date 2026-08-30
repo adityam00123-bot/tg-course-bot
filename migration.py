@@ -114,6 +114,65 @@ def reset_checkpoint(source_id: Any, dest_id: Any) -> None:
         logger.debug(f"Could not reset checkpoint: {e}")
 
 
+FAILED_MESSAGES_FILE = Config.BASE_DIR / "failed_messages.json"
+
+
+def record_failed_message(source_id: Any, dest_id: Any, msg_id: int, error_reason: str = "") -> None:
+    """Records a failed message ID so it can be automatically backfilled without data loss."""
+    try:
+        data = {}
+        if FAILED_MESSAGES_FILE.exists():
+            try:
+                with open(FAILED_MESSAGES_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        key = _get_checkpoint_key(source_id, dest_id)
+        if key not in data or not isinstance(data[key], list):
+            data[key] = []
+        if not any((m == msg_id if isinstance(m, int) else m.get("id") == msg_id) for m in data[key]):
+            data[key].append({"id": msg_id, "error": str(error_reason)[:120], "time": int(time.time())})
+        with open(FAILED_MESSAGES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.debug(f"Could not record failed message: {e}")
+
+
+def remove_failed_message(source_id: Any, dest_id: Any, msg_id: int) -> None:
+    """Removes a message from the failed registry once successfully migrated."""
+    try:
+        if FAILED_MESSAGES_FILE.exists():
+            with open(FAILED_MESSAGES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            key = _get_checkpoint_key(source_id, dest_id)
+            if key in data and isinstance(data[key], list):
+                data[key] = [m for m in data[key] if (m != msg_id if isinstance(m, int) else m.get("id") != msg_id)]
+                with open(FAILED_MESSAGES_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.debug(f"Could not remove failed message: {e}")
+
+
+def get_failed_messages(source_id: Any, dest_id: Any) -> List[int]:
+    """Retrieves all failed message IDs awaiting backfill for this channel pair."""
+    try:
+        if FAILED_MESSAGES_FILE.exists():
+            with open(FAILED_MESSAGES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            key = _get_checkpoint_key(source_id, dest_id)
+            if key in data and isinstance(data[key], list):
+                ids = []
+                for m in data[key]:
+                    if isinstance(m, int):
+                        ids.append(m)
+                    elif isinstance(m, dict) and "id" in m:
+                        ids.append(int(m["id"]))
+                return sorted(list(set(ids)))
+    except Exception as e:
+        logger.debug(f"Could not get failed messages: {e}")
+    return []
+
+
 class EngineType(str, Enum):
     USERBOT = "userbot"
     BOT_ADMIN = "bot_admin"
@@ -2318,12 +2377,14 @@ class MigrationEngine:
                     try:
                         await self._migrate_single_message(msg)
                         self.stats.processed_count += 1
+                        remove_failed_message(self.config.source_chat_id, self.config.dest_chat_id, msg.id)
                         save_checkpoint(self.config.source_chat_id, self.config.dest_chat_id, msg.id)
                     except Exception as msg_err:
                         self.stats.failed_count += 1
                         self.stats.processed_count += 1
+                        record_failed_message(self.config.source_chat_id, self.config.dest_chat_id, msg.id, str(msg_err))
                         save_checkpoint(self.config.source_chat_id, self.config.dest_chat_id, msg.id)
-                        logger.error(f"? Error migrating message #{msg.id}: {msg_err}")
+                        logger.error(f"❌ Error migrating message #{msg.id}: {msg_err}")
                         
                 elif action == "pipeline":
                     slot = item[1]
@@ -2337,12 +2398,14 @@ class MigrationEngine:
                         await self._pipeline_upload_slot(slot)
                         
                         self.stats.processed_count += 1
+                        remove_failed_message(self.config.source_chat_id, self.config.dest_chat_id, slot.msg.id)
                         save_checkpoint(self.config.source_chat_id, self.config.dest_chat_id, slot.msg.id)
                     except Exception as msg_err:
                         self.stats.failed_count += 1
                         self.stats.processed_count += 1
+                        record_failed_message(self.config.source_chat_id, self.config.dest_chat_id, slot.msg.id, str(msg_err))
                         save_checkpoint(self.config.source_chat_id, self.config.dest_chat_id, slot.msg.id)
-                        logger.error(f"? Error migrating message #{slot.msg.id}: {msg_err}")
+                        logger.error(f"❌ Error migrating message #{slot.msg.id}: {msg_err}")
                     finally:
                         # Release disk budget strictly after upload!
                         if slot.local_path: cleanup_temp_file(slot.local_path)
@@ -2376,6 +2439,25 @@ class MigrationEngine:
                     await prod_task
                 except asyncio.CancelledError:
                     pass
+
+            # --- AUTO-BACKFILL SWEEP: Re-attempt any missed / failed messages with fresh connection ---
+            failed_ids = get_failed_messages(self.config.source_chat_id, self.config.dest_chat_id)
+            if failed_ids and not self.cancel_event.is_set():
+                logger.info(f"🔄 [Auto-Backfill] Starting recovery sweep for {len(failed_ids)} missed message(s): {failed_ids}...")
+                for fid in list(failed_ids):
+                    if self.cancel_event.is_set():
+                        break
+                    try:
+                        retry_client = self.userbot or self.client
+                        fetch_res = await retry_client.get_messages(self.config.source_chat_id, message_ids=[fid])
+                        target_msg = fetch_res[0] if isinstance(fetch_res, list) and len(fetch_res) > 0 else fetch_res
+                        if target_msg and not target_msg.empty:
+                            await self._migrate_single_message(target_msg)
+                            remove_failed_message(self.config.source_chat_id, self.config.dest_chat_id, fid)
+                            self.stats.failed_count = max(0, self.stats.failed_count - 1)
+                            logger.info(f"✅ [Auto-Backfill] Successfully recovered missed message #{fid}!")
+                    except Exception as bf_err:
+                        logger.warning(f"⚠️ [Auto-Backfill] Message #{fid} recovery failed: {bf_err}")
 
             if not self.cancel_event.is_set() and self.stats.status == JobStatus.RUNNING:
                 self.stats.status = JobStatus.COMPLETED
