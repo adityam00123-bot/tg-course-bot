@@ -169,6 +169,9 @@ def setup_logging() -> logging.Logger:
 
     # Suppress excessive logging from external libraries like Pyrogram / PyCryptodome
     logging.getLogger("pyrogram").setLevel(logging.WARNING)
+    logging.getLogger("pyrogram.connection").setLevel(logging.ERROR)
+    logging.getLogger("pyrogram.session").setLevel(logging.ERROR)
+    logging.getLogger("pyrogram.crypto").setLevel(logging.ERROR)
 
     app_logger = logging.getLogger("migration_bot")
     app_logger.info(f"Logging initialized. Level: {Config.LOG_LEVEL_STR}. File: {log_path}")

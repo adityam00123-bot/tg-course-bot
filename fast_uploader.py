@@ -162,6 +162,14 @@ async def fast_save_file(
                             break
                     except Exception as err:
                         part_attempts += 1
+                        err_str = str(err)
+                        if any(k in err_str for k in ("Broken pipe", "ConnectionResetError", "OSError", "ConnectionLost")):
+                            try:
+                                session = getattr(self, "session", None)
+                                if session and hasattr(session, "restart"):
+                                    await session.restart()
+                            except Exception:
+                                pass
                         if part_attempts >= 3:
                             logger.warning(
                                 f"⚠️ Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}"
