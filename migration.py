@@ -163,7 +163,7 @@ class MigrationConfig:
     end_msg_id: Optional[int] = None
     output_format: OutputFormat = OutputFormat.VIDEO
     auto_extract_zip: bool = False
-    enable_custom_thumbnail: bool = False
+    enable_custom_thumbnail: bool = True
     strip_existing_thumbnail: bool = False
     enable_watermark: bool = False
     clean_old_watermark: bool = False
@@ -270,16 +270,17 @@ class MigrationEngine:
         # Cache resolved peers across MTProto operations
         self._resolved_peers: Dict[Union[int, str], Any] = {}
 
-        # Initialize default watermark & branding strictly from Config / filesystem (disabled by default for max throughput)
+        # Initialize default watermark & branding strictly from Config / filesystem (watermark off by default, thumbnail on, video format default)
         self.config.enable_watermark = Config.ENABLE_WATERMARK
         self.config.watermark_text = Config.WATERMARK_TEXT or "@CourseVerseHere"
         self.config.watermark_mode = Config.WATERMARK_MODE or "moving"
+        self.config.output_format = OutputFormat.VIDEO
+        self.config.enable_custom_thumbnail = True
         if Config.CUSTOM_THUMBNAIL_PATH and os.path.exists(Config.CUSTOM_THUMBNAIL_PATH):
             self.config.custom_thumbnail_path = Config.CUSTOM_THUMBNAIL_PATH
-            self.config.enable_custom_thumbnail = True
         else:
             thumb_path = Config.BASE_DIR / "thumb.jpg"
-            if thumb_path.exists() and self.owner_id == Config.OWNER_ID:
+            if thumb_path.exists():
                 self.config.custom_thumbnail_path = str(thumb_path)
         # Dedicated isolated Pyrogram Client for MTProto uploads (prevents socket contention with downloads)
         self.uploader_client: Optional[Client] = None
