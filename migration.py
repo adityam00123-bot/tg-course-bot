@@ -500,7 +500,8 @@ class MigrationEngine:
                     "CHANNEL_PRIVATE",
                     "PEER_ID_INVALID",
                     "FILE_REFERENCE_EXPIRED",
-                    "MESSAGE_NOT_MODIFIED"
+                    "MESSAGE_NOT_MODIFIED",
+                    "FILE_PART_"
                 ]
                 if any(nr in err_str for nr in non_retryable):
                     raise
