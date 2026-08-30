@@ -83,23 +83,31 @@ async def scan():
         print(f"   📄 Documents/PDFs: {len(docs)}")
         print(f"   💬 Text/Links: {len(texts)}")
 
-        print(f"\n[3/3] 📤 Scanning Destination Channel ({dest_id})...")
+        print(f"\n[3/3] 📥 Scanning Destination Channel ({dest_id})...")
         dest_count = 0
         dest_media_types = {"video": 0, "photo": 0, "document": 0, "text": 0}
+        dest_files_set = set()
+        
         async for m in app.get_chat_history(dest_id, limit=2000):
             if m.empty or m.service:
                 continue
             dest_count += 1
-            if m.video: dest_media_types["video"] += 1
-            elif m.photo: dest_media_types["photo"] += 1
-            elif m.document: dest_media_types["document"] += 1
-            else: dest_media_types["text"] += 1
+            if m.video: 
+                dest_media_types["video"] += 1
+                dest_files_set.add((m.video.file_name or f"video_{m.id}.mp4", round((m.video.file_size or 0)/(1024*1024), 2)))
+            elif m.photo: 
+                dest_media_types["photo"] += 1
+            elif m.document: 
+                dest_media_types["document"] += 1
+                dest_files_set.add((m.document.file_name or f"doc_{m.id}", round((m.document.file_size or 0)/(1024*1024), 2)))
+            else: 
+                dest_media_types["text"] += 1
 
         print(f"✅ Found {dest_count} messages in Destination Channel:")
         print(f"   🎥 Videos: {dest_media_types['video']}")
         print(f"   🖼️ Photos: {dest_media_types['photo']}")
-        print(f"   📄 Documents/PDFs: {dest_media_types['document']}")
-        print(f"   💬 Text/Links: {dest_media_types['text']}")
+        print(f"   📁 Documents/PDFs: {dest_media_types['document']}")
+        print(f"   📝 Text/Links: {dest_media_types['text']}")
 
         print("\n" + "=" * 65)
         print("                   📊 COMPARISON SUMMARY")
@@ -107,14 +115,25 @@ async def scan():
         print(f" Source Channel:       {total_source} items")
         print(f" Destination Channel:  {dest_count} items")
         diff = total_source - dest_count
+        
         if diff <= 0:
-            print(f"\n🎉 100% COMPLETE! All content is migrated successfully!")
+            print(f"\n🎉 100% COMPLETE! All content is migrated successfully! (Counts match)")
         else:
             print(f"\n⚠️ Missing Difference: ~{diff} items need migration.")
-
-        print("\n📋 Complete List of Source Channel Videos:")
-        for idx, v in enumerate(videos, 1):
-            print(f"  {idx}. [Msg #{v['id']}] {v['name']} ({v['size_mb']} MB) - {v['text']}")
+            
+            # Find exactly which videos/documents are missing
+            missing_files = []
+            for v in videos + docs:
+                file_tuple = (v['name'], v['size_mb'])
+                if file_tuple not in dest_files_set:
+                    missing_files.append(v)
+            
+            if missing_files:
+                print(f"\n🔍 EXACT MISSING FILES FOUND ({len(missing_files)} items):")
+                for idx, m in enumerate(missing_files, 1):
+                    print(f"  ❌ [Source ID #{m['id']}] {m['name']} ({m['size_mb']} MB)")
+            else:
+                print("\n🤔 Count differs, but all major Videos/Documents seem to be present. Likely just text/photos missing.")
 
         print("=" * 65)
 
