@@ -56,6 +56,29 @@ async def _safe_session_restart(self):
             logger.debug(f"Pyrogram session restart recovered: {e}")
 
 
+async def reset_client_sessions(client: Optional[Client] = None) -> None:
+    """Safely closes broken DC sockets in media_sessions and resets the main session."""
+    if not client:
+        return
+    try:
+        media_sessions = getattr(client, "media_sessions", {})
+        for dc, sess in list(media_sessions.items()):
+            try:
+                await sess.stop()
+            except Exception:
+                pass
+        if hasattr(client, "media_sessions") and isinstance(client.media_sessions, dict):
+            client.media_sessions.clear()
+    except Exception:
+        pass
+    try:
+        session = getattr(client, "session", None)
+        if session and hasattr(session, "restart"):
+            await session.restart()
+    except Exception:
+        pass
+
+
 Session.stop = _safe_session_stop
 Session.restart = _safe_session_restart
 
@@ -164,12 +187,7 @@ async def fast_save_file(
                         part_attempts += 1
                         err_str = str(err)
                         if any(k in err_str for k in ("Broken pipe", "ConnectionResetError", "OSError", "ConnectionLost")):
-                            try:
-                                session = getattr(self, "session", None)
-                                if session and hasattr(session, "restart"):
-                                    await session.restart()
-                            except Exception:
-                                pass
+                            await reset_client_sessions(self)
                         if part_attempts >= 3:
                             logger.warning(
                                 f"⚠️ Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}"

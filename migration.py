@@ -41,7 +41,7 @@ from watermark import (
     remux_to_streamable_mp4,
     is_ffmpeg_available
 )
-from fast_uploader import install_fast_uploader
+from fast_uploader import install_fast_uploader, reset_client_sessions
 
 logger = logging.getLogger("migration_bot.migration")
 
@@ -488,7 +488,7 @@ class MigrationEngine:
 
                 await asyncio.sleep(sleep_duration)
 
-            except (RPCError, TimeoutError, ConnectionError) as e:
+            except (RPCError, TimeoutError, ConnectionError, OSError) as e:
                 err_str = str(e).upper()
                 if "MESSAGE_NOT_MODIFIED" in err_str:
                     return None
@@ -509,9 +509,17 @@ class MigrationEngine:
                 if any(nr in err_str for nr in non_retryable):
                     raise
 
+                if any(k in err_str for k in ("BROKEN PIPE", "CONNECTIONRESET", "CONNECTIONLOST", "SOCKET")):
+                    try:
+                        await reset_client_sessions(self.client)
+                        if self.userbot:
+                            await reset_client_sessions(self.userbot)
+                    except Exception:
+                        pass
+
                 attempt += 1
                 if attempt >= max_attempts:
-                    logger.error(f"❌ Permanent RPC failure on {coro_fn.__name__}: {e}")
+                    logger.error(f"❌ Permanent network failure on {coro_fn.__name__}: {e}")
                     raise
                 wait_sec = min(2 ** attempt, 30)
                 logger.warning(f"Transient Telegram error on {coro_fn.__name__}: {e}. Retrying in {wait_sec}s...")
@@ -1043,12 +1051,7 @@ class MigrationEngine:
                 else:
                     err_str = str(dl_err)
                     if any(k in err_str for k in ("Broken pipe", "ConnectionResetError", "OSError", "ConnectionLost")):
-                        try:
-                            session = getattr(dl_client, "session", None)
-                            if session and hasattr(session, "restart"):
-                                await session.restart()
-                        except Exception:
-                            pass
+                        await reset_client_sessions(dl_client)
                     logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/{max_dl_attempts} failed: {dl_err}. Retrying in {wait_sec}s...")
                     downloaded = None
 
@@ -1090,12 +1093,7 @@ class MigrationEngine:
                         f"Got {actual_size / 1048576:.1f} MB / expected {expected_size / 1048576:.1f} MB. "
                         f"Retrying download (Attempt {attempt}/{max_dl_attempts}) in {wait_sec}s..."
                     )
-                    try:
-                        session = getattr(dl_client, "session", None)
-                        if session and hasattr(session, "restart"):
-                            await session.restart()
-                    except Exception:
-                        pass
+                    await reset_client_sessions(dl_client)
                     try:
                         os.unlink(downloaded)
                     except Exception:
@@ -1678,13 +1676,27 @@ class MigrationEngine:
 
                     active_client = leased_client or self.uploader_client or self.client
                     try:
-                        raw_file = await active_client.save_file(upload_path, progress=_cloud_up_prog)
+                        raw_file = None
                         raw_thumb = None
-                        if thumb_path and os.path.exists(thumb_path):
+                        max_up_attempts = 5
+                        for up_attempt in range(1, max_up_attempts + 1):
+                            if self.cancel_event.is_set():
+                                return
                             try:
-                                raw_thumb = await active_client.save_file(thumb_path)
-                            except Exception:
-                                raw_thumb = None
+                                raw_file = await active_client.save_file(upload_path, progress=_cloud_up_prog)
+                                if thumb_path and os.path.exists(thumb_path):
+                                    try:
+                                        raw_thumb = await active_client.save_file(thumb_path)
+                                    except Exception:
+                                        raw_thumb = None
+                                break
+                            except Exception as up_err:
+                                if any(k in str(up_err) for k in ("Broken pipe", "ConnectionResetError", "OSError", "ConnectionLost")):
+                                    await reset_client_sessions(active_client)
+                                if up_attempt >= max_up_attempts:
+                                    raise up_err
+                                logger.warning(f"⚠️ [Pipeline Upload #{msg.id}] Attempt {up_attempt}/{max_up_attempts} failed: {up_err}. Retrying in 2s...")
+                                await asyncio.sleep(2)
                     finally:
                         if leased_client is not None and uploader_pool is not None:
                             uploader_pool.put_nowait(leased_client)
