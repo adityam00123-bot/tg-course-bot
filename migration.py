@@ -1605,20 +1605,26 @@ class MigrationEngine:
             )
 
         try:
-            await self._execute_with_flood_retry(
-                self.client.invoke,
-                raw.functions.messages.SendMedia(
-                    peer=peer, media=media, message=caption or "", entities=raw_entities, random_id=self.client.rnd_id()
-                )
+            await asyncio.wait_for(
+                self._execute_with_flood_retry(
+                    self.client.invoke,
+                    raw.functions.messages.SendMedia(
+                        peer=peer, media=media, message=caption or "", entities=raw_entities, random_id=self.client.rnd_id()
+                    )
+                ),
+                timeout=300
             )
         except Exception as send_err:
             if raw_entities:
                 logger.warning(f"SendMedia entity formatting fallback for #{msg.id}: {send_err}. Publishing with plain caption...")
-                await self._execute_with_flood_retry(
-                    self.client.invoke,
-                    raw.functions.messages.SendMedia(
-                        peer=peer, media=media, message=caption or "", entities=None, random_id=self.client.rnd_id()
-                    )
+                await asyncio.wait_for(
+                    self._execute_with_flood_retry(
+                        self.client.invoke,
+                        raw.functions.messages.SendMedia(
+                            peer=peer, media=media, message=caption or "", entities=None, random_id=self.client.rnd_id()
+                        )
+                    ),
+                    timeout=300
                 )
             else:
                 raise send_err
