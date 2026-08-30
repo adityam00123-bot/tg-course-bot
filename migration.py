@@ -641,14 +641,40 @@ class MigrationEngine:
         Scans message metadata in batches of 100 without downloading any media files.
         Calculates exact total bytes, video counts, document counts, and estimated migration duration.
         """
-        logger.info(f"🔍 Starting metadata scan for channel {chat_id} (Range: {start_id} to {end_id})...")
+        if not self.userbot:
+            from client import get_or_create_user_client
+            self.userbot = await get_or_create_user_client(self.owner_id)
+
+        scan_client = self.userbot or self.client
+
+        # Ensure channel peer / access_hash is cached
+        try:
+            await self._execute_with_flood_retry(scan_client.get_chat, chat_id)
+        except Exception:
+            try:
+                async for _ in scan_client.get_dialogs(limit=100):
+                    pass
+            except Exception:
+                pass
 
         if not start_id or not end_id:
             # Determine channel max ID
             latest_msg = None
-            async for m in self.client.get_chat_history(chat_id, limit=1):
-                latest_msg = m
-                break
+            try:
+                async for m in scan_client.get_chat_history(chat_id, limit=1):
+                    latest_msg = m
+                    break
+            except Exception:
+                try:
+                    async for _ in scan_client.get_dialogs(limit=100):
+                        pass
+                    async for m in scan_client.get_chat_history(chat_id, limit=1):
+                        latest_msg = m
+                        break
+                except Exception as ch_err:
+                    logger.error(f"Error accessing channel {chat_id}: {ch_err}")
+                    raise
+
             if not latest_msg:
                 raise ValueError("Channel appears to be empty or inaccessible.")
             max_id = latest_msg.id
@@ -690,7 +716,7 @@ class MigrationEngine:
             batch_chunk = msg_ids[i:i + batch_size]
             try:
                 messages = await self._execute_with_flood_retry(
-                    self.client.get_messages,
+                    scan_client.get_messages,
                     chat_id=chat_id,
                     message_ids=batch_chunk
                 )

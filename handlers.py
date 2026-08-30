@@ -920,6 +920,7 @@ def register_handlers(bot: Client) -> None:
             await message.reply_text("⚠️ <b>A job is currently running!</b> Please wait for it to finish.", parse_mode=enums.ParseMode.HTML)
             return
 
+        engine.owner_id = user_id
         src_title = engine.config.source_chat_title or str(engine.config.source_chat_id)
         start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else None
         end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else None
@@ -2062,6 +2063,7 @@ def register_handlers(bot: Client) -> None:
                 await query.answer("⚠️ A job is currently running. Please wait for it to finish.", show_alert=True)
                 return
 
+            engine.owner_id = user_id
             await query.answer("🔍 Starting fast channel metadata scan...")
             src_title = engine.config.source_chat_title or str(engine.config.source_chat_id)
             start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else None
