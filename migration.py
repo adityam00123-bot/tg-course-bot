@@ -1924,9 +1924,6 @@ class MigrationEngine:
             chunk_size = 16
             last_progress_count = 0
 
-            # ── Detect pipeline mode ──────────────────────────────────
-            pipeline_active = True
-
             if pipeline_active:
                 cpu_cores = max(1, (os.cpu_count() or 2) - 1)
                 download_sem = asyncio.Semaphore(4)
