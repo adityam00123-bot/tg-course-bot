@@ -280,8 +280,8 @@ class MigrationEngine:
             thumb_path = Config.BASE_DIR / "thumb.jpg"
             if thumb_path.exists() and self.owner_id == Config.OWNER_ID:
                 self.config.custom_thumbnail_path = str(thumb_path)
-                # Keep custom thumbnail False by default unless toggled in UI
-                self.config.enable_custom_thumbnail = False
+        # Dedicated isolated Pyrogram Client for MTProto uploads (prevents socket contention with downloads)
+        self.uploader_client: Optional[Client] = None
 
         if self.userbot:
             install_fast_uploader(self.userbot, max_workers=Config.MAX_UPLOAD_WORKERS)
@@ -1483,11 +1483,12 @@ class MigrationEngine:
                             pct = (current / total * 100) if total else 0
                             logger.info(f"🔼 [Cloud Upload #{msg.id}] {current / 1048576:.1f} / {total / 1048576:.1f} MB ({pct:.1f}%)")
 
-                    raw_file = await self.client.save_file(upload_path, progress=_cloud_up_prog)
+                    up_client = self.uploader_client or self.client
+                    raw_file = await up_client.save_file(upload_path, progress=_cloud_up_prog)
                     raw_thumb = None
                     if thumb_path and os.path.exists(thumb_path):
                         try:
-                            raw_thumb = await self.client.save_file(thumb_path)
+                            raw_thumb = await up_client.save_file(thumb_path)
                         except Exception:
                             raw_thumb = None
 
@@ -1985,6 +1986,28 @@ class MigrationEngine:
                     f"Disk buffer budget ~{budget_mb} MB"
                 )
 
+                # Initialize dedicated isolated Pyrogram Client for MTProto chunk uploads
+                # This ensures download streams and upload streams never collide on the same TCP socket!
+                if self.userbot:
+                    try:
+                        session_str = await self.userbot.export_session_string()
+                        if session_str:
+                            self.uploader_client = Client(
+                                name="pipeline_uploader",
+                                session_string=session_str,
+                                in_memory=True,
+                                api_id=Config.API_ID,
+                                api_hash=Config.API_HASH,
+                                max_concurrent_transmissions=Config.MAX_UPLOAD_WORKERS,
+                                workers=Config.MAX_UPLOAD_WORKERS
+                            )
+                            await self.uploader_client.start()
+                            install_fast_uploader(self.uploader_client, max_workers=Config.MAX_UPLOAD_WORKERS)
+                            logger.info("⚡ [Pipeline] Dedicated MTProto Upload Stream established.")
+                    except Exception as up_err:
+                        logger.warning(f"[Pipeline] Dedicated uploader fallback to primary client: {up_err}")
+                        self.uploader_client = None
+
             # -- Dynamic Sliding Window Streaming Pipeline --
             
             queue = asyncio.Queue(maxsize=10) # Bounded memory buffer (holds exactly 10 slots ahead of uploader)
@@ -2147,6 +2170,14 @@ class MigrationEngine:
             self.stats.error_message = str(e)
             logger.error(f"❌ Fatal error during migration: {e}", exc_info=True)
         finally:
+            if self.uploader_client:
+                try:
+                    if self.uploader_client.is_connected:
+                        await self.uploader_client.stop()
+                except Exception:
+                    pass
+                self.uploader_client = None
+
             self.stats.end_time = time.time()
             logger.info(
                 f"🏁 Migration finished with status '{self.stats.status.value}'. "
