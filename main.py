@@ -106,7 +106,7 @@ async def main() -> None:
         me_bot = await bot.get_me()
         logger.info(f"✅ Bot client online as: @{me_bot.username} (ID: {me_bot.id})")
 
-        # 10. Register bot menu commands for Telegram '/' suggestion list
+        # 8. Register bot menu commands for Telegram '/' suggestion list
         try:
             await bot.set_bot_commands([
                 BotCommand("start", "Open Migration Control Panel & Dashboard"),
@@ -120,7 +120,7 @@ async def main() -> None:
         except Exception as e:
             logger.warning(f"Could not set bot commands: {e}")
 
-        # 11. Send startup notification to all registered users on Telegram
+        # 9. Send startup notification to all registered users on Telegram
         import database
         all_registered = database.get_all_users()
         user_ids_to_notify = set([Config.OWNER_ID])
@@ -148,7 +148,7 @@ async def main() -> None:
             except Exception as e:
                 logger.debug(f"Could not send startup message to user {uid}: {e}")
 
-        # 11. Start lightweight HTTP health server for 24/7 Cloud Platforms (HuggingFace / Render / Koyeb)
+        # 10. Start lightweight HTTP health server for 24/7 Cloud Platforms (HuggingFace / Render / Koyeb)
         port = int(os.environ.get("PORT", "7860"))
         try:
             async def _health_handler(reader, writer):
@@ -165,7 +165,7 @@ async def main() -> None:
         except Exception as h_err:
             logger.debug(f"Cloud health server not bound: {h_err}")
 
-        # 12. Run until interrupted (SIGINT / SIGTERM)
+        # 11. Run until interrupted (SIGINT / SIGTERM)
         await idle()
 
     except (KeyboardInterrupt, SystemExit):

@@ -42,8 +42,12 @@ async def run_headless():
     logger.info("  >> 24/7 GITHUB ACTIONS HEADLESS MIGRATION ENGINE <<  ")
     logger.info("=" * 65)
 
-    source_chat_id = (os.getenv("SOURCE_CHAT_ID") or "").strip() or "-1001895806383"
-    dest_chat_id = (os.getenv("DEST_CHAT_ID") or "").strip() or "-1004317253896"
+    source_chat_id = (os.getenv("SOURCE_CHAT_ID") or "").strip()
+    dest_chat_id = (os.getenv("DEST_CHAT_ID") or "").strip()
+
+    if not source_chat_id or not dest_chat_id:
+        logger.error("SOURCE_CHAT_ID and DEST_CHAT_ID must be specified in environment or .env")
+        return
 
     # Convert numeric chat IDs if applicable
     try:
@@ -56,7 +60,7 @@ async def run_headless():
     except ValueError:
         dest_chat = dest_chat_id
 
-    owner_id = Config.OWNER_ID or 8383627571
+    owner_id = Config.OWNER_ID
 
     logger.info(f"📌 Source Channel: {source_chat}")
     logger.info(f"📌 Destination:    {dest_chat}")

@@ -1,10 +1,29 @@
-﻿downloads/
-*.zip
-.venv/
-__pycache__/
-*.log
-*.temp
+# Environment & Credentials
+.env
 *.session
 *.session-journal
+users_db.json
+migration_progress.json
 .bot.lock
-.env
+
+# Cache & Virtualenv
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Logs & Temporary Files
+*.log
+migration.log
+*.temp
+downloads/
+scratch/
+temp_*/
+
+# Archives & Binaries
+*.zip
+*.tar.gz
+ffmpeg
+ffmpeg.exe

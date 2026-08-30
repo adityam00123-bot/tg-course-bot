@@ -25,14 +25,14 @@ class Config:
     """Application configuration container."""
 
     # Telegram API credentials (from https://my.telegram.org)
-    API_ID_RAW = (os.getenv("API_ID") or "").strip() or "32974135"
-    API_HASH = (os.getenv("API_HASH") or "").strip() or "ca1558b1b02b76e2875cb03ed9f5311e"
+    API_ID_RAW = (os.getenv("API_ID") or "").strip()
+    API_HASH = (os.getenv("API_HASH") or "").strip()
 
     # Telegram Bot Token (from @BotFather)
-    BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip() or "8845853554:AAFL0heuLeUtaf2pyW35DWnA-1sW-ZQtV4Q"
+    BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 
     # Authorized Owner Telegram User ID (from @userinfobot)
-    OWNER_ID_RAW = (os.getenv("OWNER_ID") or "").strip() or "8383627571"
+    OWNER_ID_RAW = (os.getenv("OWNER_ID") or "").strip()
 
     # Optional Phone Number (e.g. +1234567890)
     PHONE_NUMBER = os.getenv("PHONE_NUMBER", "").strip() or None

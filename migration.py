@@ -24,12 +24,7 @@ from pyrogram.types import Message
 from pyrogram.errors import (
     RPCError,
     FloodWait,
-    ChatForwardsRestricted,
-    MediaEmpty,
-    MessageEmpty,
-    ChannelInvalid,
-    ChatAdminRequired,
-    PeerIdInvalid
+    ChatForwardsRestricted
 )
 
 from config import Config
@@ -269,6 +264,9 @@ class MigrationEngine:
 
         # Cache resolved peers across MTProto operations
         self._resolved_peers: Dict[Union[int, str], Any] = {}
+        self._chat_forwards_restricted: bool = False
+        self._active_pipeline_tasks: set = set()
+        self._last_publish_time: float = 0.0
 
         # Initialize default watermark & branding strictly from Config / filesystem (watermark off by default, thumbnail on, video format default)
         self.config.enable_watermark = Config.ENABLE_WATERMARK
@@ -883,6 +881,14 @@ class MigrationEngine:
                         logger.warning(f"⚠️ [Download #{msg.id}] Bot fallback also failed: {bot_dl_err}")
                         downloaded = None
                 else:
+                    err_str = str(dl_err)
+                    if any(k in err_str for k in ("Broken pipe", "ConnectionResetError", "OSError", "ConnectionLost")):
+                        try:
+                            session = getattr(dl_client, "session", None)
+                            if session and hasattr(session, "restart"):
+                                await session.restart()
+                        except Exception:
+                            pass
                     logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/{max_dl_attempts} failed: {dl_err}. Retrying in {wait_sec}s...")
                     downloaded = None
 
@@ -924,6 +930,12 @@ class MigrationEngine:
                         f"Got {actual_size / 1048576:.1f} MB / expected {expected_size / 1048576:.1f} MB. "
                         f"Retrying download (Attempt {attempt}/{max_dl_attempts}) in {wait_sec}s..."
                     )
+                    try:
+                        session = getattr(dl_client, "session", None)
+                        if session and hasattr(session, "restart"):
+                            await session.restart()
+                    except Exception:
+                        pass
                     try:
                         os.unlink(downloaded)
                     except Exception:
@@ -1376,7 +1388,7 @@ class MigrationEngine:
                         disk_state["used"] += estimated_need
                         slot.disk_bytes = estimated_need
                         break
-                    elif estimated_need > budget and disk_state["used"] == 0:
+                    elif estimated_need > budget and disk_state["used"] <= (200 * 1024 * 1024):
                         # Escape hatch: If a single file demands more than the 60% budget,
                         # allow it to proceed exclusively (uses up to 100% of available disk).
                         logger.warning(f"⚠️ [Pipeline] #{msg.id} requires {estimated_need/1048576:.1f}MB (exceeds {budget/1048576:.1f}MB budget). Engaging escape hatch for exclusive download.")
@@ -1971,8 +1983,6 @@ class MigrationEngine:
             # Send immediate initial progress update
             await self._send_progress_update(is_final=False)
 
-            # Streaming batch size
-            chunk_size = 16
             last_progress_count = 0
             uploader_clients_all: List[Client] = []
 
