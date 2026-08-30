@@ -833,7 +833,8 @@ class MigrationEngine:
         elif msg.audio and msg.audio.file_size:
             expected_size = msg.audio.file_size
 
-        for attempt in range(1, 4):
+        max_dl_attempts = 10
+        for attempt in range(1, max_dl_attempts + 1):
             if self.cancel_event.is_set():
                 return None
 
@@ -855,6 +856,7 @@ class MigrationEngine:
                     logger.info(f"🔽 [Download #{msg.id}] {current / 1048576:.1f} / {total / 1048576:.1f} MB ({pct:.1f}%)")
 
             dl_client = self.userbot or self.client
+            wait_sec = min(2 ** min(attempt, 5), 30)
             try:
                 downloaded = await self._execute_with_flood_retry(
                     dl_client.download_media,
@@ -877,11 +879,11 @@ class MigrationEngine:
                         logger.warning(f"⚠️ [Download #{msg.id}] Bot fallback also failed: {bot_dl_err}")
                         downloaded = None
                 else:
-                    logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/3 failed: {dl_err}")
+                    logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/{max_dl_attempts} failed: {dl_err}. Retrying in {wait_sec}s...")
                     downloaded = None
 
             if not downloaded or not os.path.exists(downloaded):
-                await asyncio.sleep(3)
+                await asyncio.sleep(wait_sec)
                 continue
 
             if downloaded and os.path.exists(downloaded):
@@ -908,7 +910,7 @@ class MigrationEngine:
                             logger.warning(f"⚠️ [Download #{msg.id}] Bot fallback also failed: {bot_dl_err}")
                             downloaded = None
                     if not downloaded or actual_size == 0:
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(wait_sec)
                         continue
 
                 # Verify complete download (within 99% margin for metadata)
@@ -916,13 +918,13 @@ class MigrationEngine:
                     logger.warning(
                         f"⚠️ [Download #{msg.id}] Incomplete file detected: "
                         f"Got {actual_size / 1048576:.1f} MB / expected {expected_size / 1048576:.1f} MB. "
-                        f"Retrying download (Attempt {attempt}/3)..."
+                        f"Retrying download (Attempt {attempt}/{max_dl_attempts}) in {wait_sec}s..."
                     )
                     try:
                         os.unlink(downloaded)
                     except Exception:
                         pass
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(wait_sec)
                     continue
 
                 p = Path(downloaded)
@@ -936,7 +938,7 @@ class MigrationEngine:
                         return p
                 return p
 
-        logger.error(f"❌ [Download #{msg.id}] Failed completely after 3 download attempts.")
+        logger.error(f"❌ [Download #{msg.id}] Failed completely after {max_dl_attempts} download attempts.")
         return None
 
     async def _upload_and_post_media(self, msg: Message, local_file_path: Path) -> None:
@@ -1972,8 +1974,8 @@ class MigrationEngine:
                 has_gpu = bool(shutil.which("nvidia-smi"))
 
                 # Dynamic Smart Scaling for System Resources:
-                # 1. Download semaphore: 2-3 parallel streams to keep buffer full without socket congestion.
-                num_downloads = max(2, min(total_cpus, 3))
+                # 1. Download semaphore: 2 parallel streams to keep buffer full without socket congestion.
+                num_downloads = 2
 
                 # 2. FFmpeg semaphore:
                 # If GPU is present (e.g. T4 NVENC), hardware chip handles 2-3 concurrent streams.
