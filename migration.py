@@ -1779,7 +1779,10 @@ class MigrationEngine:
                         self.stats.media_count += 1
                         logger.info(f"⚡ [Smart Clean Forward] Migrated premium message #{msg.id} without forward tag!")
                         return
-                except Exception:
+                    else:
+                        raise ValueError("Forward failed (restricted channel or unsupported media)")
+                except Exception as err:
+                    logger.warning(f"?? Skipped unsupported/restricted message #{msg.id}")
                     self.stats.skipped_count += 1
             return
 
