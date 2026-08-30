@@ -2057,10 +2057,17 @@ class MigrationEngine:
                     last_progress_count = self.stats.processed_count
                     await self._send_progress_update(is_final=False)
 
-                # Pacing: shorter delay when pipeline handles heavy lifting
-                is_instant = not pipeline_active
-                delay = random.uniform(1.15, 1.25) if is_instant else 0.2
-                await asyncio.sleep(delay)
+                # Smart Dynamic Pacing: Guarantee at least 2.0s between publishes to avoid Telegram FloodWaits
+                current_time = time.time()
+                time_since_last_publish = current_time - getattr(self, '_last_publish_time', 0)
+                target_delay = 2.0
+                
+                if action in ("direct", "pipeline"):
+                    if time_since_last_publish < target_delay:
+                        await asyncio.sleep(target_delay - time_since_last_publish)
+                    self._last_publish_time = time.time()
+                elif action == "skip":
+                    await asyncio.sleep(0.1)
 
             # Cleanup producer and any orphaned tasks
             if not prod_task.done():
