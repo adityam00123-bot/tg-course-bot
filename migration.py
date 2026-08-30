@@ -403,6 +403,13 @@ class MigrationEngine:
             return False
         logger.info("Cancellation requested by user.")
         self.cancel_event.set()
+        self.stats.status = JobStatus.CANCELLED
+        if hasattr(self, "_running_task") and self._running_task and not self._running_task.done():
+            self._running_task.cancel()
+        if hasattr(self, "_active_pipeline_tasks"):
+            for t in list(self._active_pipeline_tasks):
+                if not t.done():
+                    t.cancel()
         return True
 
     async def start_migration(self, progress_callback: Optional[Callable[[str], Awaitable[None]]] = None) -> None:
@@ -421,6 +428,7 @@ class MigrationEngine:
             install_fast_uploader(self.userbot, max_workers=Config.MAX_UPLOAD_WORKERS)
 
         self.cancel_event.clear()
+        self._active_pipeline_tasks = set()
         self.progress_msg_id = None
         self.stats = MigrationStats(status=JobStatus.RUNNING, start_time=time.time())
 
@@ -836,6 +844,8 @@ class MigrationEngine:
 
             last_log = {"time": 0}
             def _prog(current: int, total: int):
+                if self.cancel_event.is_set():
+                    raise asyncio.CancelledError("Download aborted by cancellation event")
                 now = time.time()
                 if now - last_log["time"] >= 5 or current == total:
                     last_log["time"] = now
@@ -1467,6 +1477,8 @@ class MigrationEngine:
                     
                     last_up_log = {"time": 0}
                     def _cloud_up_prog(current: int, total: int):
+                        if self.cancel_event.is_set():
+                            raise asyncio.CancelledError("Upload aborted by cancellation event")
                         now = time.time()
                         if now - last_up_log["time"] >= 5 or current == total:
                             last_up_log["time"] = now
@@ -2010,12 +2022,15 @@ class MigrationEngine:
                                 await queue.put(("pipeline", slot))
                                 
                                 # Launch the background task exactly when it enters the sliding window
-                                slot.prefetch_task = asyncio.create_task(
+                                task = asyncio.create_task(
                                     self._pipeline_prefetch(
                                         slot, download_sem, ffmpeg_sem, upload_sem,
                                         disk_state, disk_lock, disk_freed,
                                     )
                                 )
+                                slot.prefetch_task = task
+                                self._active_pipeline_tasks.add(task)
+                                task.add_done_callback(lambda t: self._active_pipeline_tasks.discard(t))
                             else:
                                 await queue.put(("direct", msg, None))
                 except Exception as e:
