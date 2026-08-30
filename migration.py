@@ -718,6 +718,9 @@ class MigrationEngine:
                 continue
 
             stats["scanned_count"] += 1
+            if stats["scanned_count"] % 100 == 0:
+                await asyncio.sleep(0.08)  # Gentle 80ms pacing between 100-message chunks to prevent Telegram FloodWait
+
             if not m or m.empty or m.service:
                 stats["skipped_count"] += 1
                 continue
