@@ -1359,6 +1359,13 @@ class MigrationEngine:
                         disk_state["used"] += estimated_need
                         slot.disk_bytes = estimated_need
                         break
+                    elif estimated_need > budget and disk_state["used"] == 0:
+                        # Escape hatch: If a single file demands more than the 60% budget,
+                        # allow it to proceed exclusively (uses up to 100% of available disk).
+                        logger.warning(f"⚠️ [Pipeline] #{msg.id} requires {estimated_need/1048576:.1f}MB (exceeds {budget/1048576:.1f}MB budget). Engaging escape hatch for exclusive download.")
+                        disk_state["used"] += estimated_need
+                        slot.disk_bytes = estimated_need
+                        break
                 # Budget full — wait until an upload frees space
                 disk_freed.clear()
                 try:
