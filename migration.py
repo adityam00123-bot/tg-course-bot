@@ -1952,8 +1952,8 @@ class MigrationEngine:
                 has_gpu = bool(shutil.which("nvidia-smi"))
 
                 # Dynamic Smart Scaling for System Resources:
-                # 1. Download semaphore: Telegram allows 4-8 parallel streams per account before throttling.
-                num_downloads = max(2, min(total_cpus, 6))
+                # 1. Download semaphore: 2-3 parallel streams to keep buffer full without socket congestion.
+                num_downloads = max(2, min(total_cpus, 3))
 
                 # 2. FFmpeg semaphore:
                 # If GPU is present (e.g. T4 NVENC), hardware chip handles 2-3 concurrent streams.
@@ -1963,8 +1963,10 @@ class MigrationEngine:
                 else:
                     num_ffmpeg = max(1, min(total_cpus - 1, 4))
 
-                # 3. Upload semaphore: 2 to 4 concurrent pre-uploads to Telegram Cloud.
-                num_uploads = max(2, min(total_cpus, 4))
+                # 3. Upload semaphore: 1 dedicated high-speed cloud pre-uploader.
+                # Strictly serializing uploads gives each file 100% MTProto bandwidth and prevents
+                # Python 3.12 asyncio StreamReader collision / Session.restart deadlocks!
+                num_uploads = 1
 
                 download_sem = asyncio.Semaphore(num_downloads)
                 ffmpeg_sem = asyncio.Semaphore(num_ffmpeg)
@@ -1979,7 +1981,7 @@ class MigrationEngine:
                 logger.info(
                     f"🚀 [Pipeline] Turbo Hardware Mode ON ({hw_type}) — "
                     f"{total_cpus} System Cores detected -> "
-                    f"{num_downloads} Downloaders, {num_ffmpeg} FFmpeg Workers, {num_uploads} Uploaders | "
+                    f"{num_downloads} Downloaders, {num_ffmpeg} FFmpeg Workers, {num_uploads} Dedicated Uploader | "
                     f"Disk buffer budget ~{budget_mb} MB"
                 )
 
@@ -2036,11 +2038,12 @@ class MigrationEngine:
                 finally:
                     producer_done.set()
 
+            prod_task = asyncio.create_task(pipeline_producer())
+            self._active_pipeline_tasks.add(prod_task)
+            prod_task.add_done_callback(lambda t: self._active_pipeline_tasks.discard(t))
             if pipeline_active:
-                prod_task = asyncio.create_task(pipeline_producer())
                 logger.info("🔄 [Pipeline] Sliding Window Conveyor Belt Started (Max 10 active downloads ahead)")
             else:
-                prod_task = asyncio.create_task(pipeline_producer())
                 logger.info("🔄 [Pipeline] Direct Mode Stream Started")
 
             # -- Consumer Loop: Process in strict sequence --

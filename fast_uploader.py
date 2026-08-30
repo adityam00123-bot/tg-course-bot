@@ -27,9 +27,9 @@ async def fast_save_file(
     return await ORIGINAL_SAVE_FILE(self, path, file_id, file_part, progress, progress_args)
 
 
-def install_fast_uploader(client: Client, max_workers: int = 8) -> None:
+def install_fast_uploader(client: Client, max_workers: int = 4) -> None:
     """Installs high-speed parallel uploader on the Pyrogram client instance."""
-    logger.info(f"⚡ Fast MTProto Uploader active (max_concurrent_transmissions=8).")
+    logger.info(f"⚡ Fast MTProto Uploader active (max_concurrent_transmissions={max_workers}).")
 
 
 class ParallelUploader:
