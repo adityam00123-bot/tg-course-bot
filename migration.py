@@ -455,9 +455,9 @@ class MigrationEngine:
 
             except FloodWait as e:
                 attempt += 1
-                sleep_duration = min(e.value + 1, Config.FLOOD_WAIT_MAX_SLEEP)
+                sleep_duration = e.value + 1
                 logger.warning(
-                    f"⚠️ Telegram FloodWait: Sleeping for {sleep_duration}s "
+                    f"⚠️ Telegram FloodWait: Exact penalty issued. Sleeping for {sleep_duration}s "
                     f"(Attempt {attempt}/{max_attempts}). Action: {coro_fn.__name__}"
                 )
 
