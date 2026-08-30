@@ -21,6 +21,7 @@ A Telegram Content Migration Bot that copies content from restricted and unrestr
 - **Fast MTProto Uploader / Downloader**: The bot uses a custom `fast_uploader.py` to maximize bandwidth. It overrides Pyrogram's native transmission engine to use multiple concurrent TCP connections (`max_concurrent_transmissions=8`), utilizing system resources efficiently for lightning-fast speeds.
 
 ## 3. Critical Constraints
+- **Factual & Sourced Responses Only**: The user explicitly dislikes "estimated" or "guessed" answers. When explaining limits (like Cloud Shell size, API rates), ALWAYS perform a web search to find the *exact* limit, and provide the answer *with sources*.
 - **Avoid Flood Waits**: Do NOT introduce new API calls per message if they are not absolutely necessary. Avoid `GetFullUser` inside loops.
 - **GitHub Codespaces & Render**: The bot runs on GitHub Codespaces (during dev) and Render Free Tier (in production). Render has very low CPU resources (0.1 core). Keep FFmpeg processes as lightweight as possible.
 - **Zero FFmpeg Overhead**: When watermark is disabled, the code must purely route through instant server-side copy. Do not accidentally force downloads.
