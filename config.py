@@ -131,6 +131,19 @@ class FlushStreamHandler(logging.StreamHandler):
         self.flush()
 
 
+class SuppressPyrogramSocketFilter(logging.Filter):
+    """Filters out internal raw socket disconnect/reconnect noise and closed db traces."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "socket.send() raised exception" in msg:
+            return False
+        if "Cannot operate on a closed database" in msg:
+            return False
+        if "Broken pipe" in msg and ("Retrying" in msg or "OSError" in msg):
+            return False
+        return True
+
+
 def setup_logging() -> logging.Logger:
     """
     Set up dual logging to both stdout (console) and rotating log file.
@@ -156,10 +169,13 @@ def setup_logging() -> logging.Logger:
         datefmt="%H:%M:%S"
     )
 
+    socket_filter = SuppressPyrogramSocketFilter()
+
     # Console Handler (Instant Unbuffered Flush)
     console_handler = FlushStreamHandler(sys.stdout)
     console_handler.setLevel(log_level)
     console_handler.setFormatter(console_format)
+    console_handler.addFilter(socket_filter)
     logger.addHandler(console_handler)
 
     # Rotating File Handler (5 MB max, keeps 3 backups)
@@ -172,6 +188,7 @@ def setup_logging() -> logging.Logger:
     )
     file_handler.setLevel(log_level)
     file_handler.setFormatter(file_format)
+    file_handler.addFilter(socket_filter)
     logger.addHandler(file_handler)
 
     # Suppress excessive logging from external libraries like Pyrogram / PyCryptodome

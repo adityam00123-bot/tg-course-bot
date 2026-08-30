@@ -2196,6 +2196,7 @@ class MigrationEngine:
                                     name=f"pipeline_uploader_{idx}",
                                     session_string=session_str,
                                     in_memory=True,
+                                    no_updates=True,
                                     api_id=Config.API_ID,
                                     api_hash=Config.API_HASH,
                                     max_concurrent_transmissions=Config.MAX_UPLOAD_WORKERS,

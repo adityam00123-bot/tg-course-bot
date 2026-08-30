@@ -24,12 +24,15 @@ if hasattr(sys.stderr, "reconfigure"):
     except Exception:
         pass
 
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 # Ensure an active event loop exists for Python 3.12+ compatibility with Pyrogram
 try:
-    loop = asyncio.get_event_loop_policy().get_event_loop()
-except Exception:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+except Exception:
+    pass
 
 from pyrogram import idle
 from pyrogram.types import BotCommand
