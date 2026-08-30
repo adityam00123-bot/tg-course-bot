@@ -137,19 +137,38 @@ async def apply_video_watermark(
         f"x={x_expr}:y={y_expr}"
     )
 
-    cmd = [
-        ffmpeg_bin, "-y",
-        "-i", str(in_p),
-        "-vf", filter_str,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "26",
-        "-pix_fmt", "yuv420p",
-        "-threads", "0",
-        "-c:a", "copy",
-        "-f", "mp4",
-        str(out_p)
-    ]
+    # Smart Hardware Acceleration (GPU) Detection
+    has_gpu = bool(shutil.which("nvidia-smi"))
+    
+    if has_gpu:
+        logger.info(f"🚀 GPU Detected! Using NVENC Hardware Acceleration for {in_p.name}")
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-hwaccel", "auto",
+            "-i", str(in_p),
+            "-vf", filter_str,
+            "-c:v", "h264_nvenc",
+            "-preset", "p4",  # Fast/Medium equivalent in NVENC
+            "-cq", "26",      # Constant Quality equivalent to CRF
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            "-f", "mp4",
+            str(out_p)
+        ]
+    else:
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-i", str(in_p),
+            "-vf", filter_str,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "26",
+            "-pix_fmt", "yuv420p",
+            "-threads", "0",
+            "-c:a", "copy",
+            "-f", "mp4",
+            str(out_p)
+        ]
 
     logger.info(f"🎨 Applying {mode} anti-theft watermark to {in_p.name}...")
 
@@ -236,18 +255,33 @@ async def remove_or_mask_watermark(
         bx, by = ("W-tw-30", "H-th-30") if position == "bottom_right" else ("30", "30")
         vf_filter = f"drawtext=text='{safe_brand}':fontsize=22:fontcolor=white:box=1:boxcolor=black@0.90:boxborderw=10:x={bx}:y={by}"
 
-    cmd = [
-        ffmpeg_bin, "-y",
-        "-i", str(in_p),
-        "-vf", vf_filter,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "26",
-        "-pix_fmt", "yuv420p",
-        "-threads", "0",
-        "-c:a", "copy",
-        str(out_p)
-    ]
+    has_gpu = bool(shutil.which("nvidia-smi"))
+    if has_gpu:
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-hwaccel", "auto",
+            "-i", str(in_p),
+            "-vf", vf_filter,
+            "-c:v", "h264_nvenc",
+            "-preset", "p4",
+            "-cq", "26",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            str(out_p)
+        ]
+    else:
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-i", str(in_p),
+            "-vf", vf_filter,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "26",
+            "-pix_fmt", "yuv420p",
+            "-threads", "0",
+            "-c:a", "copy",
+            str(out_p)
+        ]
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         await proc.wait()
