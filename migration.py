@@ -1339,11 +1339,12 @@ class MigrationEngine:
         self,
         slot: _PipelineSlot,
         download_sem: asyncio.Semaphore,
-        upload_sem: asyncio.Semaphore,
         ffmpeg_sem: asyncio.Semaphore,
+        upload_sem: asyncio.Semaphore,
         disk_state: dict,
         disk_lock: asyncio.Lock,
         disk_freed: asyncio.Event,
+        uploader_pool: Optional[asyncio.Queue] = None,
     ) -> None:
         """Background task: download media + apply watermark/thumbnail for one message."""
         msg = slot.msg
@@ -1433,18 +1434,16 @@ class MigrationEngine:
                         and self.config.custom_thumbnail_path
                         and os.path.exists(self.config.custom_thumbnail_path)):
                     thumb_path = str(Path(self.config.custom_thumbnail_path).resolve())
-                elif self.config.strip_existing_thumbnail:
-                    if is_video:
-                        extracted = slot.local_path.with_name(f"clean_thumb_{slot.local_path.stem}.jpg")
-                        extra_temps.append(extracted)
-                        thumb_res = await extract_video_thumbnail(upload_path, extracted)
-                        if thumb_res and os.path.exists(thumb_res):
-                            thumb_path = str(thumb_res)
-                else:
-                    thumbs = getattr(msg.video, "thumbs", None) or getattr(msg.document, "thumbs", None)
-                    if thumbs:
+                elif is_video and not self.config.strip_existing_thumbnail:
+                    # Extract source video thumbnail
+                    biggest = None
+                    if msg.video and msg.video.thumbs:
+                        biggest = max(msg.video.thumbs, key=lambda t: (t.width or 0) * (t.height or 0))
+                    elif msg.document and msg.document.thumbs:
+                        biggest = max(msg.document.thumbs, key=lambda t: (t.width or 0) * (t.height or 0))
+
+                    if biggest:
                         try:
-                            biggest = thumbs[-1]
                             dl_client = self.userbot or self.client
                             tf = await self._execute_with_flood_retry(
                                 dl_client.download_media,
@@ -1456,6 +1455,12 @@ class MigrationEngine:
                                 extra_temps.append(Path(thumb_path))
                         except Exception:
                             pass
+                elif self.config.strip_existing_thumbnail and is_video:
+                    extracted = slot.local_path.with_name(f"clean_thumb_{slot.local_path.stem}.jpg")
+                    extra_temps.append(extracted)
+                    thumb_res = await extract_video_thumbnail(upload_path, extracted)
+                    if thumb_res and os.path.exists(thumb_res):
+                        thumb_path = str(thumb_res)
 
                 # C. Remux to streamable MP4 if needed
                 if is_video and self.config.output_format == OutputFormat.VIDEO and not upload_path.lower().endswith(".mp4"):
@@ -1483,14 +1488,26 @@ class MigrationEngine:
                             pct = (current / total * 100) if total else 0
                             logger.info(f"🔼 [Cloud Upload #{msg.id}] {current / 1048576:.1f} / {total / 1048576:.1f} MB ({pct:.1f}%)")
 
-                    up_client = self.uploader_client or self.client
-                    raw_file = await up_client.save_file(upload_path, progress=_cloud_up_prog)
-                    raw_thumb = None
-                    if thumb_path and os.path.exists(thumb_path):
+                    # Borrow an isolated uploader client from pool if available
+                    leased_client = None
+                    if uploader_pool is not None and not uploader_pool.empty():
                         try:
-                            raw_thumb = await up_client.save_file(thumb_path)
+                            leased_client = await uploader_pool.get()
                         except Exception:
-                            raw_thumb = None
+                            leased_client = None
+
+                    active_client = leased_client or self.uploader_client or self.client
+                    try:
+                        raw_file = await active_client.save_file(upload_path, progress=_cloud_up_prog)
+                        raw_thumb = None
+                        if thumb_path and os.path.exists(thumb_path):
+                            try:
+                                raw_thumb = await active_client.save_file(thumb_path)
+                            except Exception:
+                                raw_thumb = None
+                    finally:
+                        if leased_client is not None and uploader_pool is not None:
+                            uploader_pool.put_nowait(leased_client)
 
                     slot.raw_input_file = raw_file
                     slot.raw_thumb_file = raw_thumb
@@ -1947,6 +1964,7 @@ class MigrationEngine:
             # Streaming batch size
             chunk_size = 16
             last_progress_count = 0
+            uploader_clients_all: List[Client] = []
 
             if pipeline_active:
                 total_cpus = os.cpu_count() or 2
@@ -1964,10 +1982,10 @@ class MigrationEngine:
                 else:
                     num_ffmpeg = max(1, min(total_cpus - 1, 4))
 
-                # 3. Upload semaphore: 1 dedicated high-speed cloud pre-uploader.
-                # Strictly serializing uploads gives each file 100% MTProto bandwidth and prevents
-                # Python 3.12 asyncio StreamReader collision / Session.restart deadlocks!
-                num_uploads = 1
+                # 3. Upload semaphore: 2 parallel isolated upload streams.
+                # Each upload runs on its OWN dedicated in-memory Pyrogram Client connection,
+                # completely isolating upload sockets from each other and from download sockets!
+                num_uploads = min(2, total_cpus)
 
                 download_sem = asyncio.Semaphore(num_downloads)
                 ffmpeg_sem = asyncio.Semaphore(num_ffmpeg)
@@ -1982,31 +2000,37 @@ class MigrationEngine:
                 logger.info(
                     f"🚀 [Pipeline] Turbo Hardware Mode ON ({hw_type}) — "
                     f"{total_cpus} System Cores detected -> "
-                    f"{num_downloads} Downloaders, {num_ffmpeg} FFmpeg Workers, {num_uploads} Dedicated Uploader | "
+                    f"{num_downloads} Downloaders, {num_ffmpeg} FFmpeg Workers, {num_uploads} Dedicated Uploaders | "
                     f"Disk buffer budget ~{budget_mb} MB"
                 )
 
-                # Initialize dedicated isolated Pyrogram Client for MTProto chunk uploads
-                # This ensures download streams and upload streams never collide on the same TCP socket!
+                # Initialize dedicated pool of isolated Pyrogram Clients for concurrent MTProto chunk uploads
+                uploader_pool: asyncio.Queue = asyncio.Queue()
+
                 if self.userbot:
                     try:
                         session_str = await self.userbot.export_session_string()
                         if session_str:
-                            self.uploader_client = Client(
-                                name="pipeline_uploader",
-                                session_string=session_str,
-                                in_memory=True,
-                                api_id=Config.API_ID,
-                                api_hash=Config.API_HASH,
-                                max_concurrent_transmissions=Config.MAX_UPLOAD_WORKERS,
-                                workers=Config.MAX_UPLOAD_WORKERS
-                            )
-                            await self.uploader_client.start()
-                            install_fast_uploader(self.uploader_client, max_workers=Config.MAX_UPLOAD_WORKERS)
-                            logger.info("⚡ [Pipeline] Dedicated MTProto Upload Stream established.")
+                            for idx in range(num_uploads):
+                                cl = Client(
+                                    name=f"pipeline_uploader_{idx}",
+                                    session_string=session_str,
+                                    in_memory=True,
+                                    api_id=Config.API_ID,
+                                    api_hash=Config.API_HASH,
+                                    max_concurrent_transmissions=Config.MAX_UPLOAD_WORKERS,
+                                    workers=Config.MAX_UPLOAD_WORKERS
+                                )
+                                await cl.start()
+                                install_fast_uploader(cl, max_workers=Config.MAX_UPLOAD_WORKERS)
+                                uploader_pool.put_nowait(cl)
+                                uploader_clients_all.append(cl)
+                            logger.info(f"⚡ [Pipeline] {len(uploader_clients_all)} Dedicated MTProto Upload Streams established.")
                     except Exception as up_err:
                         logger.warning(f"[Pipeline] Dedicated uploader fallback to primary client: {up_err}")
-                        self.uploader_client = None
+                        uploader_pool = None
+                else:
+                    uploader_pool = None
 
             # -- Dynamic Sliding Window Streaming Pipeline --
             
@@ -2049,6 +2073,7 @@ class MigrationEngine:
                                     self._pipeline_prefetch(
                                         slot, download_sem, ffmpeg_sem, upload_sem,
                                         disk_state, disk_lock, disk_freed,
+                                        uploader_pool
                                     )
                                 )
                                 slot.prefetch_task = task
@@ -2170,13 +2195,14 @@ class MigrationEngine:
             self.stats.error_message = str(e)
             logger.error(f"❌ Fatal error during migration: {e}", exc_info=True)
         finally:
-            if self.uploader_client:
-                try:
-                    if self.uploader_client.is_connected:
-                        await self.uploader_client.stop()
-                except Exception:
-                    pass
-                self.uploader_client = None
+            if uploader_clients_all:
+                for cl in uploader_clients_all:
+                    try:
+                        if cl.is_connected:
+                            await cl.stop()
+                    except Exception:
+                        pass
+                uploader_clients_all.clear()
 
             self.stats.end_time = time.time()
             logger.info(
