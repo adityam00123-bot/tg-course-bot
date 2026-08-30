@@ -2393,9 +2393,18 @@ class MigrationEngine:
                         # Wait for the background download/watermark to finish
                         await slot.ready.wait()
                         if slot.error:
-                            raise slot.error
-                            
-                        await self._pipeline_upload_slot(slot)
+                            logger.warning(
+                                f"⚠️ [Pipeline] Prefetch issue on #{slot.msg.id} ({slot.error}). "
+                                f"Initiating in-place synchronous recovery to maintain 100% strict sequence..."
+                            )
+                            await reset_client_sessions(self.client)
+                            if self.userbot:
+                                await reset_client_sessions(self.userbot)
+                            await asyncio.sleep(2)
+                            # In-place synchronous migration guarantees 100% strict chronological lecture sequence!
+                            await self._migrate_single_message(slot.msg)
+                        else:
+                            await self._pipeline_upload_slot(slot)
                         
                         self.stats.processed_count += 1
                         remove_failed_message(self.config.source_chat_id, self.config.dest_chat_id, slot.msg.id)
