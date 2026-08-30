@@ -111,6 +111,7 @@ async def main() -> None:
             await bot.set_bot_commands([
                 BotCommand("start", "Open Migration Control Panel & Dashboard"),
                 BotCommand("status", "Check Live Migration Progress & Statistics"),
+                BotCommand("scan", "Scan Channel & Calculate Total Size (GB)"),
                 BotCommand("run", "Start/Resume Migration Job"),
                 BotCommand("stop", "Stop Active Migration Job"),
                 BotCommand("help", "View Step-by-Step Guide & Link Formats"),
