@@ -18,6 +18,7 @@ A Telegram Content Migration Bot that copies content from restricted and unrestr
 - **Session Management**: Userbot sessions are created locally via Pyrogram and stored as `.session` files. Memory cache `USER_CLIENTS` prevents redundant DB lookups.
 - **Concurrent 3-Stage Pipeline**: When watermark/thumbnails are enabled, the bot uses a concurrent pipeline (`Download` -> `Watermark` -> `Upload`). It uses `asyncio.Semaphore` to run multiple downloads (max 3) and FFmpeg jobs (max CPU cores) in the background while maintaining strictly sequential uploads to Telegram.
 - **Dynamic Disk Budgeting**: The pipeline dynamically calculates free disk space (using 60% of available space) to decide how many videos to prefetch, preventing "disk out of space" errors when handling huge files.
+- **Fast MTProto Uploader / Downloader**: The bot uses a custom `fast_uploader.py` to maximize bandwidth. It overrides Pyrogram's native transmission engine to use multiple concurrent TCP connections (`max_concurrent_transmissions=8`), utilizing system resources efficiently for lightning-fast speeds.
 
 ## 3. Critical Constraints
 - **Avoid Flood Waits**: Do NOT introduce new API calls per message if they are not absolutely necessary. Avoid `GetFullUser` inside loops.
