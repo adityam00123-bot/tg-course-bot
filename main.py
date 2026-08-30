@@ -11,17 +11,25 @@ import signal
 import asyncio
 import logging
 
-# Ensure an active event loop exists for Python 3.12+ / 3.14 compatibility with Pyrogram
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
-# Ensure UTF-8 output encoding on all platforms (including Windows console)
+# Force unbuffered real-time stdout streaming
+os.environ["PYTHONUNBUFFERED"] = "1"
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    except Exception:
+        pass
 if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    except Exception:
+        pass
+
+# Ensure an active event loop exists for Python 3.12+ compatibility with Pyrogram
+try:
+    loop = asyncio.get_event_loop_policy().get_event_loop()
+except Exception:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
 from pyrogram import idle
 from pyrogram.types import BotCommand

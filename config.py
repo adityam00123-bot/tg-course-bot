@@ -124,6 +124,13 @@ class Config:
         cls.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
+class FlushStreamHandler(logging.StreamHandler):
+    """Guarantees instant unbuffered log flushing to terminal/console."""
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+
 def setup_logging() -> logging.Logger:
     """
     Set up dual logging to both stdout (console) and rotating log file.
@@ -149,8 +156,8 @@ def setup_logging() -> logging.Logger:
         datefmt="%H:%M:%S"
     )
 
-    # Console Handler
-    console_handler = logging.StreamHandler(sys.stdout)
+    # Console Handler (Instant Unbuffered Flush)
+    console_handler = FlushStreamHandler(sys.stdout)
     console_handler.setLevel(log_level)
     console_handler.setFormatter(console_format)
     logger.addHandler(console_handler)
