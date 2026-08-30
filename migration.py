@@ -657,35 +657,30 @@ class MigrationEngine:
             except Exception:
                 pass
 
-        if not start_id or not end_id:
-            # Determine channel max ID
-            latest_msg = None
+        # Determine channel max ID
+        latest_msg = None
+        try:
+            async for m in scan_client.get_chat_history(chat_id, limit=1):
+                latest_msg = m
+                break
+        except Exception:
             try:
+                async for _ in scan_client.get_dialogs(limit=100):
+                    pass
                 async for m in scan_client.get_chat_history(chat_id, limit=1):
                     latest_msg = m
                     break
-            except Exception:
-                try:
-                    async for _ in scan_client.get_dialogs(limit=100):
-                        pass
-                    async for m in scan_client.get_chat_history(chat_id, limit=1):
-                        latest_msg = m
-                        break
-                except Exception as ch_err:
-                    logger.error(f"Error accessing channel {chat_id}: {ch_err}")
-                    raise
+            except Exception as ch_err:
+                logger.error(f"Error accessing channel {chat_id}: {ch_err}")
+                raise
 
-            if not latest_msg:
-                raise ValueError("Channel appears to be empty or inaccessible.")
-            max_id = latest_msg.id
-            effective_start = start_id or 1
-            effective_end = end_id or max_id
-        else:
-            effective_start = start_id
-            effective_end = end_id
+        if not latest_msg:
+            raise ValueError("Channel appears to be empty or inaccessible.")
 
-        msg_ids = list(range(effective_start, effective_end + 1))
-        total_msgs = len(msg_ids)
+        max_id = latest_msg.id
+        effective_start = start_id or 1
+        effective_end = min(end_id, max_id) if end_id else max_id
+        total_msgs = max(1, effective_end - effective_start + 1)
 
         stats = {
             "total_messages": total_msgs,
@@ -706,77 +701,78 @@ class MigrationEngine:
             "estimated_seconds": 0.0
         }
 
-        batch_size = 100
+        offset_id = 0
+        if effective_end < max_id:
+            offset_id = effective_end + 1
+
         last_cb_time = time.time()
 
-        for i in range(0, total_msgs, batch_size):
+        async for m in scan_client.get_chat_history(chat_id, offset_id=offset_id):
             if self.cancel_event.is_set():
                 break
 
-            batch_chunk = msg_ids[i:i + batch_size]
-            try:
-                messages = await self._execute_with_flood_retry(
-                    scan_client.get_messages,
-                    chat_id=chat_id,
-                    message_ids=batch_chunk
-                )
-            except Exception as e:
-                logger.warning(f"Error fetching batch metadata {batch_chunk[0]}-{batch_chunk[-1]}: {e}")
+            if m.id < effective_start:
+                break
+
+            if m.id > effective_end:
                 continue
 
-            if not isinstance(messages, list):
-                messages = [messages] if messages else []
+            stats["scanned_count"] += 1
+            if not m or m.empty or m.service:
+                stats["skipped_count"] += 1
+                continue
 
-            for m in messages:
-                stats["scanned_count"] += 1
-                if not m or m.empty or m.service:
-                    stats["skipped_count"] += 1
-                    continue
-
-                if m.video:
+            if m.video:
+                stats["video_count"] += 1
+                stats["video_bytes"] += (m.video.file_size or 0)
+            elif m.document:
+                fn = (m.document.file_name or "").lower()
+                if any(fn.endswith(ext) for ext in self._VIDEO_EXTS):
                     stats["video_count"] += 1
-                    stats["video_bytes"] += (m.video.file_size or 0)
-                elif m.document:
-                    fn = (m.document.file_name or "").lower()
-                    if any(fn.endswith(ext) for ext in self._VIDEO_EXTS):
-                        stats["video_count"] += 1
-                        stats["video_bytes"] += (m.document.file_size or 0)
-                    else:
-                        stats["document_count"] += 1
-                        stats["document_bytes"] += (m.document.file_size or 0)
-                elif m.photo:
-                    stats["photo_count"] += 1
-                    p_size = 0
-                    if getattr(m.photo, "file_size", None):
-                        p_size = m.photo.file_size
-                    elif getattr(m.photo, "sizes", None) and len(m.photo.sizes) > 0:
-                        p_size = getattr(m.photo.sizes[-1], "file_size", 0) or 0
-                    stats["photo_bytes"] += (p_size or 500 * 1024)
-                elif m.audio or m.voice:
-                    stats["audio_count"] += 1
-                    a_size = (getattr(m.audio, "file_size", 0) or getattr(m.voice, "file_size", 0) or 0)
-                    stats["audio_bytes"] += a_size
-                elif m.text or m.caption:
-                    stats["text_count"] += 1
+                    stats["video_bytes"] += (m.document.file_size or 0)
                 else:
-                    stats["skipped_count"] += 1
-
-            stats["total_bytes"] = (
-                stats["video_bytes"] +
-                stats["document_bytes"] +
-                stats["photo_bytes"] +
-                stats["audio_bytes"]
-            )
-            # Estimate duration assuming ~8 MB/s average pipeline throughput
-            stats["estimated_seconds"] = stats["total_bytes"] / (8 * 1024 * 1024)
+                    stats["document_count"] += 1
+                    stats["document_bytes"] += (m.document.file_size or 0)
+            elif m.photo:
+                stats["photo_count"] += 1
+                p_size = 0
+                if getattr(m.photo, "file_size", None):
+                    p_size = m.photo.file_size
+                elif getattr(m.photo, "sizes", None) and len(m.photo.sizes) > 0:
+                    p_size = getattr(m.photo.sizes[-1], "file_size", 0) or 0
+                stats["photo_bytes"] += (p_size or 500 * 1024)
+            elif m.audio or m.voice:
+                stats["audio_count"] += 1
+                a_size = (getattr(m.audio, "file_size", 0) or getattr(m.voice, "file_size", 0) or 0)
+                stats["audio_bytes"] += a_size
+            elif m.text or m.caption:
+                stats["text_count"] += 1
+            else:
+                stats["skipped_count"] += 1
 
             now = time.time()
-            if progress_callback and (now - last_cb_time >= 2.5 or stats["scanned_count"] >= total_msgs):
+            if now - last_cb_time >= 2.0 or stats["scanned_count"] >= total_msgs:
                 last_cb_time = now
-                try:
-                    await progress_callback(stats["scanned_count"], total_msgs, stats)
-                except Exception:
-                    pass
+                stats["total_bytes"] = (
+                    stats["video_bytes"] +
+                    stats["document_bytes"] +
+                    stats["photo_bytes"] +
+                    stats["audio_bytes"]
+                )
+                stats["estimated_seconds"] = stats["total_bytes"] / (8 * 1024 * 1024)
+                if progress_callback:
+                    try:
+                        await progress_callback(stats["scanned_count"], total_msgs, stats)
+                    except Exception:
+                        pass
+
+        stats["total_bytes"] = (
+            stats["video_bytes"] +
+            stats["document_bytes"] +
+            stats["photo_bytes"] +
+            stats["audio_bytes"]
+        )
+        stats["estimated_seconds"] = stats["total_bytes"] / (8 * 1024 * 1024)
 
         logger.info(
             f"✅ [Scan Complete] Scanned {stats['scanned_count']}/{total_msgs} messages | "
