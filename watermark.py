@@ -148,10 +148,15 @@ async def apply_video_watermark(
             "-i", str(in_p),
             "-vf", filter_str,
             "-c:v", "h264_nvenc",
-            "-preset", "p4",  # Fast/Medium equivalent in NVENC
-            "-cq", "26",      # Constant Quality equivalent to CRF
+            "-preset", "p4",
+            "-rc:v", "vbr",
+            "-cq", "28",
+            "-b:v", "0",
+            "-spatial-aq", "1",
+            "-temporal-aq", "1",
             "-pix_fmt", "yuv420p",
             "-c:a", "copy",
+            "-movflags", "+faststart",
             "-f", "mp4",
             str(out_p)
         ]
@@ -264,9 +269,14 @@ async def remove_or_mask_watermark(
             "-vf", vf_filter,
             "-c:v", "h264_nvenc",
             "-preset", "p4",
-            "-cq", "26",
+            "-rc:v", "vbr",
+            "-cq", "28",
+            "-b:v", "0",
+            "-spatial-aq", "1",
+            "-temporal-aq", "1",
             "-pix_fmt", "yuv420p",
             "-c:a", "copy",
+            "-movflags", "+faststart",
             str(out_p)
         ]
     else:

@@ -52,8 +52,8 @@ class Config:
     MAX_DELAY_SECONDS = float(os.getenv("MAX_DELAY_SECONDS", "3.0"))
     FLOOD_WAIT_MAX_SLEEP = int(os.getenv("FLOOD_WAIT_MAX_SLEEP", "300"))
 
-    # Parallel MTProto Uploading (Auto-scaled: 8 workers on 2 cores, up to 16 workers on 4+ cores)
-    _default_workers = max(8, min((os.cpu_count() or 2) * 4, 16))
+    # Parallel MTProto Uploading (Calibrated for high-throughput pipeline without socket drops: 4-6 workers)
+    _default_workers = max(4, min((os.cpu_count() or 2) * 1, 6))
     MAX_UPLOAD_WORKERS = int(os.getenv("MAX_UPLOAD_WORKERS", str(_default_workers)))
 
     # Video Anti-Theft Watermark Settings
