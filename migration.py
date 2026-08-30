@@ -57,12 +57,13 @@ CHECKPOINT_FILE = Config.BASE_DIR / "migration_progress.json"
 # ---------------------------------------------------------------------------
 
 def _get_disk_budget(download_dir: Path) -> int:
-    """Returns 60% of available free disk space in bytes for the pipeline buffer."""
+    """Returns 80% of available free disk space in bytes for the pipeline buffer."""
     try:
+        download_dir.mkdir(parents=True, exist_ok=True)
         usage = shutil.disk_usage(str(download_dir))
-        return int(usage.free * 0.6)
+        return int(usage.free * 0.8)
     except Exception:
-        return 2 * 1024 * 1024 * 1024  # 2 GB fallback
+        return 15 * 1024 * 1024 * 1024  # 15 GB fallback
 
 
 def natural_sort_key(s: str) -> list:
@@ -1353,11 +1354,8 @@ class MigrationEngine:
                 file_size = msg.video.file_size or 0
             elif msg.document:
                 file_size = msg.document.file_size or 0
-            # Watermark transcode needs 2.5x, fast thumbnail mode only needs 1.1x space
-            if self.config.enable_watermark or self.config.clean_old_watermark:
-                estimated_need = max(int(file_size * 2.5), 150 * 1024 * 1024)
-            else:
-                estimated_need = max(int(file_size * 1.1), 50 * 1024 * 1024)
+            # File disk footprint estimation: original download + transcode buffer
+            estimated_need = max(int(file_size * 1.3), 50 * 1024 * 1024)
 
             # --- Wait for disk budget ---
             while True:
