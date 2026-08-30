@@ -29,3 +29,7 @@ A Telegram Content Migration Bot that copies content from restricted and unrestr
 ## 4. Current State
 As of August 26, 2026:
 The codebase is highly optimized with a new concurrent processing pipeline for watermarking. Speed is significantly faster as downloads and processing happen concurrently while uploads happen sequentially. The bot is stable and adapts dynamically to disk/CPU limits.
+## 5. Recent Architecture Upgrades (Aug 2026)
+- **Dynamic Smart Pacing (Anti-FloodWait)**: Implemented in the pipeline consumer. The bot enforces a strict 2.0s delay between publishing messages to the destination. If processing a file takes >2.0s, it skips the delay. This prevents Telegram's aggressive 250s+ FloodWaits when dumping messages in Turbo Mode.
+- **Exact FloodWait Penalties**: Removed the Config.FLOOD_WAIT_MAX_SLEEP cap in _execute_with_flood_retry. The bot now respects and logs the *exact* penalty seconds issued by Telegram (e.g. 1500s). Do not artificially cap this, otherwise the bot will loop and spam the API during a ban.
+- **Dynamic Pipeline Detection**: The bot dynamically checks has_protected_content, enable_watermark, and enable_custom_thumbnail. If ALL are false (e.g. unrestricted channel with no editing), it disables the pipeline and uses Instant Server Copy (0s download time).

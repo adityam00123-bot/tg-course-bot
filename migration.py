@@ -1899,10 +1899,23 @@ class MigrationEngine:
                         )
                     except Exception:
                         pass
-
                 msg_ids = list(range(effective_start, max_id + 1))
                 self.stats.total_messages = len(msg_ids)
                 logger.info(f"Starting streaming migration of {len(msg_ids)} message IDs (from #{effective_start} to #{max_id}).")
+
+            # 🚀 Detect pipeline mode based on exact channel restrictions and features
+            is_restricted = getattr(source_peer, "has_protected_content", False)
+            self._chat_forwards_restricted = is_restricted  # Cache for fast-forward check
+            
+            needs_watermark = self.config.enable_watermark
+            needs_thumbnail = self.config.enable_custom_thumbnail
+            
+            pipeline_active = bool(is_restricted or needs_watermark or needs_thumbnail)
+            
+            if is_restricted:
+                logger.info("🔒 Source channel is restricted. Pipeline forced ON.")
+            else:
+                logger.info(f"🔓 Source channel is unrestricted. Pipeline active: {pipeline_active}")
 
             # Send immediate initial progress update
             await self._send_progress_update(is_final=False)
