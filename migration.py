@@ -1938,19 +1938,39 @@ class MigrationEngine:
             last_progress_count = 0
 
             if pipeline_active:
-                cpu_cores = max(1, (os.cpu_count() or 2) - 1)
-                download_sem = asyncio.Semaphore(4)
-                ffmpeg_sem = asyncio.Semaphore(max(1, cpu_cores))
-                upload_sem = asyncio.Semaphore(4)
+                total_cpus = os.cpu_count() or 2
+                has_gpu = bool(shutil.which("nvidia-smi"))
+
+                # Dynamic Smart Scaling for System Resources:
+                # 1. Download semaphore: Telegram allows 4-8 parallel streams per account before throttling.
+                num_downloads = max(2, min(total_cpus, 6))
+
+                # 2. FFmpeg semaphore:
+                # If GPU is present (e.g. T4 NVENC), hardware chip handles 2-3 concurrent streams.
+                # If CPU only, leave 1 core free for network I/O & Python async loop.
+                if has_gpu:
+                    num_ffmpeg = min(3, max(2, total_cpus))
+                else:
+                    num_ffmpeg = max(1, min(total_cpus - 1, 4))
+
+                # 3. Upload semaphore: 2 to 4 concurrent pre-uploads to Telegram Cloud.
+                num_uploads = max(2, min(total_cpus, 4))
+
+                download_sem = asyncio.Semaphore(num_downloads)
+                ffmpeg_sem = asyncio.Semaphore(num_ffmpeg)
+                upload_sem = asyncio.Semaphore(num_uploads)
                 disk_lock = asyncio.Lock()
                 disk_state = {"used": 0}
                 disk_freed = asyncio.Event()
                 disk_freed.set()
                 budget_mb = _get_disk_budget(Config.DOWNLOAD_DIR) // (1024 * 1024)
+                
+                hw_type = "GPU (NVENC)" if has_gpu else "Standard CPU"
                 logger.info(
-                    f"🚀 [Pipeline] Turbo Hardware Mode ON — "
-                    f"4 parallel downloaders, {max(1, cpu_cores)} FFmpeg workers, 4 parallel uploaders, "
-                    f"disk buffer budget ~{budget_mb} MB"
+                    f"🚀 [Pipeline] Turbo Hardware Mode ON ({hw_type}) — "
+                    f"{total_cpus} System Cores detected -> "
+                    f"{num_downloads} Downloaders, {num_ffmpeg} FFmpeg Workers, {num_uploads} Uploaders | "
+                    f"Disk buffer budget ~{budget_mb} MB"
                 )
 
             # -- Dynamic Sliding Window Streaming Pipeline --

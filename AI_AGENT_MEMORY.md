@@ -36,7 +36,13 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
 - **Exact FloodWait Penalties**: Removed the Config.FLOOD_WAIT_MAX_SLEEP cap in _execute_with_flood_retry. The bot now respects and logs the *exact* penalty seconds issued by Telegram (e.g. 1500s). Do not artificially cap this, otherwise the bot will loop and spam the API during a ban.
 - **Dynamic Pipeline Detection**: The bot dynamically checks has_protected_content, enable_watermark, and enable_custom_thumbnail. If ALL are false (e.g. unrestricted channel with no editing), it disables the pipeline and uses Instant Server Copy (0s download time).
 - **Massive 4GB File Handling (Escape Hatch)**: The `_pipeline_prefetch` uses a smart Sliding Window to allocate disk budget (60% of free space). For massive 4GB files that exceed the budget, an *Escape Hatch* allows them to proceed exclusively (using up to 100% of free space) as long as no other downloads are running. This prevents deadlocks.
+- **Dynamic Hardware Auto-Scaling**: The bot dynamically adapts to CPU cores and GPU availability. On 2 cores (Cloud Shell/Colab), it uses 2-3 downloaders and 8 MTProto workers. On 4+ cores (Kaggle), it scales to 4-6 downloaders, 16 MTProto workers, and NVENC GPU video encoding.
 
-## 6. Telegram API Rate Limits
+## 6. Telegram API Rate & Connection Limits (MTProto Specs)
 - **Forwarding / Instant Copy**: Telegram allows ~2000 messages per hour. The bot uses a dynamic `2.0s` delay between messages (1800 msgs/hr) to stay perfectly under this limit.
-- **Upload / Download (Media)**: Uploading and downloading large files is limited by bandwidth (~20-30 MB/s). Because uploading a 1GB file naturally takes 1-2 minutes, the 2.0s delay is often skipped during media transfers, as the time taken to upload itself acts as the pacing.
+- **Upload / Download Bandwidth & Connections**: Telegram's MTProto allows multi-part chunk streaming (4-8 TCP connections per file). The safe ceiling per account is **4 to 6 parallel file transfers (max 16 MTProto workers)**. Exceeding 16 simultaneous socket connections per session triggers DC-level TCP throttling (dropping speed to <1 MB/s) or aggressive FloodWait bans.
+- **Auto-Pacing on Media**: Because uploading a 1GB file naturally takes 1-2 minutes, the 2.0s delay is skipped during media transfers, as the upload time itself acts as natural pacing.
+
+## 7. Cloud Execution Strategy
+1. **Primary: Kaggle Notebooks** (4 vCPU, 30 GB RAM, 2x T4 GPU, ~73 GB Disk). Allows "Save & Run All (Commit)" for 12-hour background execution without keeping the browser open. Weekly GPU quota is 30 hours.
+2. **Fallback: Google Colab** (2 vCPU, 12.6 GB RAM, 1x T4 GPU, ~78 GB Disk). Used when Kaggle's 30-hour weekly GPU quota is exhausted. Requires keeping the browser tab active.
