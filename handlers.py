@@ -283,6 +283,13 @@ async def build_forward_dashboard_text(engine: MigrationEngine, user_id: int) ->
 
     checkpoint_info = f"📍 <b>Auto-Resume Checkpoint:</b> Message #{checkpoint_id}\n\n" if checkpoint_id > 0 else ""
 
+    if cfg.output_format == OutputFormat.VIDEO:
+        fmt_desc = "🎬 <b>Streamable Video (MP4 FastStart)</b>"
+    elif cfg.output_format == OutputFormat.FILE:
+        fmt_desc = "📁 <b>Document File (.mp4 Attachment)</b>"
+    else:
+        fmt_desc = "🔄 <b>As-Is (Original 1:1 Match)</b>"
+
     text = (
         "🚀 <b>Forwarding & Migration Control Panel</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -290,7 +297,7 @@ async def build_forward_dashboard_text(engine: MigrationEngine, user_id: int) ->
         f"📥 <b>Incoming Channel (Source):</b>\n   {src_display}\n\n"
         f"📤 <b>Outgoing Channel (Destination):</b>\n   {dst_display}\n\n"
         f"⚙️ <b>Migration Mode:</b>\n   {mode_display}\n\n"
-        f"🎞️ <b>Output Format:</b>\n   {'🎬 <b>Streamable Video (MP4 FastStart)</b>' if cfg.output_format == OutputFormat.VIDEO else '📁 <b>Document File (.mp4 Attachment)</b>'}\n\n"
+        f"🎞️ <b>Output Format:</b>\n   {fmt_desc}\n\n"
         f"📦 <b>Auto-Unpack ZIP Archives:</b>\n   {'✅ <b>ON (Auto-extract videos/PDFs)</b>' if cfg.auto_extract_zip else '❌ <b>OFF (Forward as .zip)</b>'}\n\n"
         f"{checkpoint_info}"
         f"🖼️ <b>Custom Thumbnail:</b>\n   {thumb_status}\n\n"
@@ -307,7 +314,12 @@ def build_forward_dashboard_keyboard(engine: MigrationEngine) -> InlineKeyboardM
     """Buttons for Forwarding Dashboard."""
     is_running = engine.is_busy()
     mode_toggle_label = "Switch to Full Mode 🔄" if engine.config.mode == MigrationMode.RANGE else "Switch to Range Mode 🔢"
-    fmt_btn_label = "🎞️ Format: 🎬 Video" if engine.config.output_format == OutputFormat.VIDEO else "🎞️ Format: 📁 Document"
+    if engine.config.output_format == OutputFormat.VIDEO:
+        fmt_btn_label = "🎞️ Format: 🎬 Video"
+    elif engine.config.output_format == OutputFormat.FILE:
+        fmt_btn_label = "🎞️ Format: 📁 Document"
+    else:
+        fmt_btn_label = "🎞️ Format: 🔄 As-Is"
     unzip_btn_label = "📦 Unzip: ✅ ON" if engine.config.auto_extract_zip else "📦 Unzip: ❌ OFF"
 
     buttons = [
@@ -1836,7 +1848,12 @@ def register_handlers(bot: Client) -> None:
 
         elif data == "opt_toggle_format":
             new_fmt = engine.toggle_output_format()
-            fmt_str = "🎬 Streamable Video" if new_fmt == OutputFormat.VIDEO else "📁 Document File"
+            if new_fmt == OutputFormat.VIDEO:
+                fmt_str = "🎬 Streamable Video"
+            elif new_fmt == OutputFormat.FILE:
+                fmt_str = "📁 Document File"
+            else:
+                fmt_str = "🔄 As-Is (Original 1:1 Match)"
             await query.answer(f"Output Format: {fmt_str}")
             text = await build_forward_dashboard_text(engine, user_id)
             kb = build_forward_dashboard_keyboard(engine)

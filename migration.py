@@ -132,6 +132,7 @@ class MigrationMode(str, Enum):
 class OutputFormat(str, Enum):
     VIDEO = "video"
     FILE = "file"
+    AS_IS = "as_is"
 
 
 class CaptionMode(str, Enum):
@@ -364,6 +365,8 @@ class MigrationEngine:
     def toggle_output_format(self) -> OutputFormat:
         if self.config.output_format == OutputFormat.VIDEO:
             self.config.output_format = OutputFormat.FILE
+        elif self.config.output_format == OutputFormat.FILE:
+            self.config.output_format = OutputFormat.AS_IS
         else:
             self.config.output_format = OutputFormat.VIDEO
         return self.config.output_format
@@ -962,7 +965,8 @@ class MigrationEngine:
 
             is_doc_video = bool(msg.document and msg.document.file_name and any(msg.document.file_name.lower().endswith(v_ext) for v_ext in [".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts", ".flv", ".m4v", ".3gp"]))
 
-            if msg.video or (is_doc_video and self.config.output_format == OutputFormat.VIDEO):
+            send_as_video = (self.config.output_format == OutputFormat.VIDEO) or (self.config.output_format == OutputFormat.AS_IS and bool(msg.video))
+            if send_as_video or (is_doc_video and self.config.output_format == OutputFormat.VIDEO):
                 thumb_path = None
 
                 # A0. Clean/Mask old watermark if enabled
@@ -1022,7 +1026,7 @@ class MigrationEngine:
                 safe_thumb = thumb_path if (thumb_path and os.path.exists(thumb_path)) else None
 
                 # D. Upload based on OutputFormat (Streamable Video vs Document File)
-                if self.config.output_format == OutputFormat.VIDEO:
+                if send_as_video:
                     # Ensure streamable MP4 container with faststart
                     if not upload_video_path.lower().endswith(".mp4"):
                         remuxed_video = local_file_path.with_name(f"stream_{local_file_path.stem}.mp4")
@@ -1577,7 +1581,8 @@ class MigrationEngine:
                 file=slot.raw_input_file,
             )
         elif msg.video or (msg.document and msg.document.file_name and any(msg.document.file_name.lower().endswith(v) for v in self._VIDEO_EXTS)):
-            if self.config.output_format == OutputFormat.VIDEO:
+            send_as_video = (self.config.output_format == OutputFormat.VIDEO) or (self.config.output_format == OutputFormat.AS_IS and bool(msg.video))
+            if send_as_video:
                 v_dur = getattr(msg.video, "duration", 0) or 0
                 v_w = getattr(msg.video, "width", 0) or 0
                 v_h = getattr(msg.video, "height", 0) or 0
@@ -1691,7 +1696,8 @@ class MigrationEngine:
                         caption=caption, caption_entities=caption_entities
                     )
                 elif msg.video or (msg.document and msg.document.file_name and any(msg.document.file_name.lower().endswith(v) for v in self._VIDEO_EXTS)):
-                    if self.config.output_format == OutputFormat.VIDEO:
+                    send_as_video = (self.config.output_format == OutputFormat.VIDEO) or (self.config.output_format == OutputFormat.AS_IS and bool(msg.video))
+                    if send_as_video:
                         v_dur = getattr(msg.video, "duration", 0) or 0
                         v_w = getattr(msg.video, "width", 0) or 0
                         v_h = getattr(msg.video, "height", 0) or 0
