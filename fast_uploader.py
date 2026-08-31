@@ -186,7 +186,7 @@ async def fast_save_file(
                     except Exception as err:
                         part_attempts += 1
                         err_str = str(err)
-                        if any(k in err_str for k in ("Broken pipe", "ConnectionResetError", "OSError", "ConnectionLost")):
+                        if any(k in err_str.lower() for k in ("broken pipe", "connectionreseterror", "oserror", "connectionlost", "timed out", "timeouterror")):
                             await reset_client_sessions(self)
                         if part_attempts >= 3:
                             logger.warning(

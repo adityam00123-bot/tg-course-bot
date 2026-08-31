@@ -1086,6 +1086,20 @@ class MigrationEngine:
 
             dl_client = self.userbot or self.client
             wait_sec = min(2 ** min(attempt, 5), 30)
+
+            # If retrying after a failure, refresh message from Telegram to renew expired file_reference tokens
+            if attempt > 1:
+                try:
+                    chat_id = (msg.chat.id if msg.chat else None) or self.config.source_chat_id
+                    refreshed = await dl_client.get_messages(chat_id, message_ids=[msg.id])
+                    if isinstance(refreshed, list) and refreshed and refreshed[0]:
+                        msg = refreshed[0]
+                    elif refreshed and not isinstance(refreshed, list):
+                        msg = refreshed
+                    logger.info(f"🔄 [Download #{msg.id}] Refreshed fresh file_reference token from Telegram (Attempt {attempt}).")
+                except Exception as ref_err:
+                    logger.debug(f"Could not refresh file_reference for #{msg.id}: {ref_err}")
+
             try:
                 downloaded = await self._execute_with_flood_retry(
                     dl_client.download_media,
@@ -1094,8 +1108,21 @@ class MigrationEngine:
                     progress=_prog
                 )
             except Exception as dl_err:
+                err_str = str(dl_err)
+                if "FILE_REFERENCE_EXPIRED" in err_str or "FileReferenceExpired" in type(dl_err).__name__:
+                    logger.warning(f"⚠️ [Download #{msg.id}] file_reference expired. Refreshing message from Telegram...")
+                    try:
+                        chat_id = (msg.chat.id if msg.chat else None) or self.config.source_chat_id
+                        refreshed = await dl_client.get_messages(chat_id, message_ids=[msg.id])
+                        if isinstance(refreshed, list) and refreshed and refreshed[0]:
+                            msg = refreshed[0]
+                        elif refreshed and not isinstance(refreshed, list):
+                            msg = refreshed
+                    except Exception:
+                        pass
+                
                 # Fallback: if userbot fails (AUTH_BYTES_INVALID on different DC), try bot client
-                if self.userbot and self.client and "AUTH_BYTES_INVALID" in str(dl_err):
+                if self.userbot and self.client and "AUTH_BYTES_INVALID" in err_str:
                     logger.info(f"🔄 [Download #{msg.id}] Retrying via Bot client (DC auth fallback)...")
                     try:
                         downloaded = await self._execute_with_flood_retry(
@@ -1108,7 +1135,6 @@ class MigrationEngine:
                         logger.warning(f"⚠️ [Download #{msg.id}] Bot fallback also failed: {bot_dl_err}")
                         downloaded = None
                 else:
-                    err_str = str(dl_err)
                     if any(k in err_str for k in ("Broken pipe", "ConnectionResetError", "OSError", "ConnectionLost")):
                         await reset_client_sessions(dl_client)
                     logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/{max_dl_attempts} failed: {dl_err}. Retrying in {wait_sec}s...")
@@ -1122,11 +1148,22 @@ class MigrationEngine:
                 actual_size = os.path.getsize(downloaded)
                 
                 if actual_size == 0:
-                    logger.warning(f"⚠️ [Download #{msg.id}] Pyrogram returned 0-byte file (possible AUTH_BYTES_INVALID).")
+                    logger.warning(f"⚠️ [Download #{msg.id}] Pyrogram returned 0-byte file (possible AUTH_BYTES_INVALID or expired reference).")
                     try:
                         os.unlink(downloaded)
                     except Exception:
                         pass
+                    # Refresh message before bot fallback
+                    try:
+                        chat_id = (msg.chat.id if msg.chat else None) or self.config.source_chat_id
+                        refreshed = await dl_client.get_messages(chat_id, message_ids=[msg.id])
+                        if isinstance(refreshed, list) and refreshed and refreshed[0]:
+                            msg = refreshed[0]
+                        elif refreshed and not isinstance(refreshed, list):
+                            msg = refreshed
+                    except Exception:
+                        pass
+
                     if dl_client == self.userbot and self.client:
                         logger.info(f"🔄 [Download #{msg.id}] Retrying via Bot client (DC auth fallback)...")
                         try:
@@ -1923,12 +1960,22 @@ class MigrationEngine:
         caption, caption_entities = self._apply_caption(msg.caption, msg.caption_entities)
 
         try:
+            sent_via_preupload = False
             if slot.raw_input_file:
-                await self._send_pre_uploaded_media(slot, dest_chat, caption, caption_entities)
-                self.stats.media_count += 1
-                media_type = "video" if msg.video else "photo" if msg.photo else "document" if msg.document else "media"
-                logger.info(f"⚡ [Pipeline] Fast-Published {media_type} #{msg.id} → Dest in ~50ms")
-            else:
+                try:
+                    await self._send_pre_uploaded_media(slot, dest_chat, caption, caption_entities)
+                    self.stats.media_count += 1
+                    media_type = "video" if msg.video else "photo" if msg.photo else "document" if msg.document else "media"
+                    logger.info(f"⚡ [Pipeline] Fast-Published {media_type} #{msg.id} → Dest in ~50ms")
+                    sent_via_preupload = True
+                except Exception as pre_err:
+                    logger.warning(
+                        f"⚠️ [Pipeline] Pre-uploaded SendMedia failed for #{msg.id} ({pre_err}). "
+                        f"Falling back to direct local file upload to guarantee 100% delivery..."
+                    )
+                    sent_via_preupload = False
+
+            if not sent_via_preupload:
                 upload_path = slot.upload_path or str(slot.local_path)
                 safe_thumb = slot.thumb_path if (slot.thumb_path and os.path.exists(slot.thumb_path)) else None
                 if os.path.exists(upload_path):
