@@ -16,9 +16,14 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# Load environment variables from .env file explicitly
+# Load environment variables from .env file explicitly (repo dir, cwd, and /kaggle/working)
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=_ENV_PATH)
+load_dotenv()
+if Path("/kaggle/working/.env").exists():
+    load_dotenv(dotenv_path="/kaggle/working/.env")
+if (Path(__file__).resolve().parent.parent / ".env").exists():
+    load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
 
 class Config:
