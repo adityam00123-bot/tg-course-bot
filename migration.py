@@ -2221,22 +2221,20 @@ class MigrationEngine:
                 total_cpus = os.cpu_count() or 2
                 has_gpu = bool(shutil.which("nvidia-smi"))
 
-                # Dynamic Smart Scaling for System Resources:
-                # 1. Download semaphore: 2 parallel streams to keep buffer full without socket congestion.
-                num_downloads = 2
+                # Dynamic Smart Scaling for Maximum Multi-Core Throughput:
+                # 1. Download semaphore: 4 parallel streams to saturate CPU cores
+                num_downloads = max(2, min(total_cpus, 4))
 
                 # 2. FFmpeg semaphore:
-                # If GPU is present (e.g. T4 NVENC), hardware chip handles 2-3 concurrent streams.
-                # If CPU only, leave 1 core free for network I/O & Python async loop.
+                # If GPU is present (e.g. T4 NVENC), hardware chip handles 3-4 concurrent streams.
+                # If CPU only, utilize all available cores.
                 if has_gpu:
-                    num_ffmpeg = min(3, max(2, total_cpus))
+                    num_ffmpeg = min(4, max(2, total_cpus))
                 else:
-                    num_ffmpeg = max(1, min(total_cpus - 1, 4))
+                    num_ffmpeg = max(2, min(total_cpus, 4))
 
-                # 3. Upload semaphore: 2 parallel isolated upload streams.
-                # Each upload runs on its OWN dedicated in-memory Pyrogram Client connection,
-                # completely isolating upload sockets from each other and from download sockets!
-                num_uploads = min(2, total_cpus)
+                # 3. Upload semaphore: 4 parallel isolated upload streams.
+                num_uploads = max(2, min(total_cpus, 4))
 
                 download_sem = asyncio.Semaphore(num_downloads)
                 ffmpeg_sem = asyncio.Semaphore(num_ffmpeg)
