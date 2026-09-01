@@ -342,9 +342,68 @@ class MigrationEngine:
                 self.config.custom_thumbnail_path = str(thumb_path)
         # Dedicated isolated Pyrogram Client for MTProto uploads (prevents socket contention with downloads)
         self.uploader_client: Optional[Client] = None
+        self._active_transfers: Dict[str, Dict[str, Any]] = {}
+        self._ticker_task: Optional[asyncio.Task] = None
 
         if self.userbot:
             install_fast_uploader(self.userbot, max_workers=Config.MAX_UPLOAD_WORKERS)
+
+    def _update_transfer_progress(self, key: str, transfer_type: str, seq: int, name: str, current: int, total: int):
+        """Records active transfer progress for real-time live console dashboard."""
+        now = time.time()
+        if key not in self._active_transfers:
+            self._active_transfers[key] = {
+                "type": transfer_type,
+                "seq": seq,
+                "name": str(name)[:20],
+                "current": current,
+                "total": total,
+                "start_time": now,
+                "last_bytes": current,
+                "last_time": now,
+                "speed": 0.0
+            }
+        else:
+            entry = self._active_transfers[key]
+            entry["current"] = current
+            entry["total"] = total
+            dt = now - entry["last_time"]
+            if dt >= 1.0:
+                db = current - entry["last_bytes"]
+                entry["speed"] = max(0.0, (db / 1048576) / max(dt, 0.1))
+                entry["last_bytes"] = current
+                entry["last_time"] = now
+
+    def _remove_transfer_progress(self, key: str):
+        """Removes a finished transfer from the live dashboard."""
+        self._active_transfers.pop(key, None)
+
+    async def _live_progress_ticker_loop(self):
+        """Central ticker updating in-place live console status every 1.0 second."""
+        while not self.cancel_event.is_set():
+            try:
+                await asyncio.sleep(1.0)
+                if not self._active_transfers:
+                    continue
+                
+                parts = []
+                for key, item in list(self._active_transfers.items()):
+                    curr_mb = item["current"] / 1048576
+                    tot_mb = item["total"] / 1048576 if item["total"] else 0
+                    pct = (item["current"] / item["total"] * 100) if item["total"] else 0
+                    spd = item.get("speed", 0.0)
+                    spd_str = f"{spd:.1f}MB/s" if spd > 0 else "...MB/s"
+                    icon = "🔽" if item["type"] == "DL" else "🔼"
+                    parts.append(f"{icon} #{item['seq']} [{item['name']}] {pct:.1f}% ({curr_mb:.1f}/{tot_mb:.1f}MB @ {spd_str})")
+
+                if parts:
+                    summary_line = " | ".join(parts)
+                    sys.stdout.write(f"\r\033[K⚡ {summary_line}")
+                    sys.stdout.flush()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
 
     @property
     def client(self) -> Client:
@@ -1065,15 +1124,14 @@ class MigrationEngine:
                 except Exception:
                     pass
 
-            last_log = {"time": 0}
+            dl_start_t = time.time()
+            file_name_display = getattr(msg.document, "file_name", None) or getattr(msg.video, "file_name", None) or f"media_{msg.id}"
+            dl_key = f"dl_{msg.id}"
+
             def _prog(current: int, total: int):
                 if self.cancel_event.is_set():
                     raise asyncio.CancelledError("Download aborted by cancellation event")
-                now = time.time()
-                if now - last_log["time"] >= 5 or current == total:
-                    last_log["time"] = now
-                    pct = (current / total * 100) if total else 0
-                    logger.info(f"🔽 [Download #{msg.id}] {current / 1048576:.1f} / {total / 1048576:.1f} MB ({pct:.1f}%)")
+                self._update_transfer_progress(dl_key, "DL", msg.id, file_name_display, current, total)
 
             dl_client = client or self.userbot or self.client
             wait_sec = min(2 ** min(attempt, 5), 30)
@@ -1099,6 +1157,7 @@ class MigrationEngine:
                     progress=_prog
                 )
             except Exception as dl_err:
+                self._remove_transfer_progress(dl_key)
                 err_str = str(dl_err)
                 if "FILE_REFERENCE_EXPIRED" in err_str or "FileReferenceExpired" in type(dl_err).__name__:
                     logger.warning(f"⚠️ [Download #{msg.id}] file_reference expired. Refreshing message from Telegram...")
@@ -1132,10 +1191,12 @@ class MigrationEngine:
                     downloaded = None
 
             if not downloaded or not os.path.exists(downloaded):
+                self._remove_transfer_progress(dl_key)
                 await asyncio.sleep(wait_sec)
                 continue
 
             if downloaded and os.path.exists(downloaded):
+                self._remove_transfer_progress(dl_key)
                 actual_size = os.path.getsize(downloaded)
                 
                 if actual_size == 0:
@@ -1188,6 +1249,10 @@ class MigrationEngine:
                     await asyncio.sleep(wait_sec)
                     continue
 
+                dur = time.time() - dl_start_t
+                spd = (actual_size / 1048576) / max(dur, 0.1)
+                logger.info(f"✅ [Downloaded #{msg.id}] {file_name_display} ({actual_size / 1048576:.1f} MB) in {format_seconds(dur)} ({spd:.1f} MB/s)")
+
                 p = Path(downloaded)
                 # Ensure the downloaded file has a valid photo extension for Telegram send_photo
                 if msg.photo and p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp"):
@@ -1199,6 +1264,7 @@ class MigrationEngine:
                         return p
                 return p
 
+        self._remove_transfer_progress(dl_key)
         logger.error(f"❌ [Download #{msg.id}] Failed completely after {max_dl_attempts} download attempts.")
         return None
 
@@ -1753,17 +1819,15 @@ class MigrationEngine:
                 async with upload_sem:
                     if self.cancel_event.is_set():
                         return
-                    logger.info(f"🔼 [Pipeline] Pre-uploading #{msg.id} to Telegram Cloud...")
                     
-                    last_up_log = {"time": 0}
+                    up_key = f"ul_{msg.id}"
+                    up_name = Path(upload_path).name
+                    up_start_t = time.time()
+
                     def _cloud_up_prog(current: int, total: int):
                         if self.cancel_event.is_set():
                             raise asyncio.CancelledError("Upload aborted by cancellation event")
-                        now = time.time()
-                        if now - last_up_log["time"] >= 5 or current == total:
-                            last_up_log["time"] = now
-                            pct = (current / total * 100) if total else 0
-                            logger.info(f"🔼 [Cloud Upload #{msg.id}] {current / 1048576:.1f} / {total / 1048576:.1f} MB ({pct:.1f}%)")
+                        self._update_transfer_progress(up_key, "UL", msg.id, up_name, current, total)
 
                     # Borrow an isolated uploader client from pool if available
                     leased_client = None
@@ -1797,6 +1861,7 @@ class MigrationEngine:
                                 logger.warning(f"⚠️ [Pipeline Upload #{msg.id}] Attempt {up_attempt}/{max_up_attempts} failed: {up_err}. Retrying in 2s...")
                                 await asyncio.sleep(2)
                     finally:
+                        self._remove_transfer_progress(up_key)
                         if leased_client is not None and uploader_pool is not None:
                             uploader_pool.put_nowait(leased_client)
 
@@ -1806,6 +1871,9 @@ class MigrationEngine:
                     if os.path.exists(upload_path):
                         file_bytes = Path(upload_path).stat().st_size
                         self.stats.total_bytes_migrated += file_bytes
+                        dur = time.time() - up_start_t
+                        spd = (file_bytes / 1048576) / max(dur, 0.1)
+                        logger.info(f"✅ [Uploaded #{msg.id}] {up_name} ({file_bytes / 1048576:.1f} MB) in {format_seconds(dur)} ({spd:.1f} MB/s) & ready for fast-publish")
 
                 # Clean local disk IMMEDIATELY because file is safely stored on Telegram Cloud!
                 if slot.local_path:
@@ -1817,8 +1885,6 @@ class MigrationEngine:
                     disk_state["used"] = max(0, disk_state["used"] - slot.disk_bytes)
                     slot.disk_bytes = 0
                 disk_freed.set()
-
-                logger.info(f"✅ [Pipeline] #{msg.id} uploaded to Cloud & ready for fast-publish")
 
         except asyncio.CancelledError:
             pass
@@ -2398,6 +2464,10 @@ class MigrationEngine:
                 finally:
                     producer_done.set()
 
+            if self._ticker_task and not self._ticker_task.done():
+                self._ticker_task.cancel()
+            self._ticker_task = asyncio.create_task(self._live_progress_ticker_loop())
+
             prod_task = asyncio.create_task(pipeline_producer())
             self._active_pipeline_tasks.add(prod_task)
             prod_task.add_done_callback(lambda t: self._active_pipeline_tasks.discard(t))
@@ -2539,6 +2609,12 @@ class MigrationEngine:
             self.stats.error_message = str(e)
             logger.error(f"❌ Fatal error during migration: {e}", exc_info=True)
         finally:
+            if self._ticker_task and not self._ticker_task.done():
+                self._ticker_task.cancel()
+            self._active_transfers.clear()
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
             all_pool_clients = uploader_clients_all + downloader_clients_all
             if all_pool_clients:
                 for cl in all_pool_clients:

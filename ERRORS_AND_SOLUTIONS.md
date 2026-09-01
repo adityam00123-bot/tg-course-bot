@@ -79,3 +79,13 @@
 | **Colab / Cloud Shell (2 vCPU)** | **2 Parallel Streams** | **2 Parallel Streams** | **2 Workers** | **4 MTProto Sockets** |
 
 > **Rule:** Never exceed 4-6 simultaneous MTProto connections per Telegram account. Exceeding 6 triggers DC-level throttling (<500 KB/s) or FloodWaits.
+
+---
+
+## 5. Live In-Place Progress Dashboard Architecture
+* **Problem:** Spamming 100+ raw logger lines every 5 seconds floods Kaggle/Cloud shell scrollback and obscures real-time status.
+* **Architecture:**
+  - `_active_transfers`: Central dictionary in `MigrationEngine` tracking all active download & upload slots.
+  - `_live_progress_ticker_loop`: Unbuffered 1.0s ticker printing real-time MB transferred, speed in MB/s, and progress percentages side-by-side using `\r\033[K`.
+  - Clean Completion Milestones: Only outputs permanent clean log lines upon milestone events (`✅ [Downloaded #898] (340.9 MB) in 42s (8.1 MB/s)`).
+
