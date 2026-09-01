@@ -2381,6 +2381,7 @@ class MigrationEngine:
                                     workers=16
                                 )
                                 await dl_cl.start()
+                                install_fast_uploader(dl_cl, max_workers=Config.MAX_UPLOAD_WORKERS)
                                 downloader_pool.put_nowait(dl_cl)
                                 downloader_clients_all.append(dl_cl)
 
