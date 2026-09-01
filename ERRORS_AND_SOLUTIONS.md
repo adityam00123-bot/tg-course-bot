@@ -4,6 +4,24 @@
 
 ---
 
+## 0. Performance & Console Output
+
+### Error: Slow Downloads & Ghost Restarts (Contention)
+* **Symptom:** Downloads cap out at 3-5 MB/s even with 4 workers. Logs occasionally show downloads jumping back to 0% (e.g., 99.7% -> 2.0%).
+* **Root Cause:** The `fast_download_media` cached `self.media_sessions[dc_id]` and shared a single MTProto `Session` across multiple concurrent downloads. MTProto sessions process `invoke()` requests sequentially on the TCP socket, causing bottleneck contention. Re-using the same session object also resets its bytes counter which creates the 0% ghost restarts.
+* **Permanent Fix:** Changed `fast_download_media` to instantiate a **new, dedicated `Session`** for every download call, preventing contention and allowing full bandwidth utilization (10MB/s+).
+
+### Error: Terminal Output Spam (`logger.info` vs `sys.stdout.write`)
+* **Symptom:** The terminal gets flooded with hundreds of lines saying `⚡ DL #921 (21/500 MB) @ 6.1 MB/s` because the Kaggle notebook does not properly support the `\r\033[K` carriage return ANSI clearing sequence.
+* **Root Cause:** Kaggle's Jupyter notebook output cell treats `\r` inconsistently when combined with ANSI codes or logger timestamps, creating endless new lines.
+* **Permanent Fix:**
+  - Implemented a single combined string: `  ⚡ DL #921 (21/500MB) 6.1MB/s | UL #920 (45/163MB) 3.2MB/s`
+  - Printed purely with `sys.stdout.write(f"\r{line}{' ' * pad}")`.
+  - The `pad` uses spaces to completely overwrite older/longer lines without needing ANSI codes.
+  - Added a `_clear_progress_line()` helper (`\r` + 160 spaces + `\r`) that MUST be called before any `logger.info()` milestones (like "Downloaded" or "Uploaded") to prevent the `\r` progress line from getting permanently embedded in the output.
+
+---
+
 ## 1. Telegram MTProto & Authentication Errors
 
 ### Error: `[400 API_ID_INVALID]`
