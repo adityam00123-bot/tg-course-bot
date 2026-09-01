@@ -137,6 +137,29 @@ async def fast_save_file(
     progress_lock = asyncio.Lock()
     stream_lock = asyncio.Lock() if is_stream else None
 
+    # Multi-Session MTProto Socket Pool for breaking single-TCP 4.5 MB/s bottleneck
+    dc_id = await self.storage.dc_id()
+    test_mode = await self.storage.test_mode()
+    auth_key = await self.storage.auth_key()
+
+    num_sessions = 3
+    sessions: List[Session] = []
+    try:
+        for _ in range(num_sessions):
+            sess = Session(
+                self, dc_id,
+                auth_key,
+                test_mode,
+                is_media=True
+            )
+            await sess.start()
+            sessions.append(sess)
+    except Exception as sess_err:
+        logger.debug(f"Media session pool initialization fallback: {sess_err}")
+
+    if not sessions:
+        sessions = [getattr(self, "session", None)]
+
     # 10-12 concurrent chunk workers per client stream for high-speed Telegram Premium uploads
     num_workers = min(getattr(self, "max_concurrent_transmissions", 12) or 12, total_parts)
     num_workers = max(1, min(num_workers, 16))
@@ -177,9 +200,12 @@ async def fast_save_file(
                 max_part_attempts = 20
                 part_ack = False
 
+                # Round-robin assign parts across multiple media sessions (multi-TCP socket multiplexing)
+                target_session = sessions[part_idx % len(sessions)] or getattr(self, "session", None)
+
                 while part_attempts < max_part_attempts and upload_error is None:
                     try:
-                        res = await self.invoke(rpc, sleep_threshold=60)
+                        res = await target_session.invoke(rpc, sleep_threshold=60)
                         if res is True or res:
                             part_ack = True
                             break
@@ -188,7 +214,10 @@ async def fast_save_file(
                         err_str = str(err)
                         # Only reset socket on genuine transport breakage, NOT on transient latency timeouts
                         if any(k in err_str.lower() for k in ("broken pipe", "connectionreseterror", "connectionlost")):
-                            await reset_client_sessions(self)
+                            try:
+                                await target_session.restart()
+                            except Exception:
+                                pass
                         if part_attempts >= 3:
                             logger.warning(
                                 f"⚠️ Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}"
@@ -217,19 +246,27 @@ async def fast_save_file(
                 except Exception:
                     pass
 
-    workers = [asyncio.create_task(_worker()) for _ in range(num_workers)]
-    await asyncio.gather(*workers, return_exceptions=True)
+    try:
+        workers = [asyncio.create_task(_worker()) for _ in range(num_workers)]
+        await asyncio.gather(*workers, return_exceptions=True)
 
-    if upload_error is not None:
-        raise upload_error
+        if upload_error is not None:
+            raise upload_error
 
-    if uploaded_bytes < file_size:
-        raise RuntimeError(f"Upload incomplete: uploaded {uploaded_bytes}/{file_size} bytes ({total_parts} parts).")
+        if uploaded_bytes < file_size:
+            raise RuntimeError(f"Upload incomplete: uploaded {uploaded_bytes}/{file_size} bytes ({total_parts} parts).")
 
-    if is_big:
-        return raw.types.InputFileBig(id=file_id, parts=total_parts, name=file_name)
-    else:
-        return raw.types.InputFile(id=file_id, parts=total_parts, name=file_name, md5_checksum="")
+        if is_big:
+            return raw.types.InputFileBig(id=file_id, parts=total_parts, name=file_name)
+        else:
+            return raw.types.InputFile(id=file_id, parts=total_parts, name=file_name, md5_checksum="")
+    finally:
+        for s in sessions:
+            if s and s != getattr(self, "session", None):
+                try:
+                    await s.stop()
+                except Exception:
+                    pass
 
 
 # Monkeypatch Pyrogram Client.save_file to use our robust uploader
