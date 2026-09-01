@@ -323,14 +323,13 @@ async def fast_download_media(
                 exported_auth = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
                 await session.invoke(raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes))
 
-            chunk_size = 1024 * 1024  # 1MB per MTProto part (maximum allowed)
+            chunk_size = 1024 * 1024  # 1MB per MTProto part (strictly divisible by 4096)
             total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
 
             part_queue: asyncio.Queue = asyncio.Queue()
             for i in range(total_parts):
                 offset = i * chunk_size
-                part_size = min(chunk_size, file_size - offset) if file_size > 0 else 0
-                part_queue.put_nowait((i, offset, part_size))
+                part_queue.put_nowait((i, offset))
 
             downloaded_bytes = 0
             progress_lock = asyncio.Lock()
@@ -350,7 +349,7 @@ async def fast_download_media(
                 nonlocal downloaded_bytes, dl_error
                 while not part_queue.empty() and dl_error is None:
                     try:
-                        part_idx, offset, part_size = part_queue.get_nowait()
+                        part_idx, offset = part_queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
 
@@ -361,7 +360,7 @@ async def fast_download_media(
                     while part_attempts < max_part_attempts and dl_error is None:
                         try:
                             r = await session.invoke(
-                                raw.functions.upload.GetFile(location=location, offset=offset, limit=part_size),
+                                raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
                                 sleep_threshold=30
                             )
                             if isinstance(r, raw.types.upload.File):
@@ -401,7 +400,7 @@ async def fast_download_media(
                 if dl_error is not None:
                     raise dl_error
 
-                if downloaded_bytes < (file_size * 0.99):
+                if file_size > 0 and downloaded_bytes < file_size:
                     raise RuntimeError(f"Download incomplete: {downloaded_bytes}/{file_size} bytes received.")
 
                 return str(out_path)
@@ -414,16 +413,8 @@ async def fast_download_media(
             await session.stop()
 
     except Exception as e:
-        logger.debug(f"Parallel chunk download fallback to native: {e}")
-        return await _orig_download_media(
-            self,
-            message=message,
-            file_name=file_name,
-            in_memory=in_memory,
-            block=block,
-            progress=progress,
-            progress_args=progress_args
-        )
+        logger.debug(f"Parallel chunk download exception: {e}")
+        raise e
 
 
 # Monkeypatch Client.download_media to use fast_download_media

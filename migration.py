@@ -397,18 +397,27 @@ class MigrationEngine:
                 if not self._active_transfers:
                     continue
                 
-                parts = []
+                dl_parts = []
+                ul_parts = []
                 for key, item in list(self._active_transfers.items()):
                     curr_mb = item["current"] / 1048576
                     tot_mb = item["total"] / 1048576 if item["total"] else 0
-                    pct = (item["current"] / item["total"] * 100) if item["total"] else 0
                     spd = item.get("speed", 0.0)
-                    spd_str = f"{spd:.1f}" if spd > 0 else "..."
-                    icon = "DL" if item["type"] == "DL" else "UL"
-                    parts.append(f"{icon} #{item['seq']} ({curr_mb:.0f}/{tot_mb:.0f}MB) {spd_str}MB/s")
+                    spd_str = f"{spd:.1f}MB/s" if spd > 0 else "..."
+                    entry_str = f"#{item['seq']} ({curr_mb:.0f}/{tot_mb:.0f}MB @ {spd_str})"
+                    if item["type"] == "DL":
+                        dl_parts.append(entry_str)
+                    else:
+                        ul_parts.append(entry_str)
 
-                if parts:
-                    line = "  ⚡ " + " | ".join(parts)
+                sections = []
+                if dl_parts:
+                    sections.append("⬇️ DL: " + ", ".join(dl_parts))
+                if ul_parts:
+                    sections.append("⬆️ UL: " + ", ".join(ul_parts))
+
+                if sections:
+                    line = "  ⚡ " + " | ".join(sections)
                     # Pad with spaces to fully overwrite any longer previous line
                     pad = max(0, _last_line_len - len(line))
                     sys.stdout.write(f"\r{line}{' ' * pad}")
@@ -1753,14 +1762,15 @@ class MigrationEngine:
                 return
 
             # --- Stage 2: FFmpeg processing (watermark + thumbnail) ---
+            upload_path = str(slot.local_path)
+            extra_temps: List[Path] = []
+            thumb_path = None
+
+            is_video = bool(msg.video or (msg.document and msg.document.file_name and any(msg.document.file_name.lower().endswith(v) for v in self._VIDEO_EXTS)))
+
             async with ffmpeg_sem:
                 if self.cancel_event.is_set():
                     return
-
-                upload_path = str(slot.local_path)
-                extra_temps: List[Path] = []
-
-                is_video = bool(msg.video or (msg.document and msg.document.file_name and any(msg.document.file_name.lower().endswith(v) for v in self._VIDEO_EXTS)))
 
                 # A0. Clean/Mask old watermark
                 if is_video and self.config.clean_old_watermark:
@@ -1788,7 +1798,6 @@ class MigrationEngine:
                     )
 
                 # B. Thumbnail resolution
-                thumb_path = None
                 if (self.config.enable_custom_thumbnail
                         and self.config.custom_thumbnail_path
                         and os.path.exists(self.config.custom_thumbnail_path)):
@@ -1827,81 +1836,81 @@ class MigrationEngine:
                     extra_temps.append(remuxed)
                     upload_path = await remux_to_streamable_mp4(upload_path, remuxed)
 
-                slot.upload_path = upload_path
-                slot.thumb_path = thumb_path
-                slot.extra_temps = extra_temps
+            slot.upload_path = upload_path
+            slot.thumb_path = thumb_path
+            slot.extra_temps = extra_temps
 
-                # --- Stage 3: Concurrent Cloud Pre-Upload (Telegram Server Direct) ---
-                async with upload_sem:
+            # --- Stage 3: Concurrent Cloud Pre-Upload (Telegram Server Direct) ---
+            async with upload_sem:
+                if self.cancel_event.is_set():
+                    return
+                
+                up_key = f"ul_{msg.id}"
+                up_name = Path(upload_path).name
+                up_start_t = time.time()
+
+                def _cloud_up_prog(current: int, total: int):
                     if self.cancel_event.is_set():
-                        return
-                    
-                    up_key = f"ul_{msg.id}"
-                    up_name = Path(upload_path).name
-                    up_start_t = time.time()
+                        raise asyncio.CancelledError("Upload aborted by cancellation event")
+                    self._update_transfer_progress(up_key, "UL", msg.id, up_name, current, total)
 
-                    def _cloud_up_prog(current: int, total: int):
-                        if self.cancel_event.is_set():
-                            raise asyncio.CancelledError("Upload aborted by cancellation event")
-                        self._update_transfer_progress(up_key, "UL", msg.id, up_name, current, total)
-
-                    # Borrow an isolated uploader client from pool if available
-                    leased_client = None
-                    if uploader_pool is not None and not uploader_pool.empty():
-                        try:
-                            leased_client = await uploader_pool.get()
-                        except Exception:
-                            leased_client = None
-
-                    active_client = leased_client or self.uploader_client or self.client
+                # Borrow an isolated uploader client from pool if available
+                leased_client = None
+                if uploader_pool is not None and not uploader_pool.empty():
                     try:
-                        raw_file = None
-                        raw_thumb = None
-                        max_up_attempts = 5
-                        for up_attempt in range(1, max_up_attempts + 1):
-                            if self.cancel_event.is_set():
-                                return
-                            try:
-                                raw_file = await active_client.save_file(upload_path, progress=_cloud_up_prog)
-                                if thumb_path and os.path.exists(thumb_path):
-                                    try:
-                                        raw_thumb = await active_client.save_file(thumb_path)
-                                    except Exception:
-                                        raw_thumb = None
-                                break
-                            except Exception as up_err:
-                                if any(k in str(up_err) for k in ("Broken pipe", "ConnectionResetError", "OSError", "ConnectionLost")):
-                                    await reset_client_sessions(active_client)
-                                if up_attempt >= max_up_attempts:
-                                    raise up_err
-                                logger.warning(f"⚠️ [Pipeline Upload #{msg.id}] Attempt {up_attempt}/{max_up_attempts} failed: {up_err}. Retrying in 2s...")
-                                await asyncio.sleep(2)
-                    finally:
-                        self._remove_transfer_progress(up_key)
-                        if leased_client is not None and uploader_pool is not None:
-                            uploader_pool.put_nowait(leased_client)
+                        leased_client = await uploader_pool.get()
+                    except Exception:
+                        leased_client = None
 
-                    slot.raw_input_file = raw_file
-                    slot.raw_thumb_file = raw_thumb
+                active_client = leased_client or self.uploader_client or self.client
+                try:
+                    raw_file = None
+                    raw_thumb = None
+                    max_up_attempts = 5
+                    for up_attempt in range(1, max_up_attempts + 1):
+                        if self.cancel_event.is_set():
+                            return
+                        try:
+                            raw_file = await active_client.save_file(upload_path, progress=_cloud_up_prog)
+                            if thumb_path and os.path.exists(thumb_path):
+                                try:
+                                    raw_thumb = await active_client.save_file(thumb_path)
+                                except Exception:
+                                    raw_thumb = None
+                            break
+                        except Exception as up_err:
+                            if any(k in str(up_err) for k in ("Broken pipe", "ConnectionResetError", "OSError", "ConnectionLost")):
+                                await reset_client_sessions(active_client)
+                            if up_attempt >= max_up_attempts:
+                                raise up_err
+                            logger.warning(f"⚠️ [Pipeline Upload #{msg.id}] Attempt {up_attempt}/{max_up_attempts} failed: {up_err}. Retrying in 2s...")
+                            await asyncio.sleep(2)
+                finally:
+                    self._remove_transfer_progress(up_key)
+                    if leased_client is not None and uploader_pool is not None:
+                        uploader_pool.put_nowait(leased_client)
 
-                    if os.path.exists(upload_path):
-                        file_bytes = Path(upload_path).stat().st_size
-                        self.stats.total_bytes_migrated += file_bytes
-                        dur = time.time() - up_start_t
-                        spd = (file_bytes / 1048576) / max(dur, 0.1)
-                        self._clear_progress_line()
-                        logger.info(f"✅ [Uploaded #{msg.id}] {up_name} ({file_bytes / 1048576:.1f} MB) in {format_seconds(dur)} ({spd:.1f} MB/s) & ready for fast-publish")
+                slot.raw_input_file = raw_file
+                slot.raw_thumb_file = raw_thumb
 
-                # Clean local disk IMMEDIATELY because file is safely stored on Telegram Cloud!
-                if slot.local_path:
-                    cleanup_temp_file(slot.local_path)
-                for p in slot.extra_temps:
-                    cleanup_temp_file(p)
+                if os.path.exists(upload_path):
+                    file_bytes = Path(upload_path).stat().st_size
+                    self.stats.total_bytes_migrated += file_bytes
+                    dur = time.time() - up_start_t
+                    spd = (file_bytes / 1048576) / max(dur, 0.1)
+                    self._clear_progress_line()
+                    logger.info(f"✅ [Uploaded #{msg.id}] {up_name} ({file_bytes / 1048576:.1f} MB) in {format_seconds(dur)} ({spd:.1f} MB/s) & ready for fast-publish")
 
-                async with disk_lock:
-                    disk_state["used"] = max(0, disk_state["used"] - slot.disk_bytes)
-                    slot.disk_bytes = 0
-                disk_freed.set()
+            # Clean local disk IMMEDIATELY because file is safely stored on Telegram Cloud!
+            if slot.local_path:
+                cleanup_temp_file(slot.local_path)
+            for p in slot.extra_temps:
+                cleanup_temp_file(p)
+
+            async with disk_lock:
+                disk_state["used"] = max(0, disk_state["used"] - slot.disk_bytes)
+                slot.disk_bytes = 0
+            disk_freed.set()
 
         except asyncio.CancelledError:
             pass

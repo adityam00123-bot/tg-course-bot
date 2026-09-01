@@ -11,15 +11,17 @@
 * **Root Cause:** The `fast_download_media` cached `self.media_sessions[dc_id]` and shared a single MTProto `Session` across multiple concurrent downloads. MTProto sessions process `invoke()` requests sequentially on the TCP socket, causing bottleneck contention. Re-using the same session object also resets its bytes counter which creates the 0% ghost restarts.
 * **Permanent Fix:** Changed `fast_download_media` to instantiate a **new, dedicated `Session`** for every download call, preventing contention and allowing full bandwidth utilization (10MB/s+).
 
-### Error: Terminal Output Spam (`logger.info` vs `sys.stdout.write`)
-* **Symptom:** The terminal gets flooded with hundreds of lines saying `⚡ DL #921 (21/500 MB) @ 6.1 MB/s` because the Kaggle notebook does not properly support the `\r\033[K` carriage return ANSI clearing sequence.
-* **Root Cause:** Kaggle's Jupyter notebook output cell treats `\r` inconsistently when combined with ANSI codes or logger timestamps, creating endless new lines.
+### Error: Double-Download Restart & 15s Stall on Final Chunk (`LIMIT_INVALID`)
+* **Symptom:** Every download reaches 99% or 100%, freezes for 10-15 seconds, and then restarts from 0% at slow 0.9 MB/s, downloading the entire file twice.
+* **Root Cause:** MTProto's `upload.GetFile` strictly requires the `limit` parameter to be divisible by 4096 bytes (4 KB). Requesting `limit = part_size` (unaligned remaining bytes of the last chunk) caused Telegram to return `[400 LIMIT_INVALID]`. `_dl_worker` retried 10 times (15s freeze), failed, and fell back to `_orig_download_media`, which wiped the downloaded bytes and started downloading from 0% again at single-connection 0.9 MB/s.
 * **Permanent Fix:**
-  - Implemented a single combined string: `  ⚡ DL #921 (21/500MB) 6.1MB/s | UL #920 (45/163MB) 3.2MB/s`
-  - Printed purely with `sys.stdout.write(f"\r{line}{' ' * pad}")`.
-  - The `pad` uses spaces to completely overwrite older/longer lines without needing ANSI codes.
-  - Added a `_clear_progress_line()` helper (`\r` + 160 spaces + `\r`) that MUST be called before any `logger.info()` milestones (like "Downloaded" or "Uploaded") to prevent the `\r` progress line from getting permanently embedded in the output.
-  - Ensured `import sys` is explicitly present at the top of `migration.py`.
+  - In `fast_download_media`, always send `limit = chunk_size` (1048576, which is an exact multiple of 4096). Telegram returns `r.bytes` containing only the actual remaining bytes without error.
+  - Removed silent fallback that wipes downloaded files.
+
+### Error: Upload Semaphore Blocked by FFmpeg (`ffmpeg_sem` Contention)
+* **Symptom:** When a large file is uploading, other completed downloads cannot process thumbnails or watermarks.
+* **Root Cause:** Stage 3 (`async with upload_sem:`) was indented inside `async with ffmpeg_sem:`, holding the FFmpeg lock for the entire 1-2 minute upload duration.
+* **Permanent Fix:** Un-nested Stage 3 so Stage 2 releases `ffmpeg_sem` immediately before Stage 3 acquires `upload_sem`.
 
 ---
 
