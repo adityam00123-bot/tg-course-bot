@@ -325,7 +325,7 @@ async def fast_download_media(
 
         session = self.media_sessions[dc_id]
 
-        chunk_size = 512 * 1024
+        chunk_size = 1024 * 1024  # 1MB per MTProto part (maximum line rate)
         total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
 
         queue: asyncio.Queue = asyncio.Queue()
@@ -336,74 +336,98 @@ async def fast_download_media(
 
         downloaded_bytes = 0
         progress_lock = asyncio.Lock()
+        file_lock = asyncio.Lock()
         dl_error: Optional[Exception] = None
 
         # Pre-allocate output file
-        with open(out_path, "wb") as fp:
-            if file_size > 0:
-                fp.truncate(file_size)
+        out_fp = open(out_path, "wb")
+        if file_size > 0:
+            out_fp.truncate(file_size)
+        out_fp.close()
 
-        num_workers = min(getattr(self, "max_concurrent_transmissions", 3) or 3, 3)
+        out_fd = None
+        has_pwrite = hasattr(os, "pwrite")
+        if has_pwrite:
+            out_fd = os.open(str(out_path), os.O_RDWR)
+        else:
+            out_fp = open(out_path, "r+b")
+
+        num_workers = min(getattr(self, "max_concurrent_transmissions", 4) or 4, 4)
         num_workers = max(1, min(num_workers, total_parts))
 
-        async def _dl_worker():
-            nonlocal downloaded_bytes, dl_error
-            while not queue.empty() and dl_error is None:
-                try:
-                    part_idx, offset, part_size = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-
-                part_attempts = 0
-                max_part_attempts = 10
-                chunk_data = None
-
-                while part_attempts < max_part_attempts and dl_error is None:
+        try:
+            async def _dl_worker():
+                nonlocal downloaded_bytes, dl_error
+                while not queue.empty() and dl_error is None:
                     try:
-                        r = await session.invoke(
-                            raw.functions.upload.GetFile(location=location, offset=offset, limit=part_size),
-                            sleep_threshold=30
-                        )
-                        if isinstance(r, raw.types.upload.File):
-                            chunk_data = r.bytes
-                            break
-                        elif isinstance(r, raw.types.upload.FileCdnRedirect):
-                            raise NotImplementedError("CDN redirect handled by fallback")
-                    except Exception as err:
-                        part_attempts += 1
-                        if any(k in str(err).lower() for k in ("file_reference_expired", "filereferenceexpired")):
-                            dl_error = err
-                            break
-                        if part_attempts >= max_part_attempts:
-                            dl_error = err
-                            break
-                        await asyncio.sleep(min(0.2 * (1.5 ** min(part_attempts, 6)), 3.0))
+                        part_idx, offset, part_size = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
 
-                if chunk_data is not None:
-                    with open(out_path, "r+b") as out_f:
-                        out_f.seek(offset)
-                        out_f.write(chunk_data)
+                    part_attempts = 0
+                    max_part_attempts = 10
+                    chunk_data = None
 
-                    async with progress_lock:
-                        downloaded_bytes += len(chunk_data)
-                        if progress:
-                            try:
-                                res_prog = progress(downloaded_bytes, file_size, *progress_args)
-                                if asyncio.iscoroutine(res_prog):
-                                    await res_prog
-                            except Exception:
-                                pass
+                    while part_attempts < max_part_attempts and dl_error is None:
+                        try:
+                            r = await session.invoke(
+                                raw.functions.upload.GetFile(location=location, offset=offset, limit=part_size),
+                                sleep_threshold=30
+                            )
+                            if isinstance(r, raw.types.upload.File):
+                                chunk_data = r.bytes
+                                break
+                            elif isinstance(r, raw.types.upload.FileCdnRedirect):
+                                raise NotImplementedError("CDN redirect handled by fallback")
+                        except Exception as err:
+                            part_attempts += 1
+                            if any(k in str(err).lower() for k in ("file_reference_expired", "filereferenceexpired")):
+                                dl_error = err
+                                break
+                            if part_attempts >= max_part_attempts:
+                                dl_error = err
+                                break
+                            await asyncio.sleep(min(0.2 * (1.5 ** min(part_attempts, 6)), 3.0))
 
-        workers = [asyncio.create_task(_dl_worker()) for _ in range(num_workers)]
-        await asyncio.gather(*workers)
+                    if chunk_data is not None:
+                        if has_pwrite and out_fd is not None:
+                            os.pwrite(out_fd, chunk_data, offset)
+                        else:
+                            async with file_lock:
+                                out_fp.seek(offset)
+                                out_fp.write(chunk_data)
 
-        if dl_error is not None:
-            raise dl_error
+                        async with progress_lock:
+                            downloaded_bytes += len(chunk_data)
+                            if progress:
+                                try:
+                                    res_prog = progress(downloaded_bytes, file_size, *progress_args)
+                                    if asyncio.iscoroutine(res_prog):
+                                        await res_prog
+                                except Exception:
+                                    pass
 
-        if downloaded_bytes < (file_size * 0.99):
-            raise RuntimeError(f"Download incomplete: {downloaded_bytes}/{file_size} bytes received.")
+            workers = [asyncio.create_task(_dl_worker()) for _ in range(num_workers)]
+            await asyncio.gather(*workers)
 
-        return str(out_path)
+            if dl_error is not None:
+                raise dl_error
+
+            if downloaded_bytes < (file_size * 0.99):
+                raise RuntimeError(f"Download incomplete: {downloaded_bytes}/{file_size} bytes received.")
+
+            return str(out_path)
+        finally:
+            if out_fd is not None:
+                try:
+                    os.close(out_fd)
+                except Exception:
+                    pass
+            elif out_fp is not None and not out_fp.closed:
+                try:
+                    out_fp.close()
+                except Exception:
+                    pass
 
     except Exception as e:
         logger.debug(f"Parallel chunk download fallback to native: {e}")

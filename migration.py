@@ -1235,7 +1235,7 @@ class MigrationEngine:
                         continue
 
                 # Verify complete download (within 99% margin for metadata)
-                if expected_size > 0 and actual_size < (expected_size * 0.99):
+                if expected_size is not None and expected_size > 0 and actual_size < (expected_size * 0.99):
                     logger.warning(
                         f"⚠️ [Download #{msg.id}] Incomplete file detected: "
                         f"Got {actual_size / 1048576:.1f} MB / expected {expected_size / 1048576:.1f} MB. "

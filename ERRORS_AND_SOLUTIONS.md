@@ -61,13 +61,10 @@
   - In `fast_uploader.py`, monkey-patched `Session.stop = _safe_session_stop` and `Session.restart = _safe_session_restart` protected by `_session_restart_lock`.
   - The reader task is cleanly cancelled and awaited before closing the underlying transport.
 
-### Error: `ValueError: Peer id invalid` in `Client.handle_updates()`
-* **Symptom:** `[ERROR] Task exception was never retrieved ... coro=<Client.handle_updates() ... exception=ValueError('Peer id invalid: -100xxxxxxxxxx')`.
-* **Root Cause:** In Telegram, background push updates (e.g. messages posted in other unrelated channels that the userbot account is joined in) arrive on the MTProto connection. If that channel's peer is not in local SQLite storage, Pyrogram logs an unhandled update task warning.
-* **Impact:** 100% harmless background noise; has zero effect on the downloading/uploading migration pipeline.
-* **Permanent Fix:** 
-  - Set `no_updates=True` on dedicated pool worker clients.
-  - Added filter in `SuppressPyrogramSocketFilter` to suppress `handle_updates` trace logs from polluting terminal logs.
+### Error: `TypeError: '>' not supported between instances of 'NoneType' and 'int'`
+* **Symptom:** `[WARNING] [Pipeline] Prefetch error for #XXX: '>' not supported between instances of 'NoneType' and 'int'`.
+* **Root Cause:** When a message has no metadata file size (or is photo/custom document), `expected_size` is `None`. Comparing `expected_size > 0` directly threw a TypeError.
+* **Permanent Fix:** In `migration.py` line 1238, guarded with `if expected_size is not None and expected_size > 0:`.
 
 ---
 
