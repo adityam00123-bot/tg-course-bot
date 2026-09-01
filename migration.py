@@ -379,10 +379,10 @@ class MigrationEngine:
         self._active_transfers.pop(key, None)
 
     async def _live_progress_ticker_loop(self):
-        """Central ticker updating in-place live console status every 1.0 second."""
+        """Central ticker outputting combined live multi-stream progress every 2.0s."""
         while not self.cancel_event.is_set():
             try:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(2.0)
                 if not self._active_transfers:
                     continue
                 
@@ -392,14 +392,14 @@ class MigrationEngine:
                     tot_mb = item["total"] / 1048576 if item["total"] else 0
                     pct = (item["current"] / item["total"] * 100) if item["total"] else 0
                     spd = item.get("speed", 0.0)
-                    spd_str = f"{spd:.1f}MB/s" if spd > 0 else "...MB/s"
+                    spd_str = f"{spd:.1f} MB/s" if spd > 0 else "... MB/s"
                     icon = "🔽" if item["type"] == "DL" else "🔼"
-                    parts.append(f"{icon} #{item['seq']} [{item['name']}] {pct:.1f}% ({curr_mb:.1f}/{tot_mb:.1f}MB @ {spd_str})")
+                    type_str = "DL" if item["type"] == "DL" else "UL"
+                    parts.append(f"{icon} {type_str} #{item['seq']} [{item['name']}] {pct:.1f}% ({curr_mb:.1f}/{tot_mb:.1f} MB @ {spd_str})")
 
                 if parts:
                     summary_line = " | ".join(parts)
-                    sys.stdout.write(f"\r\033[K⚡ {summary_line}")
-                    sys.stdout.flush()
+                    logger.info(f"⚡ {summary_line}")
             except asyncio.CancelledError:
                 break
             except Exception:
