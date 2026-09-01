@@ -1110,6 +1110,9 @@ class MigrationEngine:
 
     async def _download_media_to_file(self, msg: Message, client: Optional[Client] = None) -> Optional[Path]:
         """Download media from msg to a temporary file on disk with retries and fresh file_reference token renewal."""
+        if not (msg.video or msg.photo or msg.document or msg.audio or msg.voice or msg.animation or msg.video_note or msg.sticker):
+            return None
+
         ext = ".bin"
         if msg.video:
             ext = ".mp4"
@@ -1667,27 +1670,15 @@ class MigrationEngine:
     _VIDEO_EXTS = frozenset([".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts", ".flv", ".m4v", ".3gp"])
 
     def _msg_needs_pipeline(self, msg: Message) -> bool:
-        """Check if a message requires the concurrent download→process→upload pipeline.
-        Route ALL media through pipeline for maximum parallel throughput."""
-        if not msg or not msg.media:
+        """Check if a message contains downloadable media requiring the pipeline.
+        Only messages with actual files/media are routed to background download."""
+        if not msg or msg.empty or msg.service:
             return False
 
-        # Route ALL downloadable media through pipeline for parallel processing
-        if msg.video or msg.photo or msg.document or msg.audio or msg.animation:
-            return True
-
-        is_doc_video = bool(
-            msg.document and msg.document.file_name and
-            any(msg.document.file_name.lower().endswith(v) for v in self._VIDEO_EXTS)
-        )
-        if is_doc_video:
-            return True
-
+        # Only route messages containing actual downloadable files/media
         return bool(
-            self.config.enable_watermark or
-            self.config.clean_old_watermark or
-            self.config.enable_custom_thumbnail or
-            self.config.strip_existing_thumbnail
+            msg.video or msg.photo or msg.document or msg.audio or
+            msg.voice or msg.animation or msg.video_note or msg.sticker
         )
 
     async def _pipeline_prefetch(
