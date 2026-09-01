@@ -1433,6 +1433,7 @@ def register_handlers(bot: Client) -> None:
 
             # Success!
             me = login_res.get("user")
+            sess_str = login_res.get("session_string")
             USER_STATES[user_id] = {"state": STATE_NONE}
             post_login_kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🚀 Open Userbot Hub / Start Migration", callback_data="nav_engine_actions")],
@@ -1447,6 +1448,15 @@ def register_handlers(bot: Client) -> None:
                 reply_markup=post_login_kb,
                 parse_mode=enums.ParseMode.HTML
             )
+            if sess_str:
+                await message.reply_text(
+                    f"🔑 <b>YOUR PERMANENT SESSION STRING:</b>\n\n"
+                    f"<code>{sess_str}</code>\n\n"
+                    f"👉 <b>Kaggle Cell 2 me isko paste kar dena:</b>\n"
+                    f"<code>USERBOT_SESSION_STRING=\"{sess_str}\"</code>\n\n"
+                    f"<i>Iske baad aapko aage kabhi bhi dobara login nahi karna padega!</i>",
+                    parse_mode=enums.ParseMode.HTML
+                )
             await sync_user_dialogs(user_id, limit=100)
             return
 
@@ -1466,6 +1476,7 @@ def register_handlers(bot: Client) -> None:
                 return
 
             me = login_res.get("user")
+            sess_str = login_res.get("session_string")
             USER_STATES[user_id] = {"state": STATE_NONE}
             post_login_kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🚀 Open Userbot Hub / Start Migration", callback_data="nav_engine_actions")],
@@ -1480,6 +1491,15 @@ def register_handlers(bot: Client) -> None:
                 reply_markup=post_login_kb,
                 parse_mode=enums.ParseMode.HTML
             )
+            if sess_str:
+                await message.reply_text(
+                    f"🔑 <b>YOUR PERMANENT SESSION STRING:</b>\n\n"
+                    f"<code>{sess_str}</code>\n\n"
+                    f"👉 <b>Kaggle Cell 2 me isko paste kar dena:</b>\n"
+                    f"<code>USERBOT_SESSION_STRING=\"{sess_str}\"</code>\n\n"
+                    f"<i>Iske baad aapko aage kabhi bhi dobara login nahi karna padega!</i>",
+                    parse_mode=enums.ParseMode.HTML
+                )
             await sync_user_dialogs(user_id, limit=100)
             return
 

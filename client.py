@@ -321,7 +321,13 @@ async def complete_user_login(
                 phone=phone_number,
                 is_logged_in=True
             )
-            return {"success": True, "needs_2fa": False, "user": me}
+            sess_str = None
+            try:
+                sess_str = await temp_client.export_session_string()
+            except Exception:
+                pass
+
+            return {"success": True, "needs_2fa": False, "user": me, "session_string": sess_str}
 
         except SessionPasswordNeeded:
             if not password:
@@ -356,7 +362,12 @@ async def complete_user_login(
                 password_2fa=password,
                 is_logged_in=True
             )
-            return {"success": True, "needs_2fa": False, "user": me}
+            sess_str = None
+            try:
+                sess_str = await temp_client.export_session_string()
+            except Exception:
+                pass
+            return {"success": True, "needs_2fa": False, "user": me, "session_string": sess_str}
 
     except Exception as e:
         logger.error(f"Sign in failed for user {user_id}: {e}")
