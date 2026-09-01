@@ -6,6 +6,7 @@ Includes Auto-Resume checkpointing and Concurrent Prefetching Pipeline.
 """
 
 import os
+import sys
 import re
 import shutil
 import zipfile
@@ -2630,8 +2631,7 @@ class MigrationEngine:
             if self._ticker_task and not self._ticker_task.done():
                 self._ticker_task.cancel()
             self._active_transfers.clear()
-            sys.stdout.write("\r\033[K")
-            sys.stdout.flush()
+            self._clear_progress_line()
 
             all_pool_clients = uploader_clients_all + downloader_clients_all
             if all_pool_clients:

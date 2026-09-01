@@ -19,6 +19,7 @@
   - Printed purely with `sys.stdout.write(f"\r{line}{' ' * pad}")`.
   - The `pad` uses spaces to completely overwrite older/longer lines without needing ANSI codes.
   - Added a `_clear_progress_line()` helper (`\r` + 160 spaces + `\r`) that MUST be called before any `logger.info()` milestones (like "Downloaded" or "Uploaded") to prevent the `\r` progress line from getting permanently embedded in the output.
+  - Ensured `import sys` is explicitly present at the top of `migration.py`.
 
 ---
 
