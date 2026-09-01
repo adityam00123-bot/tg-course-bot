@@ -1026,35 +1026,26 @@ class MigrationEngine:
 
         return False
 
-    async def _download_media_to_file(self, msg: Message) -> Optional[Path]:
-        """Download media of a message to temporary file safely with valid extension."""
-        if not msg or not msg.media:
-            return None
-
-        # Determine appropriate file extension based on media type
-        if msg.photo:
+    async def _download_media_to_file(self, msg: Message, client: Optional[Client] = None) -> Optional[Path]:
+        """Download media from msg to a temporary file on disk with retries and fresh file_reference token renewal."""
+        ext = ".bin"
+        if msg.video:
+            ext = ".mp4"
+        elif msg.photo:
             ext = ".jpg"
-        elif msg.video:
-            ext = ".mp4"
-        elif msg.animation:
-            ext = ".mp4"
         elif msg.audio:
             ext = ".mp3"
         elif msg.voice:
             ext = ".ogg"
-        elif msg.video_note:
-            ext = ".mp4"
-        elif msg.sticker:
-            ext = ".webp"
-        elif msg.document and msg.document.file_name:
-            _, doc_ext = os.path.splitext(msg.document.file_name)
-            ext = doc_ext or ".bin"
-        else:
-            ext = ".dat"
+        elif msg.document:
+            fn = msg.document.file_name or ""
+            if "." in fn:
+                ext = Path(fn).suffix
+            else:
+                ext = ".doc"
 
         temp_target = Config.DOWNLOAD_DIR / f"media_{msg.chat.id}_{msg.id}{ext}"
-
-        expected_size = 0
+        expected_size = None
         if msg.video and msg.video.file_size:
             expected_size = msg.video.file_size
         elif msg.document and msg.document.file_size:
@@ -1084,7 +1075,7 @@ class MigrationEngine:
                     pct = (current / total * 100) if total else 0
                     logger.info(f"🔽 [Download #{msg.id}] {current / 1048576:.1f} / {total / 1048576:.1f} MB ({pct:.1f}%)")
 
-            dl_client = self.userbot or self.client
+            dl_client = client or self.userbot or self.client
             wait_sec = min(2 ** min(attempt, 5), 30)
 
             # If retrying after a failure, refresh message from Telegram to renew expired file_reference tokens
@@ -1618,6 +1609,7 @@ class MigrationEngine:
         disk_state: dict,
         disk_lock: asyncio.Lock,
         disk_freed: asyncio.Event,
+        downloader_pool: Optional[asyncio.Queue] = None,
         uploader_pool: Optional[asyncio.Queue] = None,
     ) -> None:
         """Background task: download media + apply watermark/thumbnail for one message."""
@@ -1656,12 +1648,23 @@ class MigrationEngine:
                 except asyncio.TimeoutError:
                     pass  # Re-check budget (disk may have been freed externally)
 
-            # --- Stage 1: Download ---
+            # --- Stage 1: Download (Dedicated MTProto Socket Stream) ---
             async with download_sem:
                 if self.cancel_event.is_set():
                     return
                 logger.info(f"🔽 [Pipeline] Downloading #{msg.id}...")
-                slot.local_path = await self._download_media_to_file(msg)
+                leased_dl_client = None
+                if downloader_pool is not None and not downloader_pool.empty():
+                    try:
+                        leased_dl_client = await downloader_pool.get()
+                    except Exception:
+                        leased_dl_client = None
+
+                try:
+                    slot.local_path = await self._download_media_to_file(msg, client=leased_dl_client)
+                finally:
+                    if leased_dl_client is not None and downloader_pool is not None:
+                        downloader_pool.put_nowait(leased_dl_client)
 
             if not slot.local_path or not slot.local_path.exists():
                 slot.error = RuntimeError(f"Download failed for #{msg.id}")
@@ -2262,26 +2265,17 @@ class MigrationEngine:
             await self._send_progress_update(is_final=False)
 
             last_progress_count = 0
+            downloader_clients_all: List[Client] = []
             uploader_clients_all: List[Client] = []
 
             if pipeline_active:
                 total_cpus = os.cpu_count() or 2
                 has_gpu = bool(shutil.which("nvidia-smi"))
 
-                # Dynamic Smart Scaling for Maximum Multi-Core Throughput:
-                # 1. Download semaphore: 4 parallel streams to saturate CPU cores
-                num_downloads = max(2, min(total_cpus, 4))
-
-                # 2. FFmpeg semaphore:
-                # If GPU is present (e.g. T4 NVENC), hardware chip handles 3-4 concurrent streams.
-                # If CPU only, utilize all available cores.
-                if has_gpu:
-                    num_ffmpeg = min(4, max(2, total_cpus))
-                else:
-                    num_ffmpeg = max(2, min(total_cpus, 4))
-
-                # 3. Upload semaphore: 4 parallel isolated upload streams.
-                num_uploads = max(2, min(total_cpus, 4))
+                # Optimal 2x2 Media Concurrency (Saturates bandwidth without exceeding Telegram DC connection limits):
+                num_downloads = 2
+                num_uploads = 2
+                num_ffmpeg = max(2, min(total_cpus, 4))
 
                 download_sem = asyncio.Semaphore(num_downloads)
                 ffmpeg_sem = asyncio.Semaphore(num_ffmpeg)
@@ -2296,19 +2290,37 @@ class MigrationEngine:
                 logger.info(
                     f"🚀 [Pipeline] Turbo Hardware Mode ON ({hw_type}) — "
                     f"{total_cpus} System Cores detected -> "
-                    f"{num_downloads} Downloaders, {num_ffmpeg} FFmpeg Workers, {num_uploads} Dedicated Uploaders | "
+                    f"{num_downloads} Dedicated Download Streams, {num_ffmpeg} FFmpeg Workers, {num_uploads} Dedicated Upload Streams | "
                     f"Disk buffer budget ~{budget_mb} MB"
                 )
 
-                # Initialize dedicated pool of isolated Pyrogram Clients for concurrent MTProto chunk uploads
+                # Initialize dedicated pools of isolated Pyrogram Clients for concurrent MTProto streams
+                downloader_pool: asyncio.Queue = asyncio.Queue()
                 uploader_pool: asyncio.Queue = asyncio.Queue()
 
                 if self.userbot:
                     try:
                         session_str = await self.userbot.export_session_string()
                         if session_str:
+                            # 1. Spawn isolated downloader clients
+                            for idx in range(num_downloads):
+                                dl_cl = Client(
+                                    name=f"pipeline_downloader_{idx}",
+                                    session_string=session_str,
+                                    in_memory=True,
+                                    no_updates=True,
+                                    api_id=Config.API_ID,
+                                    api_hash=Config.API_HASH,
+                                    max_concurrent_transmissions=Config.MAX_UPLOAD_WORKERS,
+                                    workers=16
+                                )
+                                await dl_cl.start()
+                                downloader_pool.put_nowait(dl_cl)
+                                downloader_clients_all.append(dl_cl)
+
+                            # 2. Spawn isolated uploader clients
                             for idx in range(num_uploads):
-                                cl = Client(
+                                up_cl = Client(
                                     name=f"pipeline_uploader_{idx}",
                                     session_string=session_str,
                                     in_memory=True,
@@ -2316,17 +2328,20 @@ class MigrationEngine:
                                     api_id=Config.API_ID,
                                     api_hash=Config.API_HASH,
                                     max_concurrent_transmissions=Config.MAX_UPLOAD_WORKERS,
-                                    workers=Config.MAX_UPLOAD_WORKERS
+                                    workers=16
                                 )
-                                await cl.start()
-                                install_fast_uploader(cl, max_workers=Config.MAX_UPLOAD_WORKERS)
-                                uploader_pool.put_nowait(cl)
-                                uploader_clients_all.append(cl)
-                            logger.info(f"⚡ [Pipeline] {len(uploader_clients_all)} Dedicated MTProto Upload Streams established.")
-                    except Exception as up_err:
-                        logger.warning(f"[Pipeline] Dedicated uploader fallback to primary client: {up_err}")
+                                await up_cl.start()
+                                install_fast_uploader(up_cl, max_workers=Config.MAX_UPLOAD_WORKERS)
+                                uploader_pool.put_nowait(up_cl)
+                                uploader_clients_all.append(up_cl)
+
+                            logger.info(f"⚡ [Pipeline] {len(downloader_clients_all)} Dedicated Download Streams + {len(uploader_clients_all)} Dedicated Upload Streams established.")
+                    except Exception as pool_err:
+                        logger.warning(f"[Pipeline] Dedicated pool fallback to primary userbot client: {pool_err}")
+                        downloader_pool = None
                         uploader_pool = None
                 else:
+                    downloader_pool = None
                     uploader_pool = None
 
             # -- Dynamic Sliding Window Streaming Pipeline --
@@ -2370,7 +2385,7 @@ class MigrationEngine:
                                     self._pipeline_prefetch(
                                         slot, download_sem, ffmpeg_sem, upload_sem,
                                         disk_state, disk_lock, disk_freed,
-                                        uploader_pool
+                                        downloader_pool, uploader_pool
                                     )
                                 )
                                 slot.prefetch_task = task
@@ -2524,14 +2539,16 @@ class MigrationEngine:
             self.stats.error_message = str(e)
             logger.error(f"❌ Fatal error during migration: {e}", exc_info=True)
         finally:
-            if uploader_clients_all:
-                for cl in uploader_clients_all:
+            all_pool_clients = uploader_clients_all + downloader_clients_all
+            if all_pool_clients:
+                for cl in all_pool_clients:
                     try:
                         if cl.is_connected:
                             await cl.stop()
                     except Exception:
                         pass
                 uploader_clients_all.clear()
+                downloader_clients_all.clear()
 
             self.stats.end_time = time.time()
             logger.info(

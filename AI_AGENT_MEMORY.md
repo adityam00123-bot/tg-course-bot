@@ -43,6 +43,12 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
 - **Upload / Download Bandwidth & Connections**: Telegram's MTProto allows multi-part chunk streaming (4-8 TCP connections per file). The safe ceiling per account is **4 to 6 parallel file transfers (max 16 MTProto workers)**. Exceeding 16 simultaneous socket connections per session triggers DC-level TCP throttling (dropping speed to <1 MB/s) or aggressive FloodWait bans.
 - **Auto-Pacing on Media**: Because uploading a 1GB file naturally takes 1-2 minutes, the 2.0s delay is skipped during media transfers, as the upload time itself acts as natural pacing.
 
+## 8. 2x2 Multi-Stream Conveyor Belt Architecture (Sep 2026)
+- **Dedicated Downloader & Uploader Pools**: To prevent single-session MTProto serialization, `migration.py` maintains an isolated `downloader_pool` (2 parallel streams) and `uploader_pool` (2 parallel streams).
+- **True Simultaneous Downloads & Uploads**: While File #1 and File #2 are downloading simultaneously, File #0 is uploading to Cloud in parallel.
+- **Strict Sequential Publishing**: Pre-uploaded `InputFileBig` objects are published in strict numerical order (`#1`, `#2`, `#3`...) to destination in ~50ms.
+- **Reference Document**: See `ERRORS_AND_SOLUTIONS.md` for full troubleshooting database of all MTProto, socket, and authentication errors.
+
 ## 7. Cloud Execution Strategy
 1. **Primary: Kaggle Notebooks** (4 vCPU, 30 GB RAM, 2x T4 GPU, ~73 GB Disk). Allows "Save & Run All (Commit)" for 12-hour background execution without keeping the browser open. Weekly GPU quota is 30 hours.
 2. **Fallback: Google Colab** (2 vCPU, 12.6 GB RAM, 1x T4 GPU, ~78 GB Disk). Used when Kaggle's 30-hour weekly GPU quota is exhausted. Requires keeping the browser tab active.
