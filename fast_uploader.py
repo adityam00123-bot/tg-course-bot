@@ -137,8 +137,8 @@ async def fast_save_file(
     progress_lock = asyncio.Lock()
     stream_lock = asyncio.Lock() if is_stream else None
 
-    # Use 4-6 concurrent chunk workers per client stream for high-speed throughput
-    num_workers = min(getattr(self, "max_concurrent_transmissions", 6) or 6, 6)
+    # 4 concurrent chunk workers per client stream is the proven optimal sweet spot for MTProto uploads
+    num_workers = min(getattr(self, "max_concurrent_transmissions", 4) or 4, 4)
     num_workers = max(1, min(num_workers, total_parts))
 
     async def _worker():
@@ -150,6 +150,9 @@ async def fast_save_file(
                     part_idx, offset, part_size = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+
+                # Micro-pacing: tiny 10ms yield to prevent burst packet collisions and avoid FloodWait
+                await asyncio.sleep(0.01)
 
                 if is_stream:
                     async with stream_lock:
@@ -179,20 +182,21 @@ async def fast_save_file(
 
                 while part_attempts < max_part_attempts and upload_error is None:
                     try:
-                        res = await self.invoke(rpc)
+                        res = await self.invoke(rpc, sleep_threshold=60)
                         if res is True or res:
                             part_ack = True
                             break
                     except Exception as err:
                         part_attempts += 1
                         err_str = str(err)
-                        if any(k in err_str.lower() for k in ("broken pipe", "connectionreseterror", "oserror", "connectionlost", "timed out", "timeouterror")):
+                        # Only reset socket on genuine transport breakage, NOT on transient latency timeouts
+                        if any(k in err_str.lower() for k in ("broken pipe", "connectionreseterror", "connectionlost")):
                             await reset_client_sessions(self)
                         if part_attempts >= 3:
                             logger.warning(
                                 f"⚠️ Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}"
                             )
-                        await asyncio.sleep(min(0.2 * (1.5 ** min(part_attempts, 8)), 4.0))
+                        await asyncio.sleep(min(0.2 * (1.5 ** min(part_attempts, 6)), 3.0))
 
                 if not part_ack:
                     upload_error = RuntimeError(

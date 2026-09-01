@@ -26,9 +26,16 @@
   - Non-media text messages bypass the prefetch download queue completely and publish immediately in ~50ms via direct stream.
   - Added a fast exit guard in `_download_media_to_file` returning `None` immediately if no downloadable media is present.
 
-### Enhancement: Telegram Premium 6-8 Worker Throughput Unlock
-* **Feature:** Unlocks full Telegram Premium bandwidth without artificial 3-worker capping.
-* **Fix:** Upgraded `fast_download_media`, `fast_save_file`, and `install_fast_uploader` to support 6–8 concurrent transmission workers per stream, reaching 15–25+ MB/s download and 10–15+ MB/s upload.
+### Error: 5–15s Upload Holds & FloodWait Penalties
+* **Symptom:** During uploads, progress holds/freezes for 5–15 seconds at a time before resuming.
+* **Root Cause:**
+  1. Sending 512KB MTProto chunks in tight loops on a single TCP socket triggered Telegram's server-side burst flood throttle (`FLOOD_WAIT_X`), which Pyrogram was sleeping on silently.
+  2. Transient TCP latency jitters triggered full `reset_client_sessions()`, causing 5–8s socket reconnections.
+  3. Video thumbnails were uploaded sequentially after the main file, adding a 2-second tail pause at 100%.
+* **Permanent Fix:**
+  - Added 10ms micro-pacing yield in `fast_save_file` to eliminate `FLOOD_WAIT` penalties.
+  - Restricted socket resets strictly to fatal transport errors (`BrokenPipe`, `ConnectionLost`), allowing transient timeouts to retry cleanly without socket destruction.
+  - Parallelized video and thumbnail upload via `asyncio.gather()` in `_pipeline_prefetch`.
 
 ---
 

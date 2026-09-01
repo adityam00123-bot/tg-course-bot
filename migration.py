@@ -1862,15 +1862,17 @@ class MigrationEngine:
                         if self.cancel_event.is_set():
                             return
                         try:
-                            raw_file = await active_client.save_file(upload_path, progress=_cloud_up_prog)
                             if thumb_path and os.path.exists(thumb_path):
-                                try:
-                                    raw_thumb = await active_client.save_file(thumb_path)
-                                except Exception:
-                                    raw_thumb = None
+                                raw_file, raw_thumb = await asyncio.gather(
+                                    active_client.save_file(upload_path, progress=_cloud_up_prog),
+                                    active_client.save_file(thumb_path)
+                                )
+                            else:
+                                raw_file = await active_client.save_file(upload_path, progress=_cloud_up_prog)
+                                raw_thumb = None
                             break
                         except Exception as up_err:
-                            if any(k in str(up_err) for k in ("Broken pipe", "ConnectionResetError", "OSError", "ConnectionLost")):
+                            if any(k in str(up_err) for k in ("Broken pipe", "ConnectionResetError", "ConnectionLost")):
                                 await reset_client_sessions(active_client)
                             if up_attempt >= max_up_attempts:
                                 raise up_err
