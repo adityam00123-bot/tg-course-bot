@@ -57,8 +57,8 @@ class Config:
     MAX_DELAY_SECONDS = float(os.getenv("MAX_DELAY_SECONDS", "3.0"))
     FLOOD_WAIT_MAX_SLEEP = int(os.getenv("FLOOD_WAIT_MAX_SLEEP", "300"))
 
-    # Parallel MTProto Uploading & Downloading (Optimized for Telegram Premium & High-Throughput: 6-8 workers)
-    _default_workers = max(6, min((os.cpu_count() or 2) * 2, 8))
+    # Parallel MTProto Uploading & Downloading (Optimized for Telegram Premium & High-Throughput: 10-12 workers)
+    _default_workers = max(10, min((os.cpu_count() or 2) * 3, 16))
     MAX_UPLOAD_WORKERS = int(os.getenv("MAX_UPLOAD_WORKERS", str(_default_workers)))
 
     # Video Anti-Theft Watermark Settings

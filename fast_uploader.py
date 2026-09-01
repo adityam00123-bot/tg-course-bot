@@ -137,9 +137,9 @@ async def fast_save_file(
     progress_lock = asyncio.Lock()
     stream_lock = asyncio.Lock() if is_stream else None
 
-    # 4 concurrent chunk workers per client stream is the proven optimal sweet spot for MTProto uploads
-    num_workers = min(getattr(self, "max_concurrent_transmissions", 4) or 4, 4)
-    num_workers = max(1, min(num_workers, total_parts))
+    # 10-12 concurrent chunk workers per client stream for high-speed Telegram Premium uploads
+    num_workers = min(getattr(self, "max_concurrent_transmissions", 12) or 12, total_parts)
+    num_workers = max(1, min(num_workers, 16))
 
     async def _worker():
         nonlocal uploaded_bytes, upload_error
@@ -150,9 +150,6 @@ async def fast_save_file(
                     part_idx, offset, part_size = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-
-                # Micro-pacing: tiny 10ms yield to prevent burst packet collisions and avoid FloodWait
-                await asyncio.sleep(0.01)
 
                 if is_stream:
                     async with stream_lock:
@@ -347,8 +344,8 @@ async def fast_download_media(
 
             out_fp = open(out_path, "r+b")
 
-            num_workers = min(getattr(self, "max_concurrent_transmissions", 6) or 6, total_parts)
-            num_workers = max(1, min(num_workers, 8))
+            num_workers = min(getattr(self, "max_concurrent_transmissions", 12) or 12, total_parts)
+            num_workers = max(1, min(num_workers, 16))
 
             async def _dl_worker():
                 nonlocal downloaded_bytes, dl_error
@@ -426,16 +423,16 @@ async def fast_download_media(
 Client.download_media = fast_download_media
 
 
-def install_fast_uploader(client: Client, max_workers: int = 6) -> None:
+def install_fast_uploader(client: Client, max_workers: int = 12) -> None:
     """Installs high-speed verified parallel uploader and downloader on the Pyrogram client instance."""
-    client.max_concurrent_transmissions = min(max_workers, 8)
+    client.max_concurrent_transmissions = min(max_workers, 16)
     client.save_file = fast_save_file.__get__(client, Client)
     client.download_media = fast_download_media.__get__(client, Client)
     logger.info(f"⚡ Fast Verified MTProto Uploader & Downloader active (max_concurrent_transmissions={client.max_concurrent_transmissions}).")
 
 
 class ParallelUploader:
-    def __init__(self, client: Client, max_workers: int = 6):
+    def __init__(self, client: Client, max_workers: int = 12):
         self.client = client
         self.max_workers = max_workers
         install_fast_uploader(client, max_workers)
