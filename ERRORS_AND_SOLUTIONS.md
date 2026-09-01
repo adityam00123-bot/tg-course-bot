@@ -61,12 +61,13 @@
   - In `fast_uploader.py`, monkey-patched `Session.stop = _safe_session_stop` and `Session.restart = _safe_session_restart` protected by `_session_restart_lock`.
   - The reader task is cleanly cancelled and awaited before closing the underlying transport.
 
-### Error: `[420 FLOOD_WAIT_X]` during Channel Scanning
-* **Symptom:** Bot receives `FloodWait` (e.g. 20s - 300s) when scanning message IDs in a channel.
-* **Root Cause:** Calling `get_messages()` in tight bursts or redundant `get_me()` / `users.GetFullUser` calls inside migration loops.
-* **Permanent Fix:**
-  - Switched channel scanning to `get_chat_history()` with `0.6s` calibrated pacing per 100 messages.
-  - Cached all peer entities in memory via `_resolve_peer_cached()` to eliminate redundant API calls.
+### Error: `ValueError: Peer id invalid` in `Client.handle_updates()`
+* **Symptom:** `[ERROR] Task exception was never retrieved ... coro=<Client.handle_updates() ... exception=ValueError('Peer id invalid: -100xxxxxxxxxx')`.
+* **Root Cause:** In Telegram, background push updates (e.g. messages posted in other unrelated channels that the userbot account is joined in) arrive on the MTProto connection. If that channel's peer is not in local SQLite storage, Pyrogram logs an unhandled update task warning.
+* **Impact:** 100% harmless background noise; has zero effect on the downloading/uploading migration pipeline.
+* **Permanent Fix:** 
+  - Set `no_updates=True` on dedicated pool worker clients.
+  - Added filter in `SuppressPyrogramSocketFilter` to suppress `handle_updates` trace logs from polluting terminal logs.
 
 ---
 

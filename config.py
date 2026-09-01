@@ -161,7 +161,7 @@ class FlushStreamHandler(logging.StreamHandler):
 
 
 class SuppressPyrogramSocketFilter(logging.Filter):
-    """Filters out internal raw socket disconnect/reconnect noise and closed db traces."""
+    """Filters out internal raw socket disconnect/reconnect noise, closed db traces, and handle_updates background noise."""
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
         if "socket.send() raised exception" in msg:
@@ -169,6 +169,10 @@ class SuppressPyrogramSocketFilter(logging.Filter):
         if "Cannot operate on a closed database" in msg:
             return False
         if "Broken pipe" in msg and ("Retrying" in msg or "OSError" in msg):
+            return False
+        if "handle_updates" in msg or "Peer id invalid" in msg:
+            return False
+        if "Task exception was never retrieved" in msg:
             return False
         return True
 
