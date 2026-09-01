@@ -113,8 +113,9 @@ def get_user_session_path(user_id: int) -> Path:
     return Config.SESSION_DIR / f"{sess_name}.session"
 
 
-def create_bot_client(in_memory: bool = False) -> Client:
-    """Create and configure the Pyrogram bot client instance with ultra-fast multi-worker MTProto sockets."""
+def create_bot_client(in_memory: bool = True) -> Client:
+    """Create and configure the Pyrogram bot client instance with in_memory=True for 0-conflict instant token auth."""
+    Config.reload()
     return Client(
         name=Config.BOT_SESSION_NAME,
         api_id=Config.API_ID,

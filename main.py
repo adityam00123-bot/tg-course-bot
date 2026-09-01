@@ -59,11 +59,15 @@ logger = logging.getLogger("migration_bot.main")
 
 def print_startup_banner() -> None:
     """Print clean startup information banner in console."""
+    Config.reload()
+    api_id_str = str(Config.API_ID)
+    masked_api = f"{api_id_str[:3]}****{api_id_str[-2:]}" if len(api_id_str) > 4 else api_id_str
     print("\n" + "=" * 65)
     print("      >> TELEGRAM CONTENT MIGRATION BOT (Pyrogram) <<      ")
     print("=" * 65)
     print(f" * Log File:        {Config.LOG_FILE}")
     print(f" * Download Temp:   {Config.DOWNLOAD_DIR}")
+    print(f" * Telegram API ID: {masked_api}")
     print(f" * Owner User ID:   {Config.OWNER_ID}")
     print(f" * Progress Batch:  Every {Config.PROGRESS_INTERVAL} messages")
     print("=" * 65 + "\n")
@@ -74,7 +78,7 @@ async def main() -> None:
     # 1. Validate environment configuration
     Config.validate()
 
-    # 2. Setup dual logging (stdout + rotating file)
+    # 2. Configure dual console & file logging
     setup_logging()
     print_startup_banner()
 
