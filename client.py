@@ -165,33 +165,41 @@ async def get_or_create_user_client(user_id: int) -> Optional[Client]:
         cl = USER_CLIENTS[user_id]
         if not cl.is_connected:
             try:
-                await cl.start()
+                await cl.connect()
             except Exception as e:
-                logger.debug(f"Could not start existing client for user {user_id}: {e}")
+                logger.debug(f"Could not connect existing client for user {user_id}: {e}")
         return cl
 
+    Config.reload()
     session_string = os.getenv("SESSION_STRING", "").strip() or os.getenv("USERBOT_SESSION_STRING", "").strip()
     sess_path = get_user_session_path(user_id)
-    if not session_string and not sess_path.exists():
+    if not session_string and (not sess_path.exists() or sess_path.stat().st_size == 0):
         return None
 
     try:
         cl = create_userbot_client(user_id)
         if not cl.is_connected:
-            await cl.start()
-            
+            await cl.connect()
+
         me = getattr(cl, "me", None) or getattr(cl, "_cached_me", None)
         if not me:
-            me = await cl.get_me()
-            
+            try:
+                me = await cl.get_me()
+            except Exception:
+                me = None
+
+        if not me:
+            # Session not authorized; disconnect cleanly without prompting stdin
+            if cl.is_connected:
+                await cl.disconnect()
+            return None
+
         # VERY IMPORTANT: Pyrogram's send_video relies on `self.me` existing.
         cl.me = me
         cl._cached_me = me
-        
-        if me:
-            USER_CLIENTS[user_id] = cl
-            logger.info(f"Loaded active userbot session for user {user_id} (@{me.username or me.id})")
-            return cl
+        USER_CLIENTS[user_id] = cl
+        logger.info(f"Loaded active userbot session for user {user_id} (@{me.username or me.id})")
+        return cl
     except Exception as e:
         logger.debug(f"Failed to load userbot session for user {user_id}: {e}")
 
