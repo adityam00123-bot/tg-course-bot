@@ -90,17 +90,46 @@ class Config:
         OWNER_ID: int = 0
 
     @classmethod
+    def reload(cls) -> None:
+        """Explicitly reload environment variables from all possible .env paths with override=True."""
+        paths_to_check = [
+            Path("/kaggle/working/tg-course-bot/.env"),
+            Path("/kaggle/working/.env"),
+            Path(__file__).resolve().parent / ".env",
+            Path.cwd() / ".env",
+            Path.home() / "tg-course-bot/.env",
+            Path(__file__).resolve().parent.parent / ".env"
+        ]
+        for p in paths_to_check:
+            if p.exists():
+                load_dotenv(dotenv_path=p, override=True)
+
+        load_dotenv(override=True)
+
+        cls.API_ID_RAW = (os.getenv("API_ID") or "").strip()
+        cls.API_HASH = (os.getenv("API_HASH") or "").strip()
+        cls.BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+        cls.OWNER_ID_RAW = (os.getenv("OWNER_ID") or "").strip()
+        cls.PHONE_NUMBER = os.getenv("PHONE_NUMBER", "").strip() or None
+
+        try:
+            cls.API_ID = int(cls.API_ID_RAW) if cls.API_ID_RAW else 0
+        except ValueError:
+            cls.API_ID = 0
+
+        try:
+            cls.OWNER_ID = int(cls.OWNER_ID_RAW) if cls.OWNER_ID_RAW else 0
+        except ValueError:
+            cls.OWNER_ID = 0
+
+    @classmethod
     def validate(cls) -> None:
         """Validate required configuration values and parse types."""
+        cls.reload()
         errors = []
 
-        if not cls.API_ID_RAW:
-            errors.append("API_ID is missing. Obtain it from https://my.telegram.org")
-        else:
-            try:
-                cls.API_ID = int(cls.API_ID_RAW)
-            except ValueError:
-                errors.append(f"API_ID must be an integer, got '{cls.API_ID_RAW}'")
+        if not cls.API_ID_RAW or cls.API_ID == 0:
+            errors.append(f"API_ID is missing or 0. Value: '{cls.API_ID_RAW}'. Obtain it from https://my.telegram.org")
 
         if not cls.API_HASH:
             errors.append("API_HASH is missing. Obtain it from https://my.telegram.org")
@@ -108,20 +137,15 @@ class Config:
         if not cls.BOT_TOKEN:
             errors.append("BOT_TOKEN is missing. Obtain it from @BotFather on Telegram")
 
-        if not cls.OWNER_ID_RAW:
-            errors.append("OWNER_ID is missing. Find your numerical ID via @userinfobot")
-        else:
-            try:
-                cls.OWNER_ID = int(cls.OWNER_ID_RAW)
-            except ValueError:
-                errors.append(f"OWNER_ID must be an integer, got '{cls.OWNER_ID_RAW}'")
+        if not cls.OWNER_ID_RAW or cls.OWNER_ID == 0:
+            errors.append(f"OWNER_ID is missing or 0. Value: '{cls.OWNER_ID_RAW}'. Find your numerical ID via @userinfobot")
 
         if errors:
             print("\n" + "=" * 60, file=sys.stderr)
             print("CONFIGURATION ERROR(S) DETECTED:", file=sys.stderr)
             for err in errors:
                 print(f"  ❌ {err}", file=sys.stderr)
-            print("\nPlease copy .env.example to .env and fill in your credentials.", file=sys.stderr)
+            print("\nPlease check your .env file in /kaggle/working/tg-course-bot/.env", file=sys.stderr)
             print("=" * 60 + "\n", file=sys.stderr)
             sys.exit(1)
 
