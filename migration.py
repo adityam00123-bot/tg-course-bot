@@ -374,15 +374,25 @@ class MigrationEngine:
                 entry["last_bytes"] = current
                 entry["last_time"] = now
 
+    def _clear_progress_line(self):
+        """Clears the in-place \\r progress line before printing a new logger line."""
+        sys.stdout.write("\r" + " " * 160 + "\r")
+        sys.stdout.flush()
+
     def _remove_transfer_progress(self, key: str):
         """Removes a finished transfer from the live dashboard."""
         self._active_transfers.pop(key, None)
+        if not self._active_transfers:
+            self._clear_progress_line()
 
     async def _live_progress_ticker_loop(self):
-        """Central ticker outputting combined live multi-stream progress every 2.0s."""
+        """Central ticker: updates a single in-place line on stdout every 1.5s.
+        Uses \\r to overwrite the same line (works on Kaggle with `python -u`).
+        No ANSI escape codes — just carriage return and space-padding."""
+        _last_line_len = 0
         while not self.cancel_event.is_set():
             try:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(1.5)
                 if not self._active_transfers:
                     continue
                 
@@ -392,14 +402,17 @@ class MigrationEngine:
                     tot_mb = item["total"] / 1048576 if item["total"] else 0
                     pct = (item["current"] / item["total"] * 100) if item["total"] else 0
                     spd = item.get("speed", 0.0)
-                    spd_str = f"{spd:.1f} MB/s" if spd > 0 else "... MB/s"
-                    icon = "🔽" if item["type"] == "DL" else "🔼"
-                    type_str = "DL" if item["type"] == "DL" else "UL"
-                    parts.append(f"{icon} {type_str} #{item['seq']} [{item['name']}] {pct:.1f}% ({curr_mb:.1f}/{tot_mb:.1f} MB @ {spd_str})")
+                    spd_str = f"{spd:.1f}" if spd > 0 else "..."
+                    icon = "DL" if item["type"] == "DL" else "UL"
+                    parts.append(f"{icon} #{item['seq']} ({curr_mb:.0f}/{tot_mb:.0f}MB) {spd_str}MB/s")
 
                 if parts:
-                    summary_line = " | ".join(parts)
-                    logger.info(f"⚡ {summary_line}")
+                    line = "  ⚡ " + " | ".join(parts)
+                    # Pad with spaces to fully overwrite any longer previous line
+                    pad = max(0, _last_line_len - len(line))
+                    sys.stdout.write(f"\r{line}{' ' * pad}")
+                    sys.stdout.flush()
+                    _last_line_len = len(line)
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -1251,6 +1264,7 @@ class MigrationEngine:
 
                 dur = time.time() - dl_start_t
                 spd = (actual_size / 1048576) / max(dur, 0.1)
+                self._clear_progress_line()
                 logger.info(f"✅ [Downloaded #{msg.id}] {file_name_display} ({actual_size / 1048576:.1f} MB) in {format_seconds(dur)} ({spd:.1f} MB/s)")
 
                 p = Path(downloaded)
@@ -1718,6 +1732,7 @@ class MigrationEngine:
             async with download_sem:
                 if self.cancel_event.is_set():
                     return
+                self._clear_progress_line()
                 logger.info(f"🔽 [Pipeline] Downloading #{msg.id}...")
                 leased_dl_client = None
                 if downloader_pool is not None and not downloader_pool.empty():
@@ -1873,6 +1888,7 @@ class MigrationEngine:
                         self.stats.total_bytes_migrated += file_bytes
                         dur = time.time() - up_start_t
                         spd = (file_bytes / 1048576) / max(dur, 0.1)
+                        self._clear_progress_line()
                         logger.info(f"✅ [Uploaded #{msg.id}] {up_name} ({file_bytes / 1048576:.1f} MB) in {format_seconds(dur)} ({spd:.1f} MB/s) & ready for fast-publish")
 
                 # Clean local disk IMMEDIATELY because file is safely stored on Telegram Cloud!
@@ -2035,6 +2051,7 @@ class MigrationEngine:
                     await self._send_pre_uploaded_media(slot, dest_chat, caption, caption_entities)
                     self.stats.media_count += 1
                     media_type = "video" if msg.video else "photo" if msg.photo else "document" if msg.document else "media"
+                    self._clear_progress_line()
                     logger.info(f"⚡ [Pipeline] Fast-Published {media_type} #{msg.id} → Dest in ~50ms")
                     sent_via_preupload = True
                 except Exception as pre_err:

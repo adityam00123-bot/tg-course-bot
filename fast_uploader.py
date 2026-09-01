@@ -251,7 +251,8 @@ async def fast_download_media(
 ) -> Optional[str]:
     """
     High-throughput MTProto parallel chunk downloader.
-    Uses 3 concurrent chunk workers per stream to download 512KB parts in parallel.
+    Each download gets its own dedicated media Session to prevent contention.
+    Uses 3 concurrent chunk workers with 1MB parts for maximum throughput.
     """
     file_id_str = None
     file_size = 0
@@ -305,62 +306,51 @@ async def fast_download_media(
             location = raw.types.InputDocumentFileLocation(id=file_id.media_id, access_hash=file_id.access_hash, file_reference=file_id.file_reference, thumb_size=file_id.thumbnail_size)
 
         dc_id = file_id.dc_id
-        if not hasattr(self, "media_sessions"):
-            self.media_sessions = {}
 
-        if dc_id not in self.media_sessions or not getattr(self.media_sessions[dc_id], "is_connected", True):
-            sess = Session(
-                self, dc_id,
-                await Auth(self, dc_id, await self.storage.test_mode()).create()
-                if dc_id != await self.storage.dc_id()
-                else await self.storage.auth_key(),
-                await self.storage.test_mode(),
-                is_media=True
-            )
-            await sess.start()
-            if dc_id != await self.storage.dc_id():
-                exported_auth = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
-                await sess.invoke(raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes))
-            self.media_sessions[dc_id] = sess
-
-        session = self.media_sessions[dc_id]
-
-        chunk_size = 1024 * 1024  # 1MB per MTProto part (maximum line rate)
-        total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
-
-        queue: asyncio.Queue = asyncio.Queue()
-        for i in range(total_parts):
-            offset = i * chunk_size
-            part_size = min(chunk_size, file_size - offset) if file_size > 0 else 0
-            queue.put_nowait((i, offset, part_size))
-
-        downloaded_bytes = 0
-        progress_lock = asyncio.Lock()
-        file_lock = asyncio.Lock()
-        dl_error: Optional[Exception] = None
-
-        # Pre-allocate output file
-        out_fp = open(out_path, "wb")
-        if file_size > 0:
-            out_fp.truncate(file_size)
-        out_fp.close()
-
-        out_fd = None
-        has_pwrite = hasattr(os, "pwrite")
-        if has_pwrite:
-            out_fd = os.open(str(out_path), os.O_RDWR)
-        else:
-            out_fp = open(out_path, "r+b")
-
-        num_workers = min(getattr(self, "max_concurrent_transmissions", 4) or 4, 4)
-        num_workers = max(1, min(num_workers, total_parts))
+        # Create a DEDICATED session for THIS download (no sharing = no contention)
+        session = Session(
+            self, dc_id,
+            await Auth(self, dc_id, await self.storage.test_mode()).create()
+            if dc_id != await self.storage.dc_id()
+            else await self.storage.auth_key(),
+            await self.storage.test_mode(),
+            is_media=True
+        )
+        await session.start()
 
         try:
+            if dc_id != await self.storage.dc_id():
+                exported_auth = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                await session.invoke(raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes))
+
+            chunk_size = 1024 * 1024  # 1MB per MTProto part (maximum allowed)
+            total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
+
+            part_queue: asyncio.Queue = asyncio.Queue()
+            for i in range(total_parts):
+                offset = i * chunk_size
+                part_size = min(chunk_size, file_size - offset) if file_size > 0 else 0
+                part_queue.put_nowait((i, offset, part_size))
+
+            downloaded_bytes = 0
+            progress_lock = asyncio.Lock()
+            file_lock = asyncio.Lock()
+            dl_error: Optional[Exception] = None
+
+            # Pre-allocate output file
+            with open(out_path, "wb") as fp:
+                if file_size > 0:
+                    fp.truncate(file_size)
+
+            out_fp = open(out_path, "r+b")
+
+            num_workers = min(3, total_parts)
+
             async def _dl_worker():
                 nonlocal downloaded_bytes, dl_error
-                while not queue.empty() and dl_error is None:
+                while not part_queue.empty() and dl_error is None:
                     try:
-                        part_idx, offset, part_size = queue.get_nowait()
+                        part_idx, offset, part_size = part_queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
 
@@ -390,12 +380,9 @@ async def fast_download_media(
                             await asyncio.sleep(min(0.2 * (1.5 ** min(part_attempts, 6)), 3.0))
 
                     if chunk_data is not None:
-                        if has_pwrite and out_fd is not None:
-                            os.pwrite(out_fd, chunk_data, offset)
-                        else:
-                            async with file_lock:
-                                out_fp.seek(offset)
-                                out_fp.write(chunk_data)
+                        async with file_lock:
+                            out_fp.seek(offset)
+                            out_fp.write(chunk_data)
 
                         async with progress_lock:
                             downloaded_bytes += len(chunk_data)
@@ -407,27 +394,24 @@ async def fast_download_media(
                                 except Exception:
                                     pass
 
-            workers = [asyncio.create_task(_dl_worker()) for _ in range(num_workers)]
-            await asyncio.gather(*workers)
+            try:
+                workers = [asyncio.create_task(_dl_worker()) for _ in range(num_workers)]
+                await asyncio.gather(*workers)
 
-            if dl_error is not None:
-                raise dl_error
+                if dl_error is not None:
+                    raise dl_error
 
-            if downloaded_bytes < (file_size * 0.99):
-                raise RuntimeError(f"Download incomplete: {downloaded_bytes}/{file_size} bytes received.")
+                if downloaded_bytes < (file_size * 0.99):
+                    raise RuntimeError(f"Download incomplete: {downloaded_bytes}/{file_size} bytes received.")
 
-            return str(out_path)
-        finally:
-            if out_fd is not None:
-                try:
-                    os.close(out_fd)
-                except Exception:
-                    pass
-            elif out_fp is not None and not out_fp.closed:
+                return str(out_path)
+            finally:
                 try:
                     out_fp.close()
                 except Exception:
                     pass
+        finally:
+            await session.stop()
 
     except Exception as e:
         logger.debug(f"Parallel chunk download fallback to native: {e}")
