@@ -2409,8 +2409,8 @@ class MigrationEngine:
                 total_cpus = os.cpu_count() or 2
                 has_gpu = bool(shutil.which("nvidia-smi"))
 
-                # 2 Dedicated Download Streams + 1 Dedicated Ultra High-Speed Upload Stream (3x sockets)
-                num_downloads = 2
+                # 1 Dedicated High-Speed Download Stream (2x sockets) + 1 Dedicated High-Speed Upload Stream (5x sockets) = 7 Sockets total
+                num_downloads = 1
                 num_uploads = 1
                 num_ffmpeg = max(2, min(total_cpus, 4))
 
@@ -2427,7 +2427,7 @@ class MigrationEngine:
                 logger.info(
                     f"🚀 [Pipeline] Turbo Hardware Mode ON ({hw_type}) — "
                     f"{total_cpus} System Cores detected -> "
-                    f"{num_downloads} Dedicated Download Streams, {num_ffmpeg} FFmpeg Workers, {num_uploads} Dedicated Upload Stream (3x Multiplexed Sockets) | "
+                    f"{num_downloads} High-Speed Download Stream (2x Sockets), {num_ffmpeg} FFmpeg Workers, {num_uploads} High-Speed Upload Stream (5x Sockets) | "
                     f"Disk buffer budget ~{budget_mb} MB"
                 )
 
