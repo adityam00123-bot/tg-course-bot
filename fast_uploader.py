@@ -467,6 +467,9 @@ async def fast_download_media(
                             if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "timed out", "timeout")):
                                 try:
                                     await session.restart()
+                                    if dc_id != await self.storage.dc_id():
+                                        exported_auth = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                                        await session.invoke(raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes))
                                 except Exception:
                                     pass
                             if part_attempts >= max_part_attempts:
