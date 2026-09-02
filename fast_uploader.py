@@ -138,24 +138,26 @@ async def fast_save_file(
     stream_lock = asyncio.Lock() if is_stream else None
 
     # Multi-Session MTProto Socket Pool for breaking single-TCP 4.5 MB/s bottleneck
-    dc_id = await self.storage.dc_id()
-    test_mode = await self.storage.test_mode()
-    auth_key = await self.storage.auth_key()
-
-    num_sessions = 3
     sessions: List[Session] = []
-    try:
-        for _ in range(num_sessions):
-            sess = Session(
-                self, dc_id,
-                auth_key,
-                test_mode,
-                is_media=True
-            )
-            await sess.start()
-            sessions.append(sess)
-    except Exception as sess_err:
-        logger.debug(f"Media session pool initialization fallback: {sess_err}")
+    # For small files/thumbnails (<= 4 parts, i.e. <= 2MB), use main session directly (instant upload, no socket churn)
+    if total_parts > 4:
+        try:
+            dc_id = await self.storage.dc_id()
+            test_mode = await self.storage.test_mode()
+            auth_key = await self.storage.auth_key()
+
+            num_sessions = 3
+            for _ in range(num_sessions):
+                sess = Session(
+                    self, dc_id,
+                    auth_key,
+                    test_mode,
+                    is_media=True
+                )
+                await sess.start()
+                sessions.append(sess)
+        except Exception as sess_err:
+            logger.debug(f"Media session pool initialization fallback: {sess_err}")
 
     if not sessions:
         sessions = [getattr(self, "session", None)]
@@ -211,13 +213,17 @@ async def fast_save_file(
                             break
                     except Exception as err:
                         part_attempts += 1
-                        err_str = str(err)
-                        # Only reset socket on genuine transport breakage, NOT on transient latency timeouts
-                        if any(k in err_str.lower() for k in ("broken pipe", "connectionreseterror", "connectionlost")):
+                        err_str = str(err).lower()
+                        # Reset/restart session on transport errors OR timeouts
+                        if any(k in err_str for k in ("broken pipe", "connectionreseterror", "connectionlost", "timed out", "timeout")):
                             try:
                                 await target_session.restart()
                             except Exception:
                                 pass
+                            # If a session fails 2+ times, swap to main self.session as a rock-solid safety net
+                            if part_attempts >= 2:
+                                target_session = getattr(self, "session", target_session)
+
                         if part_attempts >= 3:
                             logger.warning(
                                 f"⚠️ Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}"
