@@ -124,4 +124,5 @@
 * **Permanent Fix:**
   - In `fast_download_media`, allocate strictly **1 Dedicated MTProto `Session`** per download call, authenticating it with its own fresh `ExportAuthorization`.
   - Maintain the global connection budget: **2 Download Streams (2 sockets) + 2 Upload Streams (2-4 sockets) = Max 4-6 sockets total**, delivering sustained 15–20 MB/s without throttling.
+  - Set `_dl_stall_watchdog` idle threshold to **120s** (instead of 30s) so that normal 20-30s MTProto burst pauses between parallel multi-gigabyte files do not prematurely cancel tasks and wipe downloaded bytes.
 

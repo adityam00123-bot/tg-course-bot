@@ -405,8 +405,8 @@ class MigrationEngine:
                     tot_mb = item["total"] / 1048576 if item["total"] else 0
                     time_since_update = now_tick - item.get("last_time", now_tick)
                     spd = item.get("speed", 0.0)
-                    if time_since_update > 20.0 and item["current"] > 0:
-                        spd_str = "⚠️STALL"
+                    if time_since_update > 45.0 and item["current"] > 0:
+                        spd_str = "⚠️PAUSED"
                     elif spd > 0:
                         spd_str = f"{spd:.1f}MB/s"
                     else:
@@ -1199,7 +1199,7 @@ class MigrationEngine:
                     if self.cancel_event.is_set():
                         break
                     idle = time.time() - dl_progress_tracker["last_time"]
-                    if idle > 30.0:
+                    if idle > 120.0:
                         logger.warning(
                             f"⚠️ [Download #{msg.id}] Download stall detected (no data for {idle:.0f}s @ {dl_progress_tracker['current'] / 1048576:.1f} MB) — aborting for fresh reconnect..."
                         )
