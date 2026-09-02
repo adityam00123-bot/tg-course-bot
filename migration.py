@@ -1907,21 +1907,21 @@ class MigrationEngine:
                     raw_thumb = None
                     max_up_attempts = 5
                     for up_attempt in range(1, max_up_attempts + 1):
-                        if self.cancel_event.is_set():
-                            return
                         try:
-                            # 1. Upload thumbnail safely (isolated with fallback so thumb never blocks video)
-                            if thumb_path and os.path.exists(thumb_path):
-                                try:
-                                    raw_thumb = await active_client.save_file(thumb_path)
-                                except Exception as thumb_err:
-                                    logger.warning(f"⚠️ [Upload #{msg.id}] Thumbnail upload fallback: {thumb_err}")
-                                    raw_thumb = None
-                            else:
-                                raw_thumb = None
+                            # Parallelized upload of thumbnail and main media file
+                            async def _up_thumbnail():
+                                if thumb_path and os.path.exists(thumb_path):
+                                    try:
+                                        return await active_client.save_file(thumb_path)
+                                    except Exception as thumb_err:
+                                        logger.warning(f"⚠️ [Upload #{msg.id}] Thumbnail upload fallback: {thumb_err}")
+                                        return None
+                                return None
 
-                            # 2. Upload main video/media file
-                            raw_file = await active_client.save_file(upload_path, progress=_cloud_up_prog)
+                            async def _up_media():
+                                return await active_client.save_file(upload_path, progress=_cloud_up_prog)
+
+                            raw_thumb, raw_file = await asyncio.gather(_up_thumbnail(), _up_media())
                             break
                         except Exception as up_err:
                             err_str = str(up_err).lower()

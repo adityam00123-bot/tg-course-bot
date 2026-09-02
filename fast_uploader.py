@@ -140,31 +140,28 @@ async def fast_save_file(
     watchdog_done = asyncio.Event()
 
     # Multi-Session MTProto Socket Pool for breaking single-TCP 4.5 MB/s bottleneck
-    sessions: List[Session] = []
-    # For small files/thumbnails (<= 4 parts, i.e. <= 2MB), use main session directly (instant upload, no socket churn)
+    sessions: List[Session] = [getattr(self, "session", None)]
+
+    # For files > 2MB, spin up 2 extra parallel upload sessions on home DC with is_media=False to reach 15MB/s+
     if total_parts > 4:
         try:
             dc_id = await self.storage.dc_id()
             test_mode = await self.storage.test_mode()
             auth_key = await self.storage.auth_key()
 
-            num_sessions = 2
-            for i in range(num_sessions):
+            for i in range(2):
                 sess = Session(
                     self, dc_id,
                     auth_key,
                     test_mode,
-                    is_media=True
+                    is_media=False
                 )
                 await sess.start()
                 sessions.append(sess)
-                if i < num_sessions - 1:
-                    await asyncio.sleep(0.3)
+                if i < 1:
+                    await asyncio.sleep(0.2)
         except Exception as sess_err:
-            logger.debug(f"Media session pool initialization fallback: {sess_err}")
-
-    if not sessions:
-        sessions = [getattr(self, "session", None)]
+            logger.debug(f"Upload session pool initialization fallback: {sess_err}")
 
     # 10-12 concurrent chunk workers per client stream for high-speed Telegram Premium uploads
     num_workers = min(getattr(self, "max_concurrent_transmissions", 12) or 12, total_parts)

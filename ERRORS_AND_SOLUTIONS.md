@@ -126,3 +126,10 @@
   - Maintain the global connection budget: **2 Download Streams (2 sockets) + 2 Upload Streams (2-4 sockets) = Max 4-6 sockets total**, delivering sustained 15–20 MB/s without throttling.
   - Set `_dl_stall_watchdog` idle threshold to **120s** (instead of 30s) so that normal 20-30s MTProto burst pauses between parallel multi-gigabyte files do not prematurely cancel tasks and wipe downloaded bytes.
 
+### Error: `[Errno 32] Broken pipe` on Even Upload Parts (0.1 MB/s Upload Slowdown)
+* **Symptom:** Uploads for certain files crawl at 0.1 MB/s taking 6–9 minutes, with logs spamming `⚠️ Part X retry 3/20 due to: [Errno 32] Broken pipe` on alternating (even) part numbers.
+* **Root Cause:** In `fast_save_file`, auxiliary upload sessions were initialized with `is_media=True`. Telegram's home DC rejects `SaveBigFilePart` over raw media sub-addresses, dropping the socket on alternate round-robin parts and forcing repeated 25s watchdog freeze resets.
+* **Permanent Fix:**
+  - In `fast_save_file`, initialize auxiliary sessions with `is_media=False` (standard home DC connection) alongside `self.session`.
+  - Parallelized thumbnail and main file upload via `asyncio.gather()` in `_pipeline_upload_slot`, eliminating upfront thumbnail upload latency.
+
