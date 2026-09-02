@@ -223,6 +223,11 @@ async def fast_save_file(
                         path.seek(offset)
                         chunk = path.read(part_size)
                 else:
+                    try:
+                        if hasattr(os, "posix_fadvise"):
+                            os.posix_fadvise(fp.fileno(), offset, part_size, os.POSIX_FADV_SEQUENTIAL)
+                    except Exception:
+                        pass
                     fp.seek(offset)
                     chunk = fp.read(part_size)
 
@@ -442,10 +447,16 @@ async def fast_download_media(
             file_lock = asyncio.Lock()
             dl_error: Optional[Exception] = None
 
-            # Pre-allocate output file
+            # Pre-allocate output file using posix_fallocate (zero extents fragmentation on Linux/Kaggle)
             with open(out_path, "wb") as fp:
                 if file_size > 0:
-                    fp.truncate(file_size)
+                    try:
+                        if hasattr(os, "posix_fallocate"):
+                            os.posix_fallocate(fp.fileno(), 0, file_size)
+                        else:
+                            fp.truncate(file_size)
+                    except Exception:
+                        fp.truncate(file_size)
 
             out_fp = open(out_path, "r+b")
 

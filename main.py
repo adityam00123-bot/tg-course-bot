@@ -27,6 +27,13 @@ if hasattr(sys.stderr, "reconfigure"):
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
+# Enable high-performance C-based uvloop on Linux (Kaggle) if installed
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except (ImportError, AttributeError):
+    pass
+
 # Ensure an active event loop exists for Python 3.12+ compatibility with Pyrogram
 try:
     loop = asyncio.new_event_loop()
