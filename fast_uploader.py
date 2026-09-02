@@ -254,7 +254,14 @@ async def fast_save_file(
                             break
                     except Exception as err:
                         part_attempts += 1
-                        session_idx += 1  # rotate to next healthy socket on error
+                        err_str = str(err).lower()
+                        # Auto-recover broken socket without dropping parts
+                        if any(k in err_str for k in ("broken pipe", "connectionreset", "connectionlost")):
+                            try:
+                                await target_session.restart()
+                            except Exception:
+                                pass
+                        session_idx += 1  # rotate to next healthy socket in the pool
                         if part_attempts >= 3:
                             logger.warning(
                                 f"⚠️ Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}"

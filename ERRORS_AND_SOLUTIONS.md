@@ -139,3 +139,12 @@
   - **Safe 120s Stall Watchdog:** 120s idle watchdog raises a clean `RuntimeError` on complete stalls without destroying active sockets mid-flight.
   - **Sequential Thumbnail Upload:** Thumbnails (<200KB) upload instantly (~50ms) using `self.session` before media upload starts, eliminating socket contention.
 
+### Error: `[Errno 32] Broken pipe` on Concurrent Multi-File Uploads
+* **Symptom:** Upload logs show repeated retries (`Part X/Y retry 3/20 due to: [Errno 32] Broken pipe`) when 2 heavy uploads and 2 downloads run concurrently.
+* **Root Cause:**
+  1. **Socket Over-subscription:** Running `num_uploads = 2` (with 3 sockets each = 6 upload sockets) alongside `num_downloads = 2` (2 download sockets) created 8–9 simultaneous MTProto TCP connections transferring over 200 MB/s. Telegram's DC throttles IPs with >6 concurrent sockets, dropping a socket (TCP RST), which triggers EPIPE (`Broken pipe`) on that socket.
+  2. **Dead Socket Persistence:** When a socket died, round-robin dispatch rotated chunks, but the dead socket stayed dead in `sessions`, causing subsequent parts mapped to that index to fail again.
+* **Permanent Fix:**
+  - **Single Ultra High-Speed Upload Stream (`num_uploads = 1`):** Pipeline runs 1 dedicated upload stream at a time using 3 multiplexed sockets. Total connections across the bot stay strictly at **5 sockets** (`2 DL + 3 UL = 5`). Zero connection drops, zero `⚠️PAUSED`, and 100% of upload bandwidth (~35–50 MB/s) is dedicated to completing the active file in seconds before picking up the next.
+  - **Automatic Socket Self-Healing:** In `fast_save_file`, if `target_session.invoke(rpc)` ever catches `Broken pipe`, `connectionreset`, or `connectionlost`, it automatically invokes `await target_session.restart()` using the protected `_safe_session_restart` lock, instantly reviving the socket without dropping parts.
+

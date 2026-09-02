@@ -2409,9 +2409,9 @@ class MigrationEngine:
                 total_cpus = os.cpu_count() or 2
                 has_gpu = bool(shutil.which("nvidia-smi"))
 
-                # Optimal 2x2 Media Concurrency (Saturates bandwidth without exceeding Telegram DC connection limits):
+                # 2 Dedicated Download Streams + 1 Dedicated Ultra High-Speed Upload Stream (3x sockets)
                 num_downloads = 2
-                num_uploads = 2
+                num_uploads = 1
                 num_ffmpeg = max(2, min(total_cpus, 4))
 
                 download_sem = asyncio.Semaphore(num_downloads)
@@ -2427,7 +2427,7 @@ class MigrationEngine:
                 logger.info(
                     f"🚀 [Pipeline] Turbo Hardware Mode ON ({hw_type}) — "
                     f"{total_cpus} System Cores detected -> "
-                    f"{num_downloads} Dedicated Download Streams, {num_ffmpeg} FFmpeg Workers, {num_uploads} Dedicated Upload Streams | "
+                    f"{num_downloads} Dedicated Download Streams, {num_ffmpeg} FFmpeg Workers, {num_uploads} Dedicated Upload Stream (3x Multiplexed Sockets) | "
                     f"Disk buffer budget ~{budget_mb} MB"
                 )
 
