@@ -154,7 +154,7 @@ async def fast_save_file(
                     self, dc_id,
                     auth_key,
                     test_mode,
-                    is_media=(i < 2)  # Diversity: 2 media sessions + 1 regular session to prevent identical DC endpoint throttling
+                    is_media=True
                 )
                 await sess.start()
                 sessions.append(sess)
@@ -193,6 +193,7 @@ async def fast_save_file(
                     if s:
                         try:
                             await s.restart()
+                            await asyncio.sleep(0.5)
                         except Exception:
                             pass
                 if stall_rounds >= 4:  # ~100s of zero progress -> abort to trigger clean reconnect
@@ -244,7 +245,7 @@ async def fast_save_file(
                 while part_attempts < max_part_attempts and upload_error is None:
                     target_session = sessions[session_idx % len(sessions)] or getattr(self, "session", None)
                     try:
-                        res = await target_session.invoke(rpc, sleep_threshold=30)
+                        res = await target_session.invoke(rpc, sleep_threshold=60)
                         if res is True or res:
                             part_ack = True
                             break
