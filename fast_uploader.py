@@ -148,7 +148,7 @@ async def fast_save_file(
             test_mode = await self.storage.test_mode()
             auth_key = await self.storage.auth_key()
 
-            num_sessions = 3
+            num_sessions = 5
             for i in range(num_sessions):
                 sess = Session(
                     self, dc_id,
@@ -397,7 +397,7 @@ async def fast_download_media(
 
         # Multi-Session MTProto Socket Pool for Downloads (prevents single-socket DC throttling)
         sessions: List[Session] = []
-        num_sessions = 3
+        num_sessions = 5
         
         auth_key = await Auth(self, dc_id, await self.storage.test_mode()).create() if dc_id != await self.storage.dc_id() else await self.storage.auth_key()
         
