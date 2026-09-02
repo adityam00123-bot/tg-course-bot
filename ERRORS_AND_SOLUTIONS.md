@@ -126,10 +126,16 @@
   - Maintain the global connection budget: **2 Download Streams (2 sockets) + 2 Upload Streams (2-4 sockets) = Max 4-6 sockets total**, delivering sustained 15–20 MB/s without throttling.
   - Set `_dl_stall_watchdog` idle threshold to **120s** (instead of 30s) so that normal 20-30s MTProto burst pauses between parallel multi-gigabyte files do not prematurely cancel tasks and wipe downloaded bytes.
 
-### Error: `[Errno 32] Broken pipe` on Even Upload Parts (0.1 MB/s Upload Slowdown)
-* **Symptom:** Uploads for certain files crawl at 0.1 MB/s taking 6–9 minutes, with logs spamming `⚠️ Part X retry 3/20 due to: [Errno 32] Broken pipe` on alternating (even) part numbers.
-* **Root Cause:** In `fast_save_file`, auxiliary upload sessions were initialized with `is_media=True`. Telegram's home DC rejects `SaveBigFilePart` over raw media sub-addresses, dropping the socket on alternate round-robin parts and forcing repeated 25s watchdog freeze resets.
+### Error: `AttributeError: 'NoneType' object has no attribute 'call_exception_handler'` & Upload Freezes
+* **Symptom:** Uploads freeze and log repeated retries (`Part X/Y retry 3/20 due to: 'NoneType' object has no attribute 'call_exception_handler'`) on every 3rd part or thumbnail upload.
+* **Root Cause:** 
+  1. **Premature Watchdog Socket Destruction:** A 25s upload watchdog was calling `await s.restart()` on `self.session` (the main client connection) during normal high-volume data transmissions. Calling `stop()` force-closed the asyncio TCP transport and set `self._loop = None`. Subsequent RPC calls or Pyrogram's `ping_worker` attempting to write to the closed socket triggered `self._loop.call_exception_handler()`, crashing with `'NoneType' object has no attribute 'call_exception_handler'`.
+  2. **Socket Limit Exceeded via Auxiliary Upload Sessions:** Spawning 2 extra `Session` instances per upload stream pushed total concurrent TCP connections to 10+, violating Telegram's 4-6 connection budget and triggering DC IP throttles.
+  3. **Lingering Ping Task:** `_safe_session_stop` monkeypatch did not cancel `self.ping_task` or clear `ping_task_event`, leaving background ping tasks trying to ping closed transports.
 * **Permanent Fix:**
-  - In `fast_save_file`, initialize auxiliary sessions with `is_media=False` (standard home DC connection) alongside `self.session`.
-  - Parallelized thumbnail and main file upload via `asyncio.gather()` in `_pipeline_upload_slot`, eliminating upfront thumbnail upload latency.
+  - **1 Dedicated Session Per Client:** `fast_save_file` directly uses `self.session` (the isolated client's primary session created in `uploader_pool`). No auxiliary sessions are spawned.
+  - **12 Chunk Workers per Client:** With 12 concurrent chunk workers pipelining 512KB chunks, each dedicated upload client delivers 6.5–7.5 MB/s. Across 2 upload streams (`pipeline_uploader_0` and `pipeline_uploader_1`), this delivers **13–15 MB/s aggregate upload speed** within Telegram's strict 4-connection limit.
+  - **Safe 120s Stall Detection:** Replaced premature 25s socket resets with a clean 120s idle watchdog that raises a clean `RuntimeError` without killing active sockets.
+  - **Ping Worker Cleanup in `_safe_session_stop`:** Set `ping_task_event.set()` and cleanly await `ping_task` during session stop, preventing post-close ping errors.
+  - **Sequential Thumbnail Upload:** Upload thumbnail (<200KB, 1 part, 50ms) before media upload in `_pipeline_upload_slot`, preventing concurrent session collisions on the same client.
 

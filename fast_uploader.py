@@ -25,8 +25,20 @@ _session_restart_lock = asyncio.Lock()
 
 
 async def _safe_session_stop(self):
-    """Safely terminates transport & cancels recv_task without raising StreamReader collision."""
+    """Safely terminates transport & cancels tasks without raising StreamReader collision or lingering ping tasks."""
     try:
+        self.is_started.clear()
+        self.stored_msg_ids.clear()
+        if hasattr(self, "ping_task_event"):
+            self.ping_task_event.set()
+        if getattr(self, "ping_task", None) is not None:
+            try:
+                await self.ping_task
+            except Exception:
+                pass
+        if hasattr(self, "ping_task_event"):
+            self.ping_task_event.clear()
+
         recv_task = getattr(self, "recv_task", None)
         if recv_task and not recv_task.done():
             recv_task.cancel()
@@ -139,43 +151,23 @@ async def fast_save_file(
     stream_lock = asyncio.Lock() if is_stream else None
     watchdog_done = asyncio.Event()
 
-    # Multi-Session MTProto Socket Pool for breaking single-TCP 4.5 MB/s bottleneck
-    sessions: List[Session] = [getattr(self, "session", None)]
+    # 1 Dedicated Clean MTProto Session per upload stream (uses Client's primary session directly)
+    session = getattr(self, "session", None)
+    if session is None:
+        raise RuntimeError("Client session is not initialized or offline.")
 
-    # For files > 2MB, spin up 2 extra parallel upload sessions on home DC with is_media=False to reach 15MB/s+
-    if total_parts > 4:
-        try:
-            dc_id = await self.storage.dc_id()
-            test_mode = await self.storage.test_mode()
-            auth_key = await self.storage.auth_key()
-
-            for i in range(2):
-                sess = Session(
-                    self, dc_id,
-                    auth_key,
-                    test_mode,
-                    is_media=False
-                )
-                await sess.start()
-                sessions.append(sess)
-                if i < 1:
-                    await asyncio.sleep(0.2)
-        except Exception as sess_err:
-            logger.debug(f"Upload session pool initialization fallback: {sess_err}")
-
-    # 10-12 concurrent chunk workers per client stream for high-speed Telegram Premium uploads
+    # 12 concurrent chunk workers per client stream for high-speed Telegram Premium uploads
     num_workers = min(getattr(self, "max_concurrent_transmissions", 12) or 12, total_parts)
     num_workers = max(1, min(num_workers, 16))
 
     async def _stall_watchdog():
-        """Monitors upload progress. If no bytes are uploaded for 25s while queue is not empty,
-        restarts session pool to unfreeze stalled DC sockets."""
+        """Monitors upload progress. If no bytes are uploaded for 120s, cleanly aborts to trigger retry."""
         nonlocal upload_error
         last_snap = 0
         stall_rounds = 0
         while not watchdog_done.is_set() and upload_error is None:
             try:
-                await asyncio.wait_for(watchdog_done.wait(), timeout=25.0)
+                await asyncio.wait_for(watchdog_done.wait(), timeout=60.0)
                 break
             except asyncio.TimeoutError:
                 pass
@@ -183,19 +175,9 @@ async def fast_save_file(
             curr = uploaded_bytes
             if curr == last_snap and not queue.empty() and curr < file_size:
                 stall_rounds += 1
-                logger.warning(
-                    f"⚠️ [Upload Watchdog] Upload freeze detected ({stall_rounds}x @ {curr / 1048576:.1f}/{file_size / 1048576:.1f} MB) — resetting upload session pool..."
-                )
-                for s in sessions:
-                    if s:
-                        try:
-                            await s.restart()
-                            await asyncio.sleep(0.5)
-                        except Exception:
-                            pass
-                if stall_rounds >= 4:  # ~100s of zero progress -> abort to trigger clean reconnect
+                if stall_rounds >= 2:  # 120s of zero progress -> abort cleanly for retry
                     upload_error = RuntimeError(
-                        f"Upload stalled >100s with zero progress at {curr}/{file_size} bytes. Aborting for fresh reconnect."
+                        f"Upload stalled >120s with zero progress at {curr}/{file_size} bytes."
                     )
                     break
             else:
@@ -237,30 +219,15 @@ async def fast_save_file(
                 part_attempts = 0
                 max_part_attempts = 20
                 part_ack = False
-                session_idx = part_idx % len(sessions)
 
                 while part_attempts < max_part_attempts and upload_error is None:
-                    target_session = sessions[session_idx % len(sessions)] or getattr(self, "session", None)
                     try:
-                        res = await target_session.invoke(rpc, sleep_threshold=60)
+                        res = await session.invoke(rpc, sleep_threshold=60)
                         if res is True or res:
                             part_ack = True
                             break
                     except Exception as err:
                         part_attempts += 1
-                        err_str = str(err).lower()
-                        # Reset/restart session on transport errors OR timeouts
-                        if any(k in err_str for k in ("broken pipe", "connectionreseterror", "connectionlost", "timed out", "timeout")):
-                            try:
-                                await target_session.restart()
-                            except Exception:
-                                pass
-                            # Rotate to next session in pool so we don't hammer the same throttled DC socket
-                            session_idx += 1
-                            # If a part fails 3+ times, also try main self.session as a safety net
-                            if part_attempts >= 3 and getattr(self, "session", None) not in sessions:
-                                target_session = getattr(self, "session", target_session)
-
                         if part_attempts >= 3:
                             logger.warning(
                                 f"⚠️ Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}"
@@ -308,12 +275,6 @@ async def fast_save_file(
             return raw.types.InputFile(id=file_id, parts=total_parts, name=file_name, md5_checksum="")
     finally:
         watchdog_done.set()
-        for s in sessions:
-            if s and s != getattr(self, "session", None):
-                try:
-                    await s.stop()
-                except Exception:
-                    pass
 
 
 # Monkeypatch Pyrogram Client.save_file to use our robust uploader

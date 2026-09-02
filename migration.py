@@ -1908,24 +1908,22 @@ class MigrationEngine:
                     max_up_attempts = 5
                     for up_attempt in range(1, max_up_attempts + 1):
                         try:
-                            # Parallelized upload of thumbnail and main media file
-                            async def _up_thumbnail():
-                                if thumb_path and os.path.exists(thumb_path):
-                                    try:
-                                        return await active_client.save_file(thumb_path)
-                                    except Exception as thumb_err:
-                                        logger.warning(f"⚠️ [Upload #{msg.id}] Thumbnail upload fallback: {thumb_err}")
-                                        return None
-                                return None
+                            # 1. Upload thumbnail safely (instant <50ms upload, isolated so thumb never blocks video)
+                            if thumb_path and os.path.exists(thumb_path):
+                                try:
+                                    raw_thumb = await active_client.save_file(thumb_path)
+                                except Exception as thumb_err:
+                                    logger.warning(f"⚠️ [Upload #{msg.id}] Thumbnail upload fallback: {thumb_err}")
+                                    raw_thumb = None
+                            else:
+                                raw_thumb = None
 
-                            async def _up_media():
-                                return await active_client.save_file(upload_path, progress=_cloud_up_prog)
-
-                            raw_thumb, raw_file = await asyncio.gather(_up_thumbnail(), _up_media())
+                            # 2. Upload main media file with high-speed 12-worker chunk pipeline
+                            raw_file = await active_client.save_file(upload_path, progress=_cloud_up_prog)
                             break
                         except Exception as up_err:
                             err_str = str(up_err).lower()
-                            if any(k in err_str for k in ("broken pipe", "connectionreseterror", "connectionlost", "timed out", "timeout")):
+                            if any(k in err_str for k in ("broken pipe", "connectionreseterror", "connectionlost", "timed out", "timeout", "stalled", "call_exception_handler")):
                                 await reset_client_sessions(active_client)
                             if up_attempt >= max_up_attempts:
                                 raise up_err
