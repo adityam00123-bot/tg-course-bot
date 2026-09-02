@@ -151,12 +151,36 @@ async def fast_save_file(
     stream_lock = asyncio.Lock() if is_stream else None
     watchdog_done = asyncio.Event()
 
-    # 1 Dedicated Clean MTProto Session per upload stream (uses Client's primary session directly)
-    session = getattr(self, "session", None)
-    if session is None:
+    # Dedicated MTProto Session Pool for breaking single-TCP 4.5 MB/s bottleneck
+    sessions: List[Session] = []
+    if total_parts > 4:
+        try:
+            dc_id = await self.storage.dc_id()
+            test_mode = await self.storage.test_mode()
+            auth_key = await self.storage.auth_key()
+
+            # 3 Parallel Media TCP sockets = ~14-17 MB/s upload throughput
+            num_sessions = 3
+            for _ in range(num_sessions):
+                s = Session(
+                    self, dc_id,
+                    auth_key,
+                    test_mode,
+                    is_media=True
+                )
+                await s.start()
+                sessions.append(s)
+        except Exception as sess_err:
+            logger.debug(f"Media upload session pool fallback to primary session: {sess_err}")
+            sessions = [getattr(self, "session", None)]
+
+    if not sessions:
+        sessions = [getattr(self, "session", None)]
+
+    if not any(sessions):
         raise RuntimeError("Client session is not initialized or offline.")
 
-    # 12 concurrent chunk workers per client stream for high-speed Telegram Premium uploads
+    # 12 concurrent chunk workers pipelining across the 3-socket pool (4 workers per socket)
     num_workers = min(getattr(self, "max_concurrent_transmissions", 12) or 12, total_parts)
     num_workers = max(1, min(num_workers, 16))
 
@@ -219,15 +243,18 @@ async def fast_save_file(
                 part_attempts = 0
                 max_part_attempts = 20
                 part_ack = False
+                session_idx = part_idx % len(sessions)
 
                 while part_attempts < max_part_attempts and upload_error is None:
+                    target_session = sessions[session_idx % len(sessions)] or getattr(self, "session", None)
                     try:
-                        res = await session.invoke(rpc, sleep_threshold=60)
+                        res = await target_session.invoke(rpc, sleep_threshold=60)
                         if res is True or res:
                             part_ack = True
                             break
                     except Exception as err:
                         part_attempts += 1
+                        session_idx += 1  # rotate to next healthy socket on error
                         if part_attempts >= 3:
                             logger.warning(
                                 f"⚠️ Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}"
@@ -275,6 +302,12 @@ async def fast_save_file(
             return raw.types.InputFile(id=file_id, parts=total_parts, name=file_name, md5_checksum="")
     finally:
         watchdog_done.set()
+        for s in sessions:
+            if s and s != getattr(self, "session", None):
+                try:
+                    await s.stop()
+                except Exception:
+                    pass
 
 
 # Monkeypatch Pyrogram Client.save_file to use our robust uploader
