@@ -148,7 +148,7 @@ async def fast_save_file(
             test_mode = await self.storage.test_mode()
             auth_key = await self.storage.auth_key()
 
-            num_sessions = 5
+            num_sessions = 2
             for i in range(num_sessions):
                 sess = Session(
                     self, dc_id,
@@ -395,29 +395,24 @@ async def fast_download_media(
 
         dc_id = file_id.dc_id
 
-        # Multi-Session MTProto Socket Pool for Downloads (prevents single-socket DC throttling)
-        sessions: List[Session] = []
-        num_sessions = 5
-        
-        auth_key = await Auth(self, dc_id, await self.storage.test_mode()).create() if dc_id != await self.storage.dc_id() else await self.storage.auth_key()
-        
-        for i in range(num_sessions):
-            sess = Session(
-                self, dc_id,
-                auth_key,
-                await self.storage.test_mode(),
-                is_media=True
-            )
-            await sess.start()
-            sessions.append(sess)
-            if i < num_sessions - 1:
-                await asyncio.sleep(0.2)
+        # 1 Dedicated Clean MTProto Session per download stream (strict 4-socket budget, 100% auth valid)
+        auth_key = (
+            await Auth(self, dc_id, await self.storage.test_mode()).create()
+            if dc_id != await self.storage.dc_id()
+            else await self.storage.auth_key()
+        )
+        session = Session(
+            self, dc_id,
+            auth_key,
+            await self.storage.test_mode(),
+            is_media=True
+        )
+        await session.start()
 
         try:
             if dc_id != await self.storage.dc_id():
                 exported_auth = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
-                for sess in sessions:
-                    await sess.invoke(raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes))
+                await session.invoke(raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes))
 
             chunk_size = 1024 * 1024  # 1MB per MTProto part (strictly divisible by 4096)
             total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
@@ -451,14 +446,12 @@ async def fast_download_media(
                         break
 
                     part_attempts = 0
-                    max_part_attempts = 10
+                    max_part_attempts = 15
                     chunk_data = None
-                    session_idx = part_idx % len(sessions)
 
                     while part_attempts < max_part_attempts and dl_error is None:
-                        target_session = sessions[session_idx % len(sessions)]
                         try:
-                            r = await target_session.invoke(
+                            r = await session.invoke(
                                 raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
                                 sleep_threshold=30
                             )
@@ -475,14 +468,13 @@ async def fast_download_media(
                                 break
                             if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "timed out", "timeout")):
                                 try:
-                                    await target_session.restart()
+                                    await session.restart()
                                 except Exception:
                                     pass
-                                session_idx += 1  # rotate session on network error
                             if part_attempts >= max_part_attempts:
                                 dl_error = err
                                 break
-                            await asyncio.sleep(min(0.2 * (1.5 ** min(part_attempts, 6)), 3.0))
+                            await asyncio.sleep(min(0.2 * (1.5 ** min(part_attempts, 6)), 2.5))
 
                     if chunk_data is not None:
                         async with file_lock:
@@ -516,11 +508,10 @@ async def fast_download_media(
                 except Exception:
                     pass
         finally:
-            for sess in sessions:
-                try:
-                    await sess.stop()
-                except Exception:
-                    pass
+            try:
+                await session.stop()
+            except Exception:
+                pass
 
     except Exception as e:
         logger.debug(f"Parallel chunk download exception: {e}")

@@ -112,14 +112,16 @@
 | **Kaggle (4 vCPU, 30GB RAM)** | **2 Parallel Streams** | **2 Parallel Streams** | **2-4 Workers** | **4 MTProto Sockets** |
 | **Colab / Cloud Shell (2 vCPU)** | **2 Parallel Streams** | **2 Parallel Streams** | **2 Workers** | **4 MTProto Sockets** |
 
-> **Rule:** Never exceed 4-6 simultaneous MTProto connections per Telegram account. Exceeding 6 triggers DC-level throttling (<500 KB/s) or FloodWaits.
-
 ---
 
-## 5. Live In-Place Progress Dashboard Architecture
-* **Problem:** Spamming 100+ raw logger lines every 5 seconds floods Kaggle/Cloud shell scrollback and obscures real-time status.
-* **Architecture:**
-  - `_active_transfers`: Central dictionary in `MigrationEngine` tracking all active download & upload slots.
-  - `_live_progress_ticker_loop`: Unbuffered 1.0s ticker printing real-time MB transferred, speed in MB/s, and progress percentages side-by-side using `\r\033[K`.
-  - Clean Completion Milestones: Only outputs permanent clean log lines upon milestone events (`✅ [Downloaded #898] (340.9 MB) in 42s (8.1 MB/s)`).
+## 6. MTProto Socket Limits & Cross-DC Authorization Rules
+
+### Error: Severe Speed Throttle (<1 MB/s) & Stall on Multi-Session Downloads
+* **Symptom:** Downloads drop to 0.1–1.0 MB/s and trigger 30s stall disconnects when attempting to download media.
+* **Root Cause:**
+  1. **Cross-DC Single-Use Token Invalidation:** When media is on a foreign DC (`dc_id != storage.dc_id()`), `raw.functions.auth.ExportAuthorization` produces a single-use authorization token. Attempting to share/import the same token into multiple `Session` instances causes all subsequent sessions to fail authentication, dropping ~80% of download chunks.
+  2. **Socket Limit Exceeded:** Spawning 5 sessions across 2 download streams + 2 upload streams created 20 simultaneous TCP connections, triggering Telegram's DC-level IP throttling.
+* **Permanent Fix:**
+  - In `fast_download_media`, allocate strictly **1 Dedicated MTProto `Session`** per download call, authenticating it with its own fresh `ExportAuthorization`.
+  - Maintain the global connection budget: **2 Download Streams (2 sockets) + 2 Upload Streams (2-4 sockets) = Max 4-6 sockets total**, delivering sustained 15–20 MB/s without throttling.
 
