@@ -395,21 +395,29 @@ async def fast_download_media(
 
         dc_id = file_id.dc_id
 
-        # Create a DEDICATED session for THIS download (no sharing = no contention)
-        session = Session(
-            self, dc_id,
-            await Auth(self, dc_id, await self.storage.test_mode()).create()
-            if dc_id != await self.storage.dc_id()
-            else await self.storage.auth_key(),
-            await self.storage.test_mode(),
-            is_media=True
-        )
-        await session.start()
+        # Multi-Session MTProto Socket Pool for Downloads (prevents single-socket DC throttling)
+        sessions: List[Session] = []
+        num_sessions = 3
+        
+        auth_key = await Auth(self, dc_id, await self.storage.test_mode()).create() if dc_id != await self.storage.dc_id() else await self.storage.auth_key()
+        
+        for i in range(num_sessions):
+            sess = Session(
+                self, dc_id,
+                auth_key,
+                await self.storage.test_mode(),
+                is_media=True
+            )
+            await sess.start()
+            sessions.append(sess)
+            if i < num_sessions - 1:
+                await asyncio.sleep(0.2)
 
         try:
             if dc_id != await self.storage.dc_id():
                 exported_auth = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
-                await session.invoke(raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes))
+                for sess in sessions:
+                    await sess.invoke(raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes))
 
             chunk_size = 1024 * 1024  # 1MB per MTProto part (strictly divisible by 4096)
             total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
@@ -445,10 +453,12 @@ async def fast_download_media(
                     part_attempts = 0
                     max_part_attempts = 10
                     chunk_data = None
+                    session_idx = part_idx % len(sessions)
 
                     while part_attempts < max_part_attempts and dl_error is None:
+                        target_session = sessions[session_idx % len(sessions)]
                         try:
-                            r = await session.invoke(
+                            r = await target_session.invoke(
                                 raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
                                 sleep_threshold=30
                             )
@@ -465,9 +475,10 @@ async def fast_download_media(
                                 break
                             if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "timed out", "timeout")):
                                 try:
-                                    await session.restart()
+                                    await target_session.restart()
                                 except Exception:
                                     pass
+                                session_idx += 1  # rotate session on network error
                             if part_attempts >= max_part_attempts:
                                 dl_error = err
                                 break
@@ -505,7 +516,11 @@ async def fast_download_media(
                 except Exception:
                     pass
         finally:
-            await session.stop()
+            for sess in sessions:
+                try:
+                    await sess.stop()
+                except Exception:
+                    pass
 
     except Exception as e:
         logger.debug(f"Parallel chunk download exception: {e}")
