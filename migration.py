@@ -399,11 +399,18 @@ class MigrationEngine:
                 
                 dl_parts = []
                 ul_parts = []
+                now_tick = time.time()
                 for key, item in list(self._active_transfers.items()):
                     curr_mb = item["current"] / 1048576
                     tot_mb = item["total"] / 1048576 if item["total"] else 0
+                    time_since_update = now_tick - item.get("last_time", now_tick)
                     spd = item.get("speed", 0.0)
-                    spd_str = f"{spd:.1f}MB/s" if spd > 0 else "..."
+                    if time_since_update > 20.0 and item["current"] > 0:
+                        spd_str = "⚠️STALL"
+                    elif spd > 0:
+                        spd_str = f"{spd:.1f}MB/s"
+                    else:
+                        spd_str = "..."
                     entry_str = f"#{item['seq']} ({curr_mb:.0f}/{tot_mb:.0f}MB @ {spd_str})"
                     if item["type"] == "DL":
                         dl_parts.append(entry_str)
@@ -1154,9 +1161,13 @@ class MigrationEngine:
             file_name_display = getattr(msg.document, "file_name", None) or getattr(msg.video, "file_name", None) or f"media_{msg.id}"
             dl_key = f"dl_{msg.id}"
 
+            dl_progress_tracker = {"last_time": time.time(), "current": 0}
+
             def _prog(current: int, total: int):
                 if self.cancel_event.is_set():
                     raise asyncio.CancelledError("Download aborted by cancellation event")
+                dl_progress_tracker["current"] = current
+                dl_progress_tracker["last_time"] = time.time()
                 self._update_transfer_progress(dl_key, "DL", msg.id, file_name_display, current, total)
 
             dl_client = client or self.userbot or self.client
@@ -1175,13 +1186,46 @@ class MigrationEngine:
                 except Exception as ref_err:
                     logger.debug(f"Could not refresh file_reference for #{msg.id}: {ref_err}")
 
-            try:
-                downloaded = await self._execute_with_flood_retry(
+            watchdog_done = asyncio.Event()
+
+            async def _dl_stall_watchdog(target_task: asyncio.Task):
+                """Monitors download activity. If stalled for >30s, cancels the download task to reconnect."""
+                while not watchdog_done.is_set() and not self.cancel_event.is_set():
+                    try:
+                        await asyncio.wait_for(watchdog_done.wait(), timeout=10.0)
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+                    if self.cancel_event.is_set():
+                        break
+                    idle = time.time() - dl_progress_tracker["last_time"]
+                    if idle > 30.0:
+                        logger.warning(
+                            f"⚠️ [Download #{msg.id}] Download stall detected (no data for {idle:.0f}s @ {dl_progress_tracker['current'] / 1048576:.1f} MB) — aborting for fresh reconnect..."
+                        )
+                        if not target_task.done():
+                            target_task.cancel()
+                        break
+
+            dl_task = asyncio.create_task(
+                self._execute_with_flood_retry(
                     dl_client.download_media,
                     message=msg,
                     file_name=str(temp_target),
                     progress=_prog
                 )
+            )
+            watchdog_task = asyncio.create_task(_dl_stall_watchdog(dl_task))
+
+            try:
+                downloaded = await dl_task
+            except asyncio.CancelledError:
+                if self.cancel_event.is_set():
+                    raise
+                self._remove_transfer_progress(dl_key)
+                await reset_client_sessions(dl_client)
+                logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/{max_dl_attempts} aborted due to connection stall. Retrying in {wait_sec}s...")
+                downloaded = None
             except Exception as dl_err:
                 self._remove_transfer_progress(dl_key)
                 err_str = str(dl_err)
@@ -1215,6 +1259,10 @@ class MigrationEngine:
                         await reset_client_sessions(dl_client)
                     logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/{max_dl_attempts} failed: {dl_err}. Retrying in {wait_sec}s...")
                     downloaded = None
+            finally:
+                watchdog_done.set()
+                if not watchdog_task.done():
+                    watchdog_task.cancel()
 
             if not downloaded or not os.path.exists(downloaded):
                 self._remove_transfer_progress(dl_key)

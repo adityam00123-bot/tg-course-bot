@@ -5,6 +5,7 @@ Python 3.12 StreamReader concurrency shielding, and zero dropped file parts.
 """
 
 import os
+import time
 import math
 import asyncio
 import logging
@@ -136,6 +137,7 @@ async def fast_save_file(
     upload_error: Optional[Exception] = None
     progress_lock = asyncio.Lock()
     stream_lock = asyncio.Lock() if is_stream else None
+    watchdog_done = asyncio.Event()
 
     # Multi-Session MTProto Socket Pool for breaking single-TCP 4.5 MB/s bottleneck
     sessions: List[Session] = []
@@ -147,15 +149,17 @@ async def fast_save_file(
             auth_key = await self.storage.auth_key()
 
             num_sessions = 3
-            for _ in range(num_sessions):
+            for i in range(num_sessions):
                 sess = Session(
                     self, dc_id,
                     auth_key,
                     test_mode,
-                    is_media=True
+                    is_media=(i < 2)  # Diversity: 2 media sessions + 1 regular session to prevent identical DC endpoint throttling
                 )
                 await sess.start()
                 sessions.append(sess)
+                if i < num_sessions - 1:
+                    await asyncio.sleep(0.3)
         except Exception as sess_err:
             logger.debug(f"Media session pool initialization fallback: {sess_err}")
 
@@ -165,6 +169,40 @@ async def fast_save_file(
     # 10-12 concurrent chunk workers per client stream for high-speed Telegram Premium uploads
     num_workers = min(getattr(self, "max_concurrent_transmissions", 12) or 12, total_parts)
     num_workers = max(1, min(num_workers, 16))
+
+    async def _stall_watchdog():
+        """Monitors upload progress. If no bytes are uploaded for 25s while queue is not empty,
+        restarts session pool to unfreeze stalled DC sockets."""
+        nonlocal upload_error
+        last_snap = 0
+        stall_rounds = 0
+        while not watchdog_done.is_set() and upload_error is None:
+            try:
+                await asyncio.wait_for(watchdog_done.wait(), timeout=25.0)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+            curr = uploaded_bytes
+            if curr == last_snap and not queue.empty() and curr < file_size:
+                stall_rounds += 1
+                logger.warning(
+                    f"⚠️ [Upload Watchdog] Upload freeze detected ({stall_rounds}x @ {curr / 1048576:.1f}/{file_size / 1048576:.1f} MB) — resetting upload session pool..."
+                )
+                for s in sessions:
+                    if s:
+                        try:
+                            await s.restart()
+                        except Exception:
+                            pass
+                if stall_rounds >= 4:  # ~100s of zero progress -> abort to trigger clean reconnect
+                    upload_error = RuntimeError(
+                        f"Upload stalled >100s with zero progress at {curr}/{file_size} bytes. Aborting for fresh reconnect."
+                    )
+                    break
+            else:
+                stall_rounds = 0
+            last_snap = curr
 
     async def _worker():
         nonlocal uploaded_bytes, upload_error
@@ -201,13 +239,12 @@ async def fast_save_file(
                 part_attempts = 0
                 max_part_attempts = 20
                 part_ack = False
-
-                # Round-robin assign parts across multiple media sessions (multi-TCP socket multiplexing)
-                target_session = sessions[part_idx % len(sessions)] or getattr(self, "session", None)
+                session_idx = part_idx % len(sessions)
 
                 while part_attempts < max_part_attempts and upload_error is None:
+                    target_session = sessions[session_idx % len(sessions)] or getattr(self, "session", None)
                     try:
-                        res = await target_session.invoke(rpc, sleep_threshold=60)
+                        res = await target_session.invoke(rpc, sleep_threshold=30)
                         if res is True or res:
                             part_ack = True
                             break
@@ -220,15 +257,17 @@ async def fast_save_file(
                                 await target_session.restart()
                             except Exception:
                                 pass
-                            # If a session fails 2+ times, swap to main self.session as a rock-solid safety net
-                            if part_attempts >= 2:
+                            # Rotate to next session in pool so we don't hammer the same throttled DC socket
+                            session_idx += 1
+                            # If a part fails 3+ times, also try main self.session as a safety net
+                            if part_attempts >= 3 and getattr(self, "session", None) not in sessions:
                                 target_session = getattr(self, "session", target_session)
 
                         if part_attempts >= 3:
                             logger.warning(
                                 f"⚠️ Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}"
                             )
-                        await asyncio.sleep(min(0.2 * (1.5 ** min(part_attempts, 6)), 3.0))
+                        await asyncio.sleep(min(0.2 * (1.5 ** min(part_attempts, 6)), 2.5))
 
                 if not part_ack:
                     upload_error = RuntimeError(
@@ -253,8 +292,11 @@ async def fast_save_file(
                     pass
 
     try:
+        watchdog_task = asyncio.create_task(_stall_watchdog())
         workers = [asyncio.create_task(_worker()) for _ in range(num_workers)]
         await asyncio.gather(*workers, return_exceptions=True)
+        watchdog_done.set()
+        await watchdog_task
 
         if upload_error is not None:
             raise upload_error
@@ -267,6 +309,7 @@ async def fast_save_file(
         else:
             return raw.types.InputFile(id=file_id, parts=total_parts, name=file_name, md5_checksum="")
     finally:
+        watchdog_done.set()
         for s in sessions:
             if s and s != getattr(self, "session", None):
                 try:
@@ -415,9 +458,15 @@ async def fast_download_media(
                                 raise NotImplementedError("CDN redirect handled by fallback")
                         except Exception as err:
                             part_attempts += 1
-                            if any(k in str(err).lower() for k in ("file_reference_expired", "filereferenceexpired")):
+                            err_l = str(err).lower()
+                            if any(k in err_l for k in ("file_reference_expired", "filereferenceexpired")):
                                 dl_error = err
                                 break
+                            if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "timed out", "timeout")):
+                                try:
+                                    await session.restart()
+                                except Exception:
+                                    pass
                             if part_attempts >= max_part_attempts:
                                 dl_error = err
                                 break
