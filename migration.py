@@ -1946,16 +1946,6 @@ class MigrationEngine:
                     self._clear_progress_line()
                     logger.info(f"✅ [Uploaded #{msg.id}] {up_name} ({file_bytes / 1048576:.1f} MB) in {format_seconds(dur)} ({spd:.1f} MB/s) & ready for fast-publish")
 
-            # Clean local disk IMMEDIATELY because file is safely stored on Telegram Cloud!
-            if slot.local_path:
-                cleanup_temp_file(slot.local_path)
-            for p in slot.extra_temps:
-                cleanup_temp_file(p)
-
-            async with disk_lock:
-                disk_state["used"] = max(0, disk_state["used"] - slot.disk_bytes)
-                slot.disk_bytes = 0
-            disk_freed.set()
 
         except asyncio.CancelledError:
             pass
@@ -2076,7 +2066,7 @@ class MigrationEngine:
                         peer=peer, media=media, message=caption or "", entities=raw_entities, random_id=self.client.rnd_id()
                     )
                 ),
-                timeout=300
+                timeout=60
             )
         except Exception as send_err:
             if raw_entities:
@@ -2088,7 +2078,7 @@ class MigrationEngine:
                             peer=peer, media=media, message=caption or "", entities=None, random_id=self.client.rnd_id()
                         )
                     ),
-                    timeout=300
+                    timeout=60
                 )
             else:
                 raise send_err
@@ -2434,56 +2424,11 @@ class MigrationEngine:
                     f"Disk buffer budget ~{budget_mb} MB"
                 )
 
-                # Initialize dedicated pools of isolated Pyrogram Clients for concurrent MTProto streams
-                downloader_pool: asyncio.Queue = asyncio.Queue()
-                uploader_pool: asyncio.Queue = asyncio.Queue()
-
-                if self.userbot:
-                    try:
-                        session_str = await self.userbot.export_session_string()
-                        if session_str:
-                            # 1. Spawn isolated downloader clients
-                            for idx in range(num_downloads):
-                                dl_cl = Client(
-                                    name=f"pipeline_downloader_{idx}",
-                                    session_string=session_str,
-                                    in_memory=True,
-                                    no_updates=True,
-                                    api_id=Config.API_ID,
-                                    api_hash=Config.API_HASH,
-                                    max_concurrent_transmissions=Config.MAX_UPLOAD_WORKERS,
-                                    workers=16
-                                )
-                                await dl_cl.start()
-                                install_fast_uploader(dl_cl, max_workers=Config.MAX_UPLOAD_WORKERS)
-                                downloader_pool.put_nowait(dl_cl)
-                                downloader_clients_all.append(dl_cl)
-
-                            # 2. Spawn isolated uploader clients
-                            for idx in range(num_uploads):
-                                up_cl = Client(
-                                    name=f"pipeline_uploader_{idx}",
-                                    session_string=session_str,
-                                    in_memory=True,
-                                    no_updates=True,
-                                    api_id=Config.API_ID,
-                                    api_hash=Config.API_HASH,
-                                    max_concurrent_transmissions=Config.MAX_UPLOAD_WORKERS,
-                                    workers=16
-                                )
-                                await up_cl.start()
-                                install_fast_uploader(up_cl, max_workers=Config.MAX_UPLOAD_WORKERS)
-                                uploader_pool.put_nowait(up_cl)
-                                uploader_clients_all.append(up_cl)
-
-                            logger.info(f"⚡ [Pipeline] {len(downloader_clients_all)} Dedicated Download Streams + {len(uploader_clients_all)} Dedicated Upload Streams established.")
-                    except Exception as pool_err:
-                        logger.warning(f"[Pipeline] Dedicated pool fallback to primary userbot client: {pool_err}")
-                        downloader_pool = None
-                        uploader_pool = None
-                else:
-                    downloader_pool = None
-                    uploader_pool = None
+                # In Architecture A, transfer_lock serializes DL and UL on the unified client.
+                # Zero duplicate clients, zero session collisions, zero auth key desync!
+                downloader_pool = None
+                uploader_pool = None
+                logger.info("⚡ [Pipeline] Unified MTProto Client Engine active for Sequential Turbo.")
 
             # -- Strict Sequential Streaming Pipeline (Architecture A) --
             # maxsize=1 guarantees 1 active media message at a time: zero disk accumulation, zero concurrency conflict

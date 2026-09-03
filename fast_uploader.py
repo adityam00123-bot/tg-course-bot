@@ -263,7 +263,7 @@ async def fast_save_file(
                         # Auto-recover broken socket without dropping parts
                         if any(k in err_str for k in ("broken pipe", "connectionreset", "connectionlost")):
                             try:
-                                await target_session.restart()
+                                await _safe_session_restart(target_session)
                             except Exception:
                                 pass
                         session_idx += 1  # rotate to next healthy socket in the pool
@@ -496,7 +496,7 @@ async def fast_download_media(
                                 break
                             if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "timed out", "timeout")):
                                 try:
-                                    await target_session.restart()
+                                    await _safe_session_restart(target_session)
                                     if dc_id != await self.storage.dc_id() and exported_auth:
                                         await target_session.invoke(raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes))
                                 except Exception:

@@ -166,3 +166,13 @@
   - **uvloop Integration:** Enabled C-based `uvloop` on Linux (Kaggle) to reduce epoll socket polling latency.
   - **Result:** Consistent, clockwork **~14–16 seconds per 350 MB file** (4 files/min, ~240 files/hr), 100% stable, zero disk accumulation, zero broken pipes, zero session logout risk.
 
+### Error: Premature Local File Deletion Before Publishing Fallback
+* **Symptom:** `Error migrating message #2093: Failed to decode "/kaggle/working/downloads/media_...mp4". The value does not represent an existing local file, HTTP URL, or valid file id.`
+* **Root Cause:** In `_pipeline_prefetch`, local files were being unlinked immediately after `active_client.save_file` finished. When Telegram's `SendMedia` encountered a network timeout or connection reset, the fallback mechanism attempted to upload the local file directly, but the file was already deleted from disk!
+* **Permanent Fix:**
+  - Removed premature file cleanup from `_pipeline_prefetch`.
+  - Local files are preserved on disk until the consumer loop `_pipeline_upload_slot` has successfully published the media to the destination chat (via fast pre-upload or fallback direct upload).
+  - The consumer loop's `finally:` block cleans up `slot.local_path` and `slot.extra_temps` and frees disk budget only AFTER publishing completes.
+  - Reduced `SendMedia` RPC timeout from 300s to 60s so temporary network glitches fail fast into the direct upload fallback without stalling for 5 minutes.
+  - Ensured only ONE Pyrogram client (`self.client` / `self.userbot`) handles both upload and publishing in Architecture A, avoiding session dissociation.
+
