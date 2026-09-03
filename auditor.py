@@ -163,40 +163,77 @@ async def scan_channel_gaps(
     source_chat_id: Union[int, str],
     dest_chat_id: Union[int, str],
     start_id: Optional[int] = None,
-    end_id: Optional[int] = None
+    end_id: Optional[int] = None,
+    in_memory_failed_ids: Optional[List[int]] = None
 ) -> Dict[str, Any]:
     """
     Scans source channel vs destination channel and failed_messages.json to identify missing lecture gaps.
-    Builds and updates message_map on the fly.
+    Uses multi-layered detection:
+    1. Explicit failed_messages.json registry + in-memory error list.
+    2. Persistent message_map.json.
+    3. Content & File-Size Fingerprinting: Compares exact byte sizes and text between Source and Destination.
     """
-    from migration import get_failed_messages
+    from migration import get_failed_messages, load_checkpoint
 
-    # 1. Check failed messages registry
+    # 1. Gather all recorded failed IDs
     failed_ids = set(get_failed_messages(source_chat_id, dest_chat_id))
+    if in_memory_failed_ids:
+        failed_ids.update(in_memory_failed_ids)
 
-    # 2. Check existing message map
+    # 2. Determine effective range:
+    cp = load_checkpoint(source_chat_id, dest_chat_id)
+    if not start_id:
+        start_id = 1
+    if not end_id:
+        end_id = max(cp, 1)
+
+    # 3. Read destination channel messages to build fingerprints
+    dest_video_sizes = set()
+    dest_doc_sizes = set()
+    dest_photo_sizes = set()
+    dest_texts = set()
+    dest_mapped_source_ids = set()
+
     msg_map = load_message_map(source_chat_id, dest_chat_id)
+    for sid in msg_map.keys():
+        dest_mapped_source_ids.add(int(sid))
 
-    # 3. If message map is empty or partial, scan destination channel history to auto-populate
-    if len(msg_map) < 10:
-        try:
-            discovered_map = {}
-            async for dmsg in client.get_chat_history(dest_chat_id, limit=300):
-                sid = extract_source_id_from_dest_message(dmsg)
-                if sid:
-                    discovered_map[sid] = dmsg.id
-            if discovered_map:
-                update_message_map_batch(source_chat_id, dest_chat_id, discovered_map)
-                msg_map.update(discovered_map)
-        except Exception as e:
-            logger.debug(f"Destination scan for auto-map failed: {e}")
+    logger.info(f"🔍 [Auditor] Inspecting destination channel for content fingerprints...")
+    try:
+        discovered_map = {}
+        async for dmsg in client.get_chat_history(dest_chat_id, limit=800):
+            if dmsg.empty or dmsg.service:
+                continue
+            if dmsg.video and getattr(dmsg.video, "file_size", None):
+                dest_video_sizes.add(dmsg.video.file_size)
+            if dmsg.document and getattr(dmsg.document, "file_size", None):
+                dest_doc_sizes.add(dmsg.document.file_size)
+            if dmsg.photo and getattr(dmsg.photo, "file_size", None):
+                dest_photo_sizes.add(dmsg.photo.file_size)
+            if dmsg.text:
+                dest_texts.add(dmsg.text.strip())
 
-    # 4. If a range is specified, scan source channel to find any un-migrated IDs
-    missing_ids = list(failed_ids)
-    if start_id and end_id and (end_id - start_id) <= 1000:
-        target_ids = list(range(start_id, end_id + 1))
-        for i in range(0, len(target_ids), 50):
-            batch = target_ids[i:i + 50]
+            extracted_sid = extract_source_id_from_dest_message(dmsg)
+            if extracted_sid:
+                dest_mapped_source_ids.add(extracted_sid)
+                discovered_map[extracted_sid] = dmsg.id
+
+        if discovered_map:
+            update_message_map_batch(source_chat_id, dest_chat_id, discovered_map)
+            msg_map.update(discovered_map)
+    except Exception as e:
+        logger.debug(f"[Auditor] Error reading destination history: {e}")
+
+    # 4. Now scan source channel messages in the range [start_id, end_id]
+    missing_ids = set(failed_ids)
+
+    if end_id > start_id:
+        logger.info(f"🔍 [Auditor] Comparing Source #{start_id}..#{end_id} against Destination channel...")
+        scan_limit = 5000
+        target_ids = list(range(start_id, min(end_id + 1, start_id + scan_limit)))
+
+        for i in range(0, len(target_ids), 100):
+            batch = target_ids[i:i + 100]
             try:
                 msgs = await client.get_messages(source_chat_id, message_ids=batch)
                 if not isinstance(msgs, list):
@@ -205,19 +242,42 @@ async def scan_channel_gaps(
                     if not m or m.empty or m.service:
                         continue
                     sid = m.id
-                    if sid not in msg_map and sid not in missing_ids:
-                        missing_ids.append(sid)
+
+                    if sid in failed_ids:
+                        continue
+
+                    if sid in dest_mapped_source_ids:
+                        continue
+
+                    # Check by content fingerprint
+                    is_present = False
+                    if m.video and getattr(m.video, "file_size", None):
+                        if m.video.file_size in dest_video_sizes or m.video.file_size in dest_doc_sizes:
+                            is_present = True
+                    elif m.document and getattr(m.document, "file_size", None):
+                        if m.document.file_size in dest_doc_sizes or m.document.file_size in dest_video_sizes:
+                            is_present = True
+                    elif m.photo and getattr(m.photo, "file_size", None):
+                        if m.photo.file_size in dest_photo_sizes:
+                            is_present = True
+                    elif m.text and not bool(m.video or m.document or m.photo):
+                        if m.text.strip() in dest_texts:
+                            is_present = True
+
+                    if not is_present:
+                        logger.info(f"🔍 [Auditor] Gap detected: Source #{sid} is missing in destination!")
+                        missing_ids.add(sid)
             except Exception as scan_err:
-                logger.debug(f"Source scan batch error: {scan_err}")
+                logger.debug(f"[Auditor] Source scan error for batch {batch}: {scan_err}")
 
-    missing_ids = sorted(list(set(missing_ids)))
-
+    missing_list = sorted(list(missing_ids))
     return {
         "source_chat_id": source_chat_id,
         "dest_chat_id": dest_chat_id,
-        "missing_ids": missing_ids,
-        "count": len(missing_ids),
-        "mapped_count": len(msg_map)
+        "missing_ids": missing_list,
+        "count": len(missing_list),
+        "mapped_count": len(msg_map),
+        "scanned_range": f"#{start_id} to #{end_id}"
     }
 
 

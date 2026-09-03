@@ -162,14 +162,25 @@ def get_failed_messages(source_id: Any, dest_id: Any) -> List[int]:
             with open(FAILED_MESSAGES_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             key = _get_checkpoint_key(source_id, dest_id)
+            ids = []
             if key in data and isinstance(data[key], list):
-                ids = []
                 for m in data[key]:
                     if isinstance(m, int):
                         ids.append(m)
                     elif isinstance(m, dict) and "id" in m:
                         ids.append(int(m["id"]))
-                return sorted(list(set(ids)))
+            # Fallback: loose matching across all keys in data
+            if not ids:
+                s_str = str(source_id).strip()
+                d_str = str(dest_id).strip()
+                for k, v in data.items():
+                    if (s_str in k or d_str in k) and isinstance(v, list):
+                        for m in v:
+                            if isinstance(m, int):
+                                ids.append(m)
+                            elif isinstance(m, dict) and "id" in m:
+                                ids.append(int(m["id"]))
+            return sorted(list(set(ids)))
     except Exception as e:
         logger.debug(f"Could not get failed messages: {e}")
     return []
@@ -242,6 +253,7 @@ class MigrationStats:
     text_count: int = 0
     skipped_count: int = 0
     failed_count: int = 0
+    failed_msg_ids: List[int] = field(default_factory=list)
     total_bytes_migrated: int = 0
     current_msg_id: Optional[int] = None
     start_time: Optional[float] = None
@@ -2324,6 +2336,8 @@ class MigrationEngine:
         if not local_path or not local_path.exists():
             logger.warning(f"Media download returned empty/missing file for message #{msg.id}")
             self.stats.failed_count += 1
+            self.stats.failed_msg_ids.append(msg.id)
+            record_failed_message(self.config.source_chat_id, self.config.dest_chat_id, msg.id, "Empty or missing media download")
             return
 
         await self._upload_and_post_media(msg, local_path)
@@ -2567,6 +2581,7 @@ class MigrationEngine:
                         save_checkpoint(self.config.source_chat_id, self.config.dest_chat_id, msg.id)
                     except Exception as msg_err:
                         self.stats.failed_count += 1
+                        self.stats.failed_msg_ids.append(msg.id)
                         self.stats.processed_count += 1
                         record_failed_message(self.config.source_chat_id, self.config.dest_chat_id, msg.id, str(msg_err))
                         save_checkpoint(self.config.source_chat_id, self.config.dest_chat_id, msg.id)
@@ -2597,6 +2612,7 @@ class MigrationEngine:
                         save_checkpoint(self.config.source_chat_id, self.config.dest_chat_id, slot.msg.id)
                     except Exception as msg_err:
                         self.stats.failed_count += 1
+                        self.stats.failed_msg_ids.append(slot.msg.id)
                         self.stats.processed_count += 1
                         record_failed_message(self.config.source_chat_id, self.config.dest_chat_id, slot.msg.id, str(msg_err))
                         save_checkpoint(self.config.source_chat_id, self.config.dest_chat_id, slot.msg.id)

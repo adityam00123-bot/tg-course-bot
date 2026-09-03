@@ -1038,14 +1038,19 @@ def register_handlers(bot: Client) -> None:
 
         try:
             client = engine.userbot or engine.client
-            start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else None
-            end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else None
+            cp_val = load_checkpoint(engine.config.source_chat_id, engine.config.dest_chat_id)
+            cur_val = getattr(engine.stats, "current_msg_id", 0) or 0
+            start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else 1
+            end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else max(cp_val, cur_val)
+            in_mem_failed = getattr(engine.stats, "failed_msg_ids", [])
+
             audit_res = await scan_channel_gaps(
                 client=client,
                 source_chat_id=engine.config.source_chat_id,
                 dest_chat_id=engine.config.dest_chat_id,
                 start_id=start_id,
-                end_id=end_id
+                end_id=end_id,
+                in_memory_failed_ids=in_mem_failed
             )
             missing_ids = audit_res["missing_ids"]
 
@@ -2349,14 +2354,19 @@ def register_handlers(bot: Client) -> None:
 
             try:
                 client = engine.userbot or engine.client
-                start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else None
-                end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else None
+                cp_val = load_checkpoint(engine.config.source_chat_id, engine.config.dest_chat_id)
+                cur_val = getattr(engine.stats, "current_msg_id", 0) or 0
+                start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else 1
+                end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else max(cp_val, cur_val)
+                in_mem_failed = getattr(engine.stats, "failed_msg_ids", [])
+
                 audit_res = await scan_channel_gaps(
                     client=client,
                     source_chat_id=engine.config.source_chat_id,
                     dest_chat_id=engine.config.dest_chat_id,
                     start_id=start_id,
-                    end_id=end_id
+                    end_id=end_id,
+                    in_memory_failed_ids=in_mem_failed
                 )
                 missing_ids = audit_res["missing_ids"]
 
@@ -2433,14 +2443,19 @@ def register_handlers(bot: Client) -> None:
 
             await query.answer("⚡ Starting Sequential Re-Alignment...")
             client = engine.userbot or engine.client
-            start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else None
-            end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else None
+            cp_val = load_checkpoint(engine.config.source_chat_id, engine.config.dest_chat_id)
+            cur_val = getattr(engine.stats, "current_msg_id", 0) or 0
+            start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else 1
+            end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else max(cp_val, cur_val)
+            in_mem_failed = getattr(engine.stats, "failed_msg_ids", [])
+
             audit_res = await scan_channel_gaps(
                 client=client,
                 source_chat_id=engine.config.source_chat_id,
                 dest_chat_id=engine.config.dest_chat_id,
                 start_id=start_id,
-                end_id=end_id
+                end_id=end_id,
+                in_memory_failed_ids=in_mem_failed
             )
             missing_ids = audit_res["missing_ids"]
             if not missing_ids:
@@ -2499,14 +2514,19 @@ def register_handlers(bot: Client) -> None:
             engine.owner_id = user_id
             await query.answer("📥 Starting Simple Append Backfill...")
             client = engine.userbot or engine.client
-            start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else None
-            end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else None
+            cp_val = load_checkpoint(engine.config.source_chat_id, engine.config.dest_chat_id)
+            cur_val = getattr(engine.stats, "current_msg_id", 0) or 0
+            start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else 1
+            end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else max(cp_val, cur_val)
+            in_mem_failed = getattr(engine.stats, "failed_msg_ids", [])
+
             audit_res = await scan_channel_gaps(
                 client=client,
                 source_chat_id=engine.config.source_chat_id,
                 dest_chat_id=engine.config.dest_chat_id,
                 start_id=start_id,
-                end_id=end_id
+                end_id=end_id,
+                in_memory_failed_ids=in_mem_failed
             )
             missing_ids = audit_res["missing_ids"]
             if not missing_ids:
