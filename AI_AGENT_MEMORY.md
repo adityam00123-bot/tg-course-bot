@@ -62,8 +62,8 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
   3. **Auto-Crawl Guard & Socket Circuit-Breaker:**
      - **Cumulative 45s Rolling Average Watchdog:** Tracks byte snapshots over a rolling 45s window. If the cumulative rolling average drops below 1.0 MB/s on a file >30MB (even with momentary spikes up to 4-6 MB/s), it cleanly aborts for a fresh reconnect.
      - **Per-Socket Bad-Apple Circuit Breaker:** If a single 512KB chunk takes >4.0s on any socket (<128 KB/s), that specific socket is background-restarted (`_safe_session_restart`) without failing the file or stalling the remaining 3 healthy sockets.
-  4. **Master Turbo Architecture (Commit `master-turbo`):**
-     - **Global TCP Buffer Turbo Shield (`fast_uploader.py`):** Automatically sets `SO_RCVBUF = 4MB`, `SO_SNDBUF = 4MB`, and `TCP_NODELAY = 1` on every Pyrogram socket. Removes the Linux 208KB Bandwidth-Delay Product choke for high-latency cross-continental connections (e.g. Taiwan/US to Europe).
+  4. **Step 1 Zero-Risk Optimizations & Smart Token Bucket:**
+     - **Native Linux Kernel TCP Auto-Tuning:** Preserved Linux dynamic TCP window auto-tuning (`tcp_moderate_rcvbuf`) without manual `SO_RCVBUF` overrides.
      - **Rolling 60s Token Bucket Limiter:** Max 24 msgs/min sliding window. Chote files and single messages publish with **0.0s instant delay**, while large bursts of 24+ tiny messages are safely paced to eliminate `FLOOD_WAIT` risk.
      - **Static Thumbnail Cache:** Reuses the uploaded `InputFile` handle for `thumb.jpg` (1-hour TTL), saving 200–400ms per video (saves ~1.6 hours over 20k files).
      - **Native `.m4v` Pass-Through:** Bypasses FFmpeg disk remux for `.m4v`, eliminating 7–10s disk I/O on 1GB+ files.

@@ -25,27 +25,7 @@ try:
 except Exception:
     pass
 
-import socket
 
-# ---------------------------------------------------------------------------
-# Global TCP Window & Buffer Turbo Shield (Eliminates Trans-Atlantic BDP Bottleneck)
-# Applies 4MB SO_RCVBUF / SO_SNDBUF and TCP_NODELAY to all asyncio TCP connections
-# ---------------------------------------------------------------------------
-_orig_open_connection = asyncio.open_connection
-
-async def _turbo_open_connection(*args, **kwargs):
-    reader, writer = await _orig_open_connection(*args, **kwargs)
-    sock = writer.get_extra_info("socket") if writer else None
-    if sock:
-        try:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
-        except Exception:
-            pass
-    return reader, writer
-
-asyncio.open_connection = _turbo_open_connection
 
 # ---------------------------------------------------------------------------
 # Python 3.12 StreamReader & MTProto Session Concurrency Shield
