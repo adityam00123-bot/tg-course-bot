@@ -305,7 +305,7 @@ async def fast_save_file(
                 while part_attempts < max_part_attempts and upload_error is None:
                     target_session = sessions[session_idx % len(sessions)] or getattr(self, "session", None)
                     try:
-                        res = await target_session.invoke(rpc, sleep_threshold=60)
+                        res = await target_session.invoke(rpc, timeout=15, sleep_threshold=60)
                         if res is True or res:
                             part_ack = True
                             break
@@ -556,6 +556,7 @@ async def fast_download_media(
                         try:
                             r = await target_session.invoke(
                                 raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
+                                timeout=15,
                                 sleep_threshold=30
                             )
                             if isinstance(r, raw.types.upload.File):
