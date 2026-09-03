@@ -59,13 +59,18 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
   2. **Fresh Session Lifecycle Per File (Zero Zombie Sockets):**
      - In `fast_save_file`, 3-4 fresh dedicated media sessions are created on the home DC per file and **cleanly stopped in `finally:`**.
      - NEVER maintain a persistent global pool across files; idle sockets get dropped by NAT/firewalls, creating half-open "zombie" connections that cause multi-minute hangs.
-  3. **Sane 90s Watchdog & 15s Straggler Protection:**
-     - Watchdog threshold is 90s ($30\text{s} \times 3$) and checks `if curr == last_snap and curr < file_size:`, protecting all chunks up to the very last byte without killing healthy transfers during TCP window recalculations.
-     - Straggler re-claim threshold is 15.0s, preventing thundering-herd duplicate chunk spam while still rescuing stuck workers.
-     - Chunk invokes are wrapped in `asyncio.wait_for(..., timeout=25.0)` to eliminate indefinite hangs in `writer.drain()`.
-  4. **Emergency Rollback Point:**
-     - If future experiments degrade performance or reintroduce stalls, immediately revert to commit `cecd423`:
-       `git reset --hard cecd423`
+  3. **Auto-Crawl Guard & Socket Circuit-Breaker:**
+     - **Cumulative 45s Rolling Average Watchdog:** Tracks byte snapshots over a rolling 45s window. If the cumulative rolling average drops below 1.0 MB/s on a file >30MB (even with momentary spikes up to 4-6 MB/s), it cleanly aborts for a fresh reconnect.
+     - **Per-Socket Bad-Apple Circuit Breaker:** If a single 512KB chunk takes >4.0s on any socket (<128 KB/s), that specific socket is background-restarted (`_safe_session_restart`) without failing the file or stalling the remaining 3 healthy sockets.
+  4. **Master Turbo Architecture (Commit `master-turbo`):**
+     - **Global TCP Buffer Turbo Shield (`fast_uploader.py`):** Automatically sets `SO_RCVBUF = 4MB`, `SO_SNDBUF = 4MB`, and `TCP_NODELAY = 1` on every Pyrogram socket. Removes the Linux 208KB Bandwidth-Delay Product choke for high-latency cross-continental connections (e.g. Taiwan/US to Europe).
+     - **Rolling 60s Token Bucket Limiter:** Max 24 msgs/min sliding window. Chote files and single messages publish with **0.0s instant delay**, while large bursts of 24+ tiny messages are safely paced to eliminate `FLOOD_WAIT` risk.
+     - **Static Thumbnail Cache:** Reuses the uploaded `InputFile` handle for `thumb.jpg` (1-hour TTL), saving 200–400ms per video (saves ~1.6 hours over 20k files).
+     - **Native `.m4v` Pass-Through:** Bypasses FFmpeg disk remux for `.m4v`, eliminating 7–10s disk I/O on 1GB+ files.
+     - **Dedicated Per-File Clean Auth Handshake:** Strictly creates fresh `Auth(self, dc_id).create()` per file, avoiding stale transport drops on foreign DCs.
+  5. **Emergency Rollback Point:**
+     - If future experiments ever degrade performance or introduce stalls, immediately revert to commit `22a8956`:
+       `git reset --hard 22a8956`
 
 ## 7. Cloud Execution Strategy
 1. **Primary: Kaggle Notebooks** (4 vCPU, 30 GB RAM, 2x T4 GPU, ~73 GB Disk). Allows "Save & Run All (Commit)" for 12-hour background execution without keeping the browser open. Weekly GPU quota is 30 hours.

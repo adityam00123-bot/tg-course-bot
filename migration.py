@@ -15,6 +15,7 @@ import time
 import random
 import asyncio
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -342,6 +343,8 @@ class MigrationEngine:
         self._chat_forwards_restricted: bool = False
         self._active_pipeline_tasks: set = set()
         self._last_publish_time: float = 0.0
+        self._cached_custom_thumb: Optional[Tuple[Any, float]] = None
+        self._publish_history: deque = deque()
 
         # Initialize default watermark & branding strictly from Config / filesystem (watermark off by default, thumbnail on, video format default)
         self.config.enable_watermark = Config.ENABLE_WATERMARK
@@ -1893,8 +1896,8 @@ class MigrationEngine:
                     if thumb_res and os.path.exists(thumb_res):
                         thumb_path = str(thumb_res)
 
-                # C. Remux to streamable MP4 if needed
-                if is_video and self.config.output_format == OutputFormat.VIDEO and not upload_path.lower().endswith(".mp4"):
+                # C. Remux to streamable MP4 if needed (natively skip .mp4 and .m4v)
+                if is_video and self.config.output_format == OutputFormat.VIDEO and not any(upload_path.lower().endswith(ext) for ext in (".mp4", ".m4v")):
                     remuxed = slot.local_path.with_name(f"stream_{slot.local_path.stem}.mp4")
                     extra_temps.append(remuxed)
                     upload_path = await remux_to_streamable_mp4(upload_path, remuxed)
@@ -1932,13 +1935,20 @@ class MigrationEngine:
                     max_up_attempts = 5
                     for up_attempt in range(1, max_up_attempts + 1):
                         try:
-                            # 1. Upload thumbnail safely (instant <50ms upload, isolated so thumb never blocks video)
+                            # 1. Upload thumbnail safely (cached for static custom thumb, instant <50ms)
                             if thumb_path and os.path.exists(thumb_path):
-                                try:
-                                    raw_thumb = await active_client.save_file(thumb_path)
-                                except Exception as thumb_err:
-                                    logger.warning(f"⚠️ [Upload #{msg.id}] Thumbnail upload fallback: {thumb_err}")
-                                    raw_thumb = None
+                                is_static_thumb = (self.config.custom_thumbnail_path and thumb_path == self.config.custom_thumbnail_path)
+                                now_t = time.time()
+                                if is_static_thumb and self._cached_custom_thumb and (now_t - self._cached_custom_thumb[1]) < 3600.0:
+                                    raw_thumb = self._cached_custom_thumb[0]
+                                else:
+                                    try:
+                                        raw_thumb = await active_client.save_file(thumb_path)
+                                        if is_static_thumb and raw_thumb:
+                                            self._cached_custom_thumb = (raw_thumb, now_t)
+                                    except Exception as thumb_err:
+                                        logger.warning(f"⚠️ [Upload #{msg.id}] Thumbnail upload fallback: {thumb_err}")
+                                        raw_thumb = None
                             else:
                                 raw_thumb = None
 
@@ -2640,17 +2650,25 @@ class MigrationEngine:
                     last_progress_count = self.stats.processed_count
                     await self._send_progress_update(is_final=False)
 
-                # Smart Dynamic Pacing: Guarantee at least 2.0s between publishes to avoid Telegram FloodWaits
-                current_time = time.time()
-                time_since_last_publish = current_time - getattr(self, '_last_publish_time', 0)
-                target_delay = 2.0
-                
+                # Rolling 60s Token Bucket Rate Limiter: Max 24 messages/minute (safe Telegram channel ceiling)
+                # Gives 0.0s instant burst on small files when safe, but throttles smoothly during bursts of 24+ files
+                now = time.time()
+                while self._publish_history and (now - self._publish_history[0]) > 60.0:
+                    self._publish_history.popleft()
+
+                max_msgs_per_min = 24
                 if action in ("direct", "pipeline"):
-                    if time_since_last_publish < target_delay:
-                        await asyncio.sleep(target_delay - time_since_last_publish)
-                    self._last_publish_time = time.time()
+                    if len(self._publish_history) >= max_msgs_per_min:
+                        oldest = self._publish_history[0]
+                        wait_needed = max(0.1, 60.0 - (now - oldest) + 0.1)
+                        await asyncio.sleep(wait_needed)
+                        now = time.time()
+                        while self._publish_history and (now - self._publish_history[0]) > 60.0:
+                            self._publish_history.popleft()
+                    self._publish_history.append(now)
+                    self._last_publish_time = now
                 elif action == "skip":
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.05)
 
             # Cleanup producer and any orphaned tasks
             if not prod_task.done():

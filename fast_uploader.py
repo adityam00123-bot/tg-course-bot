@@ -25,6 +25,28 @@ try:
 except Exception:
     pass
 
+import socket
+import pyrogram.connection.transport.tcp.tcp as pyrogram_tcp
+
+# ---------------------------------------------------------------------------
+# Global TCP Window & Buffer Turbo Shield (Eliminates Trans-Atlantic BDP Bottleneck)
+# ---------------------------------------------------------------------------
+_orig_connect_via_direct = pyrogram_tcp.TCP._connect_via_direct
+
+async def _turbo_connect_via_direct(self, destination):
+    await _orig_connect_via_direct(self, destination)
+    if getattr(self, "writer", None):
+        sock = self.writer.get_extra_info("socket")
+        if sock:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+            except Exception:
+                pass
+
+pyrogram_tcp.TCP._connect_via_direct = _turbo_connect_via_direct
+
 # ---------------------------------------------------------------------------
 # Python 3.12 StreamReader & MTProto Session Concurrency Shield
 # ---------------------------------------------------------------------------
@@ -225,24 +247,32 @@ async def fast_save_file(
     up_done = asyncio.Event()
 
     async def _stall_watchdog():
-        """Monitors upload progress. Aborts if stalled >90s or crawling <0.5 MB/s for 45s."""
+        """Monitors upload progress. Aborts if stalled >90s or rolling 45s average < 1.0 MB/s."""
         nonlocal upload_error
         last_snap = 0
         stall_rounds = 0
-        crawl_rounds = 0
+        history: list = []  # [(timestamp, uploaded_bytes)]
+
         while not watchdog_done.is_set() and upload_error is None and not up_done.is_set():
             try:
-                await asyncio.wait_for(watchdog_done.wait(), timeout=15.0)
+                await asyncio.wait_for(watchdog_done.wait(), timeout=5.0)
                 break
             except asyncio.TimeoutError:
                 pass
 
+            now = time.time()
             curr = uploaded_bytes
-            delta = curr - last_snap
+            history.append((now, curr))
+
+            # Keep only entries from the last 45 seconds
+            while history and (now - history[0][0]) > 45.0:
+                history.pop(0)
+
             if curr < file_size:
+                # 1. Zero Progress Check (18 rounds * 5s = 90s)
                 if curr == last_snap:
                     stall_rounds += 1
-                    if stall_rounds >= 6:  # 6 * 15s = 90s of zero progress -> abort cleanly for retry
+                    if stall_rounds >= 18:
                         upload_error = RuntimeError(
                             f"Upload stalled >90s with zero progress at {curr}/{file_size} bytes."
                         )
@@ -250,21 +280,21 @@ async def fast_save_file(
                 else:
                     stall_rounds = 0
 
-                # Auto-Crawl Guard: If file is >30MB and speed is <0.5 MB/s for 45s (3 * 15s), abort for fresh reconnect
-                if file_size > 30 * 1024 * 1024:
-                    rate_mbps = (delta / (1024 * 1024)) / 15.0
-                    if rate_mbps < 0.5:
-                        crawl_rounds += 1
-                        if crawl_rounds >= 3:  # 45s of crawling <0.5 MB/s
+                # 2. Cumulative Rolling Average Check over 45 seconds (Immune to momentary spikes!)
+                if file_size > 30 * 1024 * 1024 and history:
+                    oldest_t, oldest_b = history[0]
+                    span = now - oldest_t
+                    if span >= 35.0:  # Evaluated once we have 35-45s of cumulative history
+                        bytes_moved = curr - oldest_b
+                        rolling_mbps = (bytes_moved / (1024 * 1024)) / span
+                        if rolling_mbps < 1.0:
                             upload_error = RuntimeError(
-                                f"Upload crawling too slow ({rate_mbps:.2f} MB/s < 0.5 MB/s for 45s) at {curr / 1048576:.1f}/{file_size / 1048576:.1f} MB. Aborting for auto-reconnect."
+                                f"Upload crawling too slow (rolling 45s avg: {rolling_mbps:.2f} MB/s < 1.0 MB/s) "
+                                f"at {curr / 1048576:.1f}/{file_size / 1048576:.1f} MB. Aborting for fresh reconnect."
                             )
                             break
-                    else:
-                        crawl_rounds = 0
             else:
                 stall_rounds = 0
-                crawl_rounds = 0
             last_snap = curr
 
     async def _worker(worker_id: int):
@@ -338,6 +368,7 @@ async def fast_save_file(
 
                 while part_attempts < max_part_attempts and part_idx not in completed_parts and upload_error is None:
                     target_session = sessions[session_idx % len(sessions)] or getattr(self, "session", None)
+                    t_chunk_start = time.time()
                     try:
                         # Wrap with 25s timeout so writer.drain() or TCP stall cannot hang worker indefinitely
                         res = await asyncio.wait_for(
@@ -346,6 +377,13 @@ async def fast_save_file(
                         )
                         if res is True or res:
                             part_ack = True
+                            # If a 512KB chunk took unusually long (>4.0s = <128 KB/s), refresh that socket in background
+                            chunk_dur = time.time() - t_chunk_start
+                            if chunk_dur > 4.0 and len(sessions) > 1:
+                                try:
+                                    asyncio.create_task(_safe_session_restart(target_session))
+                                except Exception:
+                                    pass
                             break
                     except Exception as err:
                         part_attempts += 1
