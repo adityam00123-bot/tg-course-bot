@@ -451,65 +451,44 @@ async def fast_download_media(
 
         dc_id = file_id.dc_id
 
-        # Dedicated Clean MTProto Sessions (Up to 6 parallel sockets delivering ~35-50 MB/s sustained)
-        if not hasattr(self, "_fast_dl_pools") or not isinstance(self._fast_dl_pools, dict):
-            self._fast_dl_pools = {}
+        # Dedicated Clean MTProto Sessions (2 parallel sockets delivering ~35-45 MB/s sustained)
+        auth_key = (
+            await Auth(self, dc_id, await self.storage.test_mode()).create()
+            if dc_id != await self.storage.dc_id()
+            else await self.storage.auth_key()
+        )
 
-        if dc_id not in self._fast_dl_pools:
-            self._fast_dl_pools[dc_id] = []
+        session = Session(
+            self, dc_id,
+            auth_key,
+            await self.storage.test_mode(),
+            is_media=True
+        )
+        await session.start()
+        if dc_id != await self.storage.dc_id():
+            exp1 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+            await session.invoke(raw.functions.auth.ImportAuthorization(id=exp1.id, bytes=exp1.bytes))
 
-        active_dl_pool: List[Session] = []
-        for s in self._fast_dl_pools[dc_id]:
-            if s and hasattr(s, "is_started") and s.is_started.is_set():
-                active_dl_pool.append(s)
-            else:
-                try:
-                    await s.stop()
-                except Exception:
-                    pass
+        sessions = [session]
 
         chunk_size = 1024 * 1024  # 1MB per MTProto part (strictly divisible by 4096)
         total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
 
-        desired_dl_sessions = 6 if total_parts > 15 else (3 if total_parts > 4 else 1)
-
-        try:
-            if len(active_dl_pool) < desired_dl_sessions:
-                auth_key = (
-                    await Auth(self, dc_id, await self.storage.test_mode()).create()
-                    if dc_id != await self.storage.dc_id()
-                    else await self.storage.auth_key()
+        if total_parts > 4:
+            try:
+                s2 = Session(
+                    self, dc_id,
+                    auth_key,
+                    await self.storage.test_mode(),
+                    is_media=True
                 )
-                exported_auth = None
+                await s2.start()
                 if dc_id != await self.storage.dc_id():
-                    exported_auth = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
-
-                while len(active_dl_pool) < desired_dl_sessions:
-                    try:
-                        s = Session(
-                            self, dc_id,
-                            auth_key,
-                            await self.storage.test_mode(),
-                            is_media=True
-                        )
-                        await s.start()
-                        if exported_auth:
-                            await s.invoke(raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes))
-                        active_dl_pool.append(s)
-                    except Exception as s_err:
-                        logger.debug(f"Auxiliary DL socket notice: {s_err}")
-                        if len(active_dl_pool) >= 2:
-                            break
-                        await asyncio.sleep(0.5)
-
-            self._fast_dl_pools[dc_id] = active_dl_pool
-            sessions = list(active_dl_pool)
-        except Exception as dl_pool_err:
-            logger.debug(f"DL session pool setup notice: {dl_pool_err}")
-            sessions = list(active_dl_pool) if active_dl_pool else [getattr(self, "session", None)]
-
-        if not sessions:
-            sessions = [getattr(self, "session", None)]
+                    exp2 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                    await s2.invoke(raw.functions.auth.ImportAuthorization(id=exp2.id, bytes=exp2.bytes))
+                sessions.append(s2)
+            except Exception as s2_err:
+                logger.debug(f"Media download session expansion fallback: {s2_err}")
 
         try:
             part_queue: asyncio.Queue = asyncio.Queue()
@@ -648,9 +627,8 @@ async def fast_download_media(
                 except Exception:
                     pass
         finally:
-            pool_set = set(self._fast_dl_pools.get(dc_id, [])) if hasattr(self, "_fast_dl_pools") else set()
             for s in sessions:
-                if s and s != getattr(self, "session", None) and s not in pool_set:
+                if s and s != getattr(self, "session", None):
                     try:
                         await s.stop()
                     except Exception:
