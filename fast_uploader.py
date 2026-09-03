@@ -225,27 +225,46 @@ async def fast_save_file(
     up_done = asyncio.Event()
 
     async def _stall_watchdog():
-        """Monitors upload progress. If no bytes are uploaded for 90s, cleanly aborts to trigger retry."""
+        """Monitors upload progress. Aborts if stalled >90s or crawling <0.5 MB/s for 45s."""
         nonlocal upload_error
         last_snap = 0
         stall_rounds = 0
+        crawl_rounds = 0
         while not watchdog_done.is_set() and upload_error is None and not up_done.is_set():
             try:
-                await asyncio.wait_for(watchdog_done.wait(), timeout=30.0)
+                await asyncio.wait_for(watchdog_done.wait(), timeout=15.0)
                 break
             except asyncio.TimeoutError:
                 pass
 
             curr = uploaded_bytes
-            if curr == last_snap and curr < file_size:
-                stall_rounds += 1
-                if stall_rounds >= 3:  # 90s of zero progress -> abort cleanly for retry
-                    upload_error = RuntimeError(
-                        f"Upload stalled >90s with zero progress at {curr}/{file_size} bytes."
-                    )
-                    break
+            delta = curr - last_snap
+            if curr < file_size:
+                if curr == last_snap:
+                    stall_rounds += 1
+                    if stall_rounds >= 6:  # 6 * 15s = 90s of zero progress -> abort cleanly for retry
+                        upload_error = RuntimeError(
+                            f"Upload stalled >90s with zero progress at {curr}/{file_size} bytes."
+                        )
+                        break
+                else:
+                    stall_rounds = 0
+
+                # Auto-Crawl Guard: If file is >30MB and speed is <0.5 MB/s for 45s (3 * 15s), abort for fresh reconnect
+                if file_size > 30 * 1024 * 1024:
+                    rate_mbps = (delta / (1024 * 1024)) / 15.0
+                    if rate_mbps < 0.5:
+                        crawl_rounds += 1
+                        if crawl_rounds >= 3:  # 45s of crawling <0.5 MB/s
+                            upload_error = RuntimeError(
+                                f"Upload crawling too slow ({rate_mbps:.2f} MB/s < 0.5 MB/s for 45s) at {curr / 1048576:.1f}/{file_size / 1048576:.1f} MB. Aborting for auto-reconnect."
+                            )
+                            break
+                    else:
+                        crawl_rounds = 0
             else:
                 stall_rounds = 0
+                crawl_rounds = 0
             last_snap = curr
 
     async def _worker(worker_id: int):
