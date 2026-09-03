@@ -26,12 +26,12 @@ except Exception:
     pass
 
 import socket
-import pyrogram.connection.transport.tcp.tcp as pyrogram_tcp
+from pyrogram.connection.transport.tcp.tcp import TCP
 
 # ---------------------------------------------------------------------------
 # Global TCP Window & Buffer Turbo Shield (Eliminates Trans-Atlantic BDP Bottleneck)
 # ---------------------------------------------------------------------------
-_orig_connect_via_direct = pyrogram_tcp.TCP._connect_via_direct
+_orig_connect_via_direct = TCP._connect_via_direct
 
 async def _turbo_connect_via_direct(self, destination):
     await _orig_connect_via_direct(self, destination)
@@ -45,7 +45,7 @@ async def _turbo_connect_via_direct(self, destination):
             except Exception:
                 pass
 
-pyrogram_tcp.TCP._connect_via_direct = _turbo_connect_via_direct
+TCP._connect_via_direct = _turbo_connect_via_direct
 
 # ---------------------------------------------------------------------------
 # Python 3.12 StreamReader & MTProto Session Concurrency Shield
