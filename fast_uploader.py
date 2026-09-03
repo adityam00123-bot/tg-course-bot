@@ -11,10 +11,19 @@ import asyncio
 import logging
 from typing import Optional, Union, Callable, BinaryIO, Any
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import pyrogram
 from pyrogram import Client, raw
 from pyrogram.session import Session
 
 logger = logging.getLogger("migration_bot.fast_uploader")
+
+# Upgrade Pyrogram crypto executor from 1 single thread to 8 parallel worker threads
+try:
+    if hasattr(pyrogram, "crypto_executor") and getattr(pyrogram.crypto_executor, "_max_workers", 1) < 8:
+        pyrogram.crypto_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="pyrogram_crypto")
+except Exception:
+    pass
 
 # ---------------------------------------------------------------------------
 # Python 3.12 StreamReader & MTProto Session Concurrency Shield
@@ -196,8 +205,8 @@ async def fast_save_file(
                     except Exception:
                         pass
 
-            # 5 Parallel Media TCP sockets = ~28-35 MB/s sustained upload throughput
-            desired_sessions = 5 if total_parts > 30 else (3 if total_parts > 4 else 1)
+            # 2 Parallel Media TCP sockets on Home DC (Golden 4-Socket budget across DL+UL)
+            desired_sessions = 2 if total_parts > 4 else 1
             # Create additional sessions up to desired count with resilient individual attempts
             while len(active_pool) < desired_sessions:
                 try:
