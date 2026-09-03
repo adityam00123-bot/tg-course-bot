@@ -176,10 +176,14 @@
   - Reduced `SendMedia` RPC timeout from 300s to 60s so temporary network glitches fail fast into the direct upload fallback without stalling for 5 minutes.
   - Ensured only ONE Pyrogram client (`self.client` / `self.userbot`) handles both upload and publishing in Architecture A, avoiding session dissociation.
 
-### Error: Cross-DC Single-Use Token Invalidation on Multi-Socket Downloads
-* **Symptom:** Downloads fail or throttle to <1 MB/s with repeated chunk retries when downloading from a foreign DC with multiple sockets.
-* **Root Cause:** Telegram's `raw.functions.auth.ExportAuthorization` produces a **single-use cryptographic token**. Reusing `exported_auth.bytes` across multiple `Session` instances causes Telegram's foreign DC to reject all sessions after the first one (`AUTH_KEY_UNREGISTERED`).
-* **Permanent Fix:** In `fast_download_media`, invoke `raw.functions.auth.ExportAuthorization` **separately for each individual socket** (`exp1` for `session`, `exp2` for `s2`), ensuring 100% of sockets are fully authenticated on the foreign DC.
+### Error: `unable to perform operation on <TCPTransport closed=True ...>; the handler is closed`
+* **Symptom:** Uploads and thumbnails fail with 20 consecutive retries: `⚠️ Part 1/2 retry 20/20 due to: unable to perform operation on <TCPTransport closed=True reading=False 0x...>; the handler is closed`. Subsequent media items all fail on the same closed socket address.
+* **Root Cause:** When an underlying OS TCP transport terminates, Pyrogram's `Session.invoke()` raises a transport-level error. The error recovery string matching only checked for `"broken pipe"`, `"connectionreset"`, and `"connectionlost"`, completely missing `"handler is closed"` and `"tcptransport"`. As a result, the dead session was never restarted, and all 20 chunk attempts hit the same closed transport.
+* **Permanent Fix:**
+  - In `fast_save_file` and `fast_download_media`, added `"handler is closed"`, `"tcptransport"`, `"closed=true"`, and `"operation on"` to the exception recovery matching, triggering immediate `_safe_session_restart(target_session)`.
+  - Added an explicit `_is_session_alive(sess)` validator to `_fast_media_pool` that inspects `transport.is_closing()` and `transport._closed` to immediately purge dead sockets upon re-use.
+  - In `migration.py`, added transport closed strings to the outer `reset_client_sessions()` trigger so dead sockets are discarded from client state.
+
 
 
 
