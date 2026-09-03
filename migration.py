@@ -704,6 +704,15 @@ class MigrationEngine:
             migrated_gb = self.stats.total_bytes_migrated / (1024 ** 3)
             data_str = f"{migrated_gb:.2f} GB" if migrated_gb >= 0.01 else f"{self.stats.total_bytes_migrated / (1024 ** 2):.1f} MB"
 
+            failed_str = f"❌ <b>Errors:</b> {self.stats.failed_count}"
+            if self.stats.failed_count > 0:
+                f_ids = get_failed_messages(self.config.source_chat_id, self.config.dest_chat_id)
+                if f_ids:
+                    recent_ids = ", ".join([f"#{i}" for i in f_ids[-5:]])
+                    if len(f_ids) > 5:
+                        recent_ids = f"... {recent_ids}"
+                    failed_str += f" (<code>{recent_ids}</code>)"
+
             text = (
                 f"{title}\n"
                 f"━━━━━━━━━━━━━━━━━━━\n"
@@ -716,7 +725,7 @@ class MigrationEngine:
                 f"🎬 <b>Media Uploaded:</b> {self.stats.media_count}\n"
                 f"📝 <b>Text Messages:</b> {self.stats.text_count}\n"
                 f"⏭️ <b>Skipped:</b> {self.stats.skipped_count}\n"
-                f"❌ <b>Errors:</b> {self.stats.failed_count}\n"
+                f"{failed_str}\n"
                 f"⏱️ <b>Elapsed:</b> {elapsed}\n"
             )
 

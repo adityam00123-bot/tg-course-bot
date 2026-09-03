@@ -351,6 +351,8 @@ async def realign_channel_sequence(
                             chat_id=dest_chat,
                             message_ids=batch
                         )
+                        # Polite safety pacing between batches of 100 to stay well under rate limits
+                        await asyncio.sleep(1.5)
                     except Exception as fwd_err:
                         logger.warning(f"[Auditor] Batch shuffle error for {batch}: {fwd_err}")
 
