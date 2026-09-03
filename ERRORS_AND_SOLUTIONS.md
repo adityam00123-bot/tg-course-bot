@@ -176,13 +176,18 @@
   - Reduced `SendMedia` RPC timeout from 300s to 60s so temporary network glitches fail fast into the direct upload fallback without stalling for 5 minutes.
   - Ensured only ONE Pyrogram client (`self.client` / `self.userbot`) handles both upload and publishing in Architecture A, avoiding session dissociation.
 
-### Error: `unable to perform operation on <TCPTransport closed=True ...>; the handler is closed`
-* **Symptom:** Uploads and thumbnails fail with 20 consecutive retries: `⚠️ Part 1/2 retry 20/20 due to: unable to perform operation on <TCPTransport closed=True reading=False 0x...>; the handler is closed`. Subsequent media items all fail on the same closed socket address.
-* **Root Cause:** When an underlying OS TCP transport terminates, Pyrogram's `Session.invoke()` raises a transport-level error. The error recovery string matching only checked for `"broken pipe"`, `"connectionreset"`, and `"connectionlost"`, completely missing `"handler is closed"` and `"tcptransport"`. As a result, the dead session was never restarted, and all 20 chunk attempts hit the same closed transport.
+### Error: Single Upload Chunk Straggler Hang (2 to 7 Minute Stall on Healthy Network)
+* **Symptom:** Most uploads finish in 10-14 seconds (10-13 MB/s), but randomly a file like #2334 (62 MB) hangs for 7m 08s (`Upload stalled >120s with zero progress at 3145728/65521661 bytes`), collapsing overall hourly speed.
+* **Root Cause:**
+  1. **Pyrogram's Hidden 150-Second Recursion:** `Session.invoke()` defaults to `retries=10`. When an invoke hung or hit a silent TCP drop, Pyrogram retried 10 times internally with `timeout=15`, blocking the worker on the broken socket for 150 seconds before raising an exception.
+  2. **No Straggler Stealing:** When all parts were popped from `queue`, if Worker A held the last part and stalled, no other idle worker could touch that part.
+  3. **Broken Watchdog Guard:** The watchdog checked `if curr == last_snap and not queue.empty()`. Because all parts were already popped into workers, `queue.empty()` was True, so the 120s watchdog never fired while a straggler was stuck!
 * **Permanent Fix:**
-  - In `fast_save_file` and `fast_download_media`, added `"handler is closed"`, `"tcptransport"`, `"closed=true"`, and `"operation on"` to the exception recovery matching, triggering immediate `_safe_session_restart(target_session)`.
-  - Added an explicit `_is_session_alive(sess)` validator to `_fast_media_pool` that inspects `transport.is_closing()` and `transport._closed` to immediately purge dead sockets upon re-use.
-  - In `migration.py`, added transport closed strings to the outer `reset_client_sessions()` trigger so dead sockets are discarded from client state.
+  - Enforced `retries=1, timeout=10` on all `target_session.invoke()` calls so broken connections bubble up in 10s instead of 150s.
+  - Implemented **Upload Straggler Stealing** (`(now - s_time) > 4.0s`): idle workers immediately re-claim and re-upload any part that takes > 4.0s on another socket.
+  - Fixed stall watchdog: removed `not queue.empty()` condition and lowered stall threshold from 120s to **24 seconds** (12s × 2).
+  - Configured 4 parallel media sessions for upload as recommended by MTProto telemetry research.
+
 
 
 

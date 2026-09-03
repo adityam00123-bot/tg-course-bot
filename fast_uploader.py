@@ -216,8 +216,8 @@ async def fast_save_file(
                     except Exception:
                         pass
 
-            # 3 Parallel Media TCP sockets on Home DC (delivering 25-35 MB/s upload when running alone)
-            desired_sessions = 3 if total_parts > 4 else 1
+            # 4 Parallel Media TCP sockets on Home DC (optimal Gemini research recommendation)
+            desired_sessions = 4 if total_parts > 4 else 1
             # Create additional sessions up to desired count with resilient individual attempts
             while len(active_pool) < desired_sessions:
                 try:
@@ -256,39 +256,71 @@ async def fast_save_file(
     num_workers = min(getattr(self, "max_concurrent_transmissions", 16) or 16, total_parts)
     num_workers = max(1, min(num_workers, 18))
 
+    completed_parts: set = set()
+    part_start_times: dict = {}
+    parts_lock = asyncio.Lock()
+    up_done = asyncio.Event()
+
     async def _stall_watchdog():
-        """Monitors upload progress. If no bytes are uploaded for 120s, cleanly aborts to trigger retry."""
+        """Monitors upload progress. If no bytes are uploaded for 24s, cleanly aborts to trigger retry."""
         nonlocal upload_error
         last_snap = 0
         stall_rounds = 0
-        while not watchdog_done.is_set() and upload_error is None:
+        while not watchdog_done.is_set() and upload_error is None and not up_done.is_set():
             try:
-                await asyncio.wait_for(watchdog_done.wait(), timeout=60.0)
+                await asyncio.wait_for(watchdog_done.wait(), timeout=12.0)
                 break
             except asyncio.TimeoutError:
                 pass
 
             curr = uploaded_bytes
-            if curr == last_snap and not queue.empty() and curr < file_size:
+            if curr == last_snap and curr < file_size:
                 stall_rounds += 1
-                if stall_rounds >= 2:  # 120s of zero progress -> abort cleanly for retry
+                if stall_rounds >= 2:  # 24s of zero progress -> abort cleanly for retry
                     upload_error = RuntimeError(
-                        f"Upload stalled >120s with zero progress at {curr}/{file_size} bytes."
+                        f"Upload stalled >24s with zero progress at {curr}/{file_size} bytes."
                     )
                     break
             else:
                 stall_rounds = 0
             last_snap = curr
 
-    async def _worker():
+    async def _worker(worker_id: int):
         nonlocal uploaded_bytes, upload_error
         fp = None if is_stream else open(file_path, "rb")
         try:
-            while not queue.empty() and upload_error is None:
+            while len(completed_parts) < total_parts and upload_error is None and not up_done.is_set():
+                part_info = None
                 try:
-                    part_idx, offset, part_size = queue.get_nowait()
+                    part_info = queue.get_nowait()
                 except asyncio.QueueEmpty:
-                    break
+                    pass
+
+                if part_info is None:
+                    # Queue is empty: check for stalled straggler parts taking > 4.0s
+                    async with parts_lock:
+                        now = time.time()
+                        straggler_idx = None
+                        for p_idx, s_time in list(part_start_times.items()):
+                            if p_idx not in completed_parts and (now - s_time) > 4.0:
+                                straggler_idx = p_idx
+                                part_start_times[p_idx] = now  # re-claim straggler
+                                break
+                    if straggler_idx is not None:
+                        offset = straggler_idx * CHUNK_SIZE
+                        p_size = min(CHUNK_SIZE, file_size - offset) if file_size > 0 else 0
+                        part_info = (straggler_idx, offset, p_size)
+                    else:
+                        if len(completed_parts) >= total_parts or upload_error is not None:
+                            break
+                        try:
+                            await asyncio.wait_for(up_done.wait(), timeout=0.25)
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
+
+                part_idx, offset, part_size = part_info
+                part_start_times[part_idx] = time.time()
 
                 if is_stream:
                     async with stream_lock:
@@ -318,14 +350,15 @@ async def fast_save_file(
                     )
 
                 part_attempts = 0
-                max_part_attempts = 20
+                max_part_attempts = 10
                 part_ack = False
-                session_idx = part_idx % len(sessions)
+                session_idx = (part_idx + worker_id) % len(sessions)
 
-                while part_attempts < max_part_attempts and upload_error is None:
+                while part_attempts < max_part_attempts and part_idx not in completed_parts and upload_error is None:
                     target_session = sessions[session_idx % len(sessions)] or getattr(self, "session", None)
                     try:
-                        res = await target_session.invoke(rpc, timeout=15, sleep_threshold=60)
+                        # Cap retries to 1 and timeout to 10s so broken transports bubble up immediately
+                        res = await target_session.invoke(rpc, timeout=10, retries=1, sleep_threshold=60)
                         if res is True or res:
                             part_ack = True
                             break
@@ -333,7 +366,7 @@ async def fast_save_file(
                         part_attempts += 1
                         err_str = str(err).lower()
                         # Auto-recover broken or closed socket without dropping parts
-                        if any(k in err_str for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "operation on", "closed=true")):
+                        if any(k in err_str for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "operation on", "closed=true", "timed out", "timeout")):
                             try:
                                 await _safe_session_restart(target_session)
                             except Exception:
@@ -343,16 +376,16 @@ async def fast_save_file(
                             logger.warning(
                                 f"⚠️ Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}"
                             )
-                        await asyncio.sleep(min(0.2 * (1.5 ** min(part_attempts, 6)), 2.5))
+                        await asyncio.sleep(0.1)
 
-                if not part_ack:
-                    upload_error = RuntimeError(
-                        f"Upload failed: Part {part_idx + 1}/{total_parts} could not be uploaded after {max_part_attempts} attempts."
-                    )
-                    break
+                if part_ack and part_idx not in completed_parts:
+                    async with parts_lock:
+                        if part_idx not in completed_parts:
+                            completed_parts.add(part_idx)
+                            uploaded_bytes += len(chunk)
+                            if len(completed_parts) >= total_parts:
+                                up_done.set()
 
-                async with progress_lock:
-                    uploaded_bytes += len(chunk)
                     if progress:
                         try:
                             res_prog = progress(uploaded_bytes, file_size, *progress_args)
@@ -360,6 +393,11 @@ async def fast_save_file(
                                 await res_prog
                         except Exception:
                             pass
+                elif not part_ack and part_idx not in completed_parts and part_attempts >= max_part_attempts:
+                    upload_error = RuntimeError(
+                        f"Upload failed: Part {part_idx + 1}/{total_parts} could not be uploaded after {max_part_attempts} attempts."
+                    )
+                    break
         finally:
             if fp:
                 try:
@@ -369,7 +407,7 @@ async def fast_save_file(
 
     try:
         watchdog_task = asyncio.create_task(_stall_watchdog())
-        workers = [asyncio.create_task(_worker()) for _ in range(num_workers)]
+        workers = [asyncio.create_task(_worker(w_id)) for w_id in range(num_workers)]
         await asyncio.gather(*workers, return_exceptions=True)
         watchdog_done.set()
         await watchdog_task
@@ -586,6 +624,7 @@ async def fast_download_media(
                             r = await target_session.invoke(
                                 raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
                                 timeout=5,
+                                retries=1,
                                 sleep_threshold=30
                             )
                             if isinstance(r, raw.types.upload.File):
