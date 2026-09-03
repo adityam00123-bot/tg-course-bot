@@ -43,6 +43,7 @@ from watermark import (
     is_ffmpeg_available
 )
 from fast_uploader import install_fast_uploader, reset_client_sessions
+from auditor import record_message_map
 
 logger = logging.getLogger("migration_bot.migration")
 
@@ -2058,8 +2059,9 @@ class MigrationEngine:
                 force_file=bool(msg.document and not msg.animation)
             )
 
+        sent_res = None
         try:
-            await asyncio.wait_for(
+            sent_res = await asyncio.wait_for(
                 self._execute_with_flood_retry(
                     self.client.invoke,
                     raw.functions.messages.SendMedia(
@@ -2071,7 +2073,7 @@ class MigrationEngine:
         except Exception as send_err:
             if raw_entities:
                 logger.warning(f"SendMedia entity formatting fallback for #{msg.id}: {send_err}. Publishing with plain caption...")
-                await asyncio.wait_for(
+                sent_res = await asyncio.wait_for(
                     self._execute_with_flood_retry(
                         self.client.invoke,
                         raw.functions.messages.SendMedia(
@@ -2082,6 +2084,21 @@ class MigrationEngine:
                 )
             else:
                 raise send_err
+
+        # Extract published destination message ID and persist to message map
+        dest_msg_id = None
+        if hasattr(sent_res, "id"):
+            dest_msg_id = getattr(sent_res, "id", None)
+        elif hasattr(sent_res, "updates"):
+            for u in sent_res.updates:
+                if hasattr(u, "message") and hasattr(u.message, "id"):
+                    dest_msg_id = u.message.id
+                    break
+                elif hasattr(u, "id"):
+                    dest_msg_id = u.id
+                    break
+        if dest_msg_id:
+            record_message_map(self.config.source_chat_id, self.config.dest_chat_id, msg.id, dest_msg_id)
 
     async def _pipeline_upload_slot(self, slot: _PipelineSlot) -> None:
         """Upload a pre-processed pipeline media to the destination channel in strict sequence."""
@@ -2178,6 +2195,8 @@ class MigrationEngine:
                     message_id=msg.id
                 )
                 if copied:
+                    if hasattr(copied, 'id'):
+                        record_message_map(self.config.source_chat_id, dest_chat, msg.id, copied.id)
                     if msg.media:
                         self.stats.media_count += 1
                     else:
@@ -2195,6 +2214,9 @@ class MigrationEngine:
                         drop_author=True
                     )
                     if fwd:
+                        fwd_id = fwd[0].id if isinstance(fwd, list) and fwd else getattr(fwd, 'id', None)
+                        if fwd_id:
+                            record_message_map(self.config.source_chat_id, dest_chat, msg.id, fwd_id)
                         self.stats.media_count += 1
                         logger.info(f"🤖 [Bot Mode] Forwarded message #{msg.id} -> Dest Channel")
                         return
@@ -2206,7 +2228,7 @@ class MigrationEngine:
             try:
                 poll = msg.poll
                 options = [opt.text for opt in poll.options] if poll.options else ["Yes", "No"]
-                await self._execute_with_flood_retry(
+                sent_poll = await self._execute_with_flood_retry(
                     self.client.send_poll,
                     chat_id=dest_chat,
                     question=poll.question,
@@ -2217,6 +2239,8 @@ class MigrationEngine:
                     correct_option_id=poll.correct_option_id,
                     explanation=poll.explanation
                 )
+                if sent_poll and hasattr(sent_poll, 'id'):
+                    record_message_map(self.config.source_chat_id, dest_chat, msg.id, sent_poll.id)
                 self.stats.text_count += 1
                 logger.info(f"✅ Migrated poll message #{msg.id} -> Dest Channel")
             except Exception as poll_err:
@@ -2230,13 +2254,15 @@ class MigrationEngine:
             text_content = msg.text or msg.caption
             final_text, final_entities = self._apply_caption(text_content, msg.entities or msg.caption_entities)
             if final_text:
-                await self._execute_with_flood_retry(
+                sent_txt = await self._execute_with_flood_retry(
                     self.client.send_message,
                     chat_id=dest_chat,
                     text=final_text,
                     entities=final_entities,
                     disable_web_page_preview=False
                 )
+                if sent_txt and hasattr(sent_txt, 'id'):
+                    record_message_map(self.config.source_chat_id, dest_chat, msg.id, sent_txt.id)
                 self.stats.text_count += 1
                 logger.debug(f"Migrated text/link message #{msg.id}")
             else:

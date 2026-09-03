@@ -51,6 +51,7 @@ from migration import (
     remove_failed_message
 )
 import database
+from auditor import scan_channel_gaps, realign_channel_sequence, check_admin_permissions
 
 logger = logging.getLogger("migration_bot.handlers")
 
@@ -343,7 +344,8 @@ def build_forward_dashboard_keyboard(engine: MigrationEngine) -> InlineKeyboardM
             InlineKeyboardButton("📝 Caption", callback_data="sub_caption")
         ],
         [
-            InlineKeyboardButton("🔍 Scan & Calculate Total Size (GB)", callback_data="action_scan_channel")
+            InlineKeyboardButton("🔍 Scan Size (GB)", callback_data="action_scan_channel"),
+            InlineKeyboardButton("🧩 Scan Gaps & Fix Order", callback_data="action_audit_gaps")
         ],
         [
             InlineKeyboardButton("🚀 RUN MIGRATION", callback_data="action_run"),
@@ -905,7 +907,7 @@ def register_handlers(bot: Client) -> None:
     # -------------------------------------------------------------
     # /scan or /audit Command Handler (Calculate Total Channel Data GBs)
     # -------------------------------------------------------------
-    @bot.on_message(filters.private & filters.command(["scan", "audit", "size"]))
+    @bot.on_message(filters.private & filters.command(["scan", "size"]))
     async def handle_scan_command(_, message: Message):
         user_id = message.from_user.id
         engine = get_user_engine(user_id, bot)
@@ -998,6 +1000,97 @@ def register_handlers(bot: Client) -> None:
             await status_msg.edit_text(
                 f"❌ <b>Scan Failed:</b> {e}\n\n"
                 f"<i>Please ensure the source channel is accessible.</i>",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]]),
+                parse_mode=enums.ParseMode.HTML
+            )
+
+    # -------------------------------------------------------------
+    # /audit or /scangaps Command (Audit Missing Videos & Restore Order)
+    # -------------------------------------------------------------
+    @bot.on_message(filters.private & filters.command(["audit", "scangaps", "gaps"]))
+    async def handle_audit_command(_, message: Message):
+        user_id = message.from_user.id
+        engine = get_user_engine(user_id, bot)
+
+        if not engine.config.source_chat_id or not engine.config.dest_chat_id:
+            await message.reply_text(
+                "⚠️ <b>Source and Destination Channels Required!</b>\n\n"
+                "Please configure both <b>Incoming</b> and <b>Outgoing</b> channels in <b>/dashboard</b> first.",
+                parse_mode=enums.ParseMode.HTML
+            )
+            return
+
+        if engine.is_busy():
+            await message.reply_text("⚠️ <b>A job is currently running!</b> Please wait for it to finish.", parse_mode=enums.ParseMode.HTML)
+            return
+
+        engine.owner_id = user_id
+        src_title = engine.config.source_chat_title or str(engine.config.source_chat_id)
+        dst_title = engine.config.dest_chat_title or str(engine.config.dest_chat_id)
+
+        status_msg = await message.reply_text(
+            f"🔍 <b>Auditing Channel Continuity...</b>\n\n"
+            f"📥 <b>Source:</b> {src_title}\n"
+            f"📤 <b>Destination:</b> {dst_title}\n\n"
+            f"⏳ <i>Scanning messages and inspecting gap registry...</i>",
+            parse_mode=enums.ParseMode.HTML
+        )
+
+        try:
+            client = engine.userbot or engine.client
+            start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else None
+            end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else None
+            audit_res = await scan_channel_gaps(
+                client=client,
+                source_chat_id=engine.config.source_chat_id,
+                dest_chat_id=engine.config.dest_chat_id,
+                start_id=start_id,
+                end_id=end_id
+            )
+            missing_ids = audit_res["missing_ids"]
+
+            if not missing_ids:
+                clean_text = (
+                    "🎉 <b>EXCELLENT! NO GAPS FOUND</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"📥 <b>Source:</b> {src_title}\n"
+                    f"📤 <b>Destination:</b> {dst_title}\n\n"
+                    "✅ <b>Status:</b> All lectures are 100% synchronized in your destination channel.\n"
+                    "✨ Zero missing videos detected!"
+                )
+                clean_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]
+                ])
+                await status_msg.edit_text(clean_text, reply_markup=clean_kb, parse_mode=enums.ParseMode.HTML)
+                return
+
+            id_list_str = ", ".join([f"#{i}" for i in missing_ids[:25]])
+            if len(missing_ids) > 25:
+                id_list_str += f" ... (+{len(missing_ids) - 25} more)"
+
+            report_text = (
+                "🔍 <b>CHANNEL GAP AUDIT REPORT</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📥 <b>Source:</b> {src_title}\n"
+                f"📤 <b>Destination:</b> {dst_title}\n\n"
+                f"⚠️ <b>Detected Gaps:</b> <b>{len(missing_ids)} missing lecture(s)</b>\n"
+                f"📋 <b>Missing IDs:</b> <code>{id_list_str}</code>\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "💡 <b>Choose how you want to restore these videos:</b>\n\n"
+                "• <b>⚡ Restore Sequence (Shuffle):</b> Uploads missing videos and shuffles subsequent messages so lecture numbers stay in 100% perfect chronological order!\n\n"
+                "• <b>📥 Simple Append:</b> Quickly uploads missing videos to the end of the destination channel without re-ordering."
+            )
+
+            report_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚡ Restore Sequence (Shuffle & Order)", callback_data="action_fix_sequence_shuffle")],
+                [InlineKeyboardButton("📥 Simple Append (Upload to End)", callback_data="action_fix_sequence_append")],
+                [InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]
+            ])
+            await status_msg.edit_text(report_text, reply_markup=report_kb, parse_mode=enums.ParseMode.HTML)
+        except Exception as err:
+            logger.error(f"Audit failed: {err}")
+            await status_msg.edit_text(
+                f"❌ <b>Audit Failed:</b> {err}",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]]),
                 parse_mode=enums.ParseMode.HTML
             )
@@ -2231,6 +2324,222 @@ def register_handlers(bot: Client) -> None:
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]]),
                     parse_mode=enums.ParseMode.HTML
                 )
+
+        elif data == "action_audit_gaps":
+            if not engine.config.source_chat_id or not engine.config.dest_chat_id:
+                await query.answer("⚠️ Please configure both Source and Destination channels first!", show_alert=True)
+                return
+
+            if engine.is_busy():
+                await query.answer("⚠️ A task is currently running. Please wait for it to finish.", show_alert=True)
+                return
+
+            engine.owner_id = user_id
+            await query.answer("🔍 Auditing for missing lectures...")
+            src_title = engine.config.source_chat_title or str(engine.config.source_chat_id)
+            dst_title = engine.config.dest_chat_title or str(engine.config.dest_chat_id)
+
+            await query.message.edit_text(
+                f"🔍 <b>Auditing Channels for Missing Lectures...</b>\n\n"
+                f"📥 <b>Source:</b> {src_title}\n"
+                f"📤 <b>Destination:</b> {dst_title}\n\n"
+                f"⏳ <i>Scanning message continuity and checking failed registry...</i>",
+                parse_mode=enums.ParseMode.HTML
+            )
+
+            try:
+                client = engine.userbot or engine.client
+                start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else None
+                end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else None
+                audit_res = await scan_channel_gaps(
+                    client=client,
+                    source_chat_id=engine.config.source_chat_id,
+                    dest_chat_id=engine.config.dest_chat_id,
+                    start_id=start_id,
+                    end_id=end_id
+                )
+                missing_ids = audit_res["missing_ids"]
+
+                if not missing_ids:
+                    clean_text = (
+                        "🎉 <b>EXCELLENT! NO GAPS FOUND</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"📥 <b>Source:</b> {src_title}\n"
+                        f"📤 <b>Destination:</b> {dst_title}\n\n"
+                        "✅ <b>Status:</b> All lectures are 100% synchronized in your destination channel.\n"
+                        "✨ Zero missing videos detected!"
+                    )
+                    clean_kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]
+                    ])
+                    await query.message.edit_text(clean_text, reply_markup=clean_kb, parse_mode=enums.ParseMode.HTML)
+                    return
+
+                id_list_str = ", ".join([f"#{i}" for i in missing_ids[:25]])
+                if len(missing_ids) > 25:
+                    id_list_str += f" ... (+{len(missing_ids) - 25} more)"
+
+                report_text = (
+                    "🔍 <b>CHANNEL GAP AUDIT REPORT</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"📥 <b>Source:</b> {src_title}\n"
+                    f"📤 <b>Destination:</b> {dst_title}\n\n"
+                    f"⚠️ <b>Detected Gaps:</b> <b>{len(missing_ids)} missing lecture(s)</b>\n"
+                    f"📋 <b>Missing IDs:</b> <code>{id_list_str}</code>\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "💡 <b>Choose how you want to restore these videos:</b>\n\n"
+                    "• <b>⚡ Restore Sequence (Shuffle):</b> Uploads missing videos and shuffles subsequent messages so lecture numbers stay in 100% perfect chronological order!\n\n"
+                    "• <b>📥 Simple Append:</b> Quickly uploads missing videos to the end of the destination channel without re-ordering."
+                )
+
+                report_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⚡ Restore Sequence (Shuffle & Order)", callback_data="action_fix_sequence_shuffle")],
+                    [InlineKeyboardButton("📥 Simple Append (Upload to End)", callback_data="action_fix_sequence_append")],
+                    [InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]
+                ])
+                await query.message.edit_text(report_text, reply_markup=report_kb, parse_mode=enums.ParseMode.HTML)
+            except Exception as e:
+                logger.error(f"Audit callback failed: {e}")
+                await query.message.edit_text(
+                    f"❌ <b>Audit Failed:</b> {e}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]]),
+                    parse_mode=enums.ParseMode.HTML
+                )
+
+        elif data == "action_fix_sequence_shuffle":
+            if not engine.config.source_chat_id or not engine.config.dest_chat_id:
+                await query.answer("⚠️ Source and Destination channels required!", show_alert=True)
+                return
+
+            if engine.is_busy():
+                await query.answer("⚠️ A task is already running. Please wait for it to finish.", show_alert=True)
+                return
+
+            dest_chat = engine.config.dest_chat_id
+
+            # Verify admin rights in destination
+            can_admin, admin_err = await check_admin_permissions(engine.bot, dest_chat)
+            if not can_admin:
+                await query.message.edit_text(
+                    f"{admin_err}\n\n"
+                    f"<i>Once you promote the bot to Admin with 'Delete Messages' enabled, tap below to continue:</i>",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Retry After Making Admin", callback_data="action_fix_sequence_shuffle")],
+                        [InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]
+                    ]),
+                    parse_mode=enums.ParseMode.HTML
+                )
+                return
+
+            await query.answer("⚡ Starting Sequential Re-Alignment...")
+            client = engine.userbot or engine.client
+            start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else None
+            end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else None
+            audit_res = await scan_channel_gaps(
+                client=client,
+                source_chat_id=engine.config.source_chat_id,
+                dest_chat_id=engine.config.dest_chat_id,
+                start_id=start_id,
+                end_id=end_id
+            )
+            missing_ids = audit_res["missing_ids"]
+            if not missing_ids:
+                await query.answer("✅ No missing gaps found!", show_alert=True)
+                return
+
+            status_msg = query.message
+            async def _realign_progress(txt: str):
+                try:
+                    await status_msg.edit_text(
+                        txt,
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏹️ Stop Alignment", callback_data="action_stop")]]),
+                        parse_mode=enums.ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+
+            engine.cancel_event.clear()
+            engine._active_job_task = asyncio.current_task()
+            res = await realign_channel_sequence(engine, missing_ids, progress_callback=_realign_progress)
+
+            if not res.get("success", False):
+                await query.message.edit_text(
+                    f"{res.get('error', 'Unknown Error')}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="action_audit_gaps")]]),
+                    parse_mode=enums.ParseMode.HTML
+                )
+                return
+
+            recovered = res.get("recovered", [])
+            failed = res.get("failed", [])
+
+            summary_text = (
+                "🏁 <b>SEQUENCE RESTORATION COMPLETED!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"✅ <b>Successfully Re-Aligned:</b> <b>{len(recovered)}</b> videos\n"
+                f"❌ <b>Remaining Failures:</b> <b>{len(failed)}</b>\n\n"
+                "✨ <b>Result:</b> All recovered videos have been placed into their exact chronological order! "
+                "The subsequent messages were server-side copied and old duplicates cleaned up. Perfect sequence achieved! 🎉"
+            )
+            await query.message.edit_text(
+                summary_text,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]]),
+                parse_mode=enums.ParseMode.HTML
+            )
+
+        elif data == "action_fix_sequence_append":
+            if not engine.config.source_chat_id or not engine.config.dest_chat_id:
+                await query.answer("⚠️ Source and Destination channels required!", show_alert=True)
+                return
+
+            if engine.is_busy():
+                await query.answer("⚠️ A task is already running.", show_alert=True)
+                return
+
+            engine.owner_id = user_id
+            await query.answer("📥 Starting Simple Append Backfill...")
+            client = engine.userbot or engine.client
+            start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else None
+            end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else None
+            audit_res = await scan_channel_gaps(
+                client=client,
+                source_chat_id=engine.config.source_chat_id,
+                dest_chat_id=engine.config.dest_chat_id,
+                start_id=start_id,
+                end_id=end_id
+            )
+            missing_ids = audit_res["missing_ids"]
+            if not missing_ids:
+                await query.answer("✅ No missing gaps found!", show_alert=True)
+                return
+
+            await query.message.edit_text(
+                f"📥 <b>Backfilling {len(missing_ids)} Missing Videos...</b>\n\n"
+                f"⏳ <i>Uploading to the end of destination channel...</i>",
+                parse_mode=enums.ParseMode.HTML
+            )
+
+            recovered_count = 0
+            for idx, fid in enumerate(missing_ids, 1):
+                if engine.cancel_event.is_set():
+                    break
+                try:
+                    fetch_res = await client.get_messages(engine.config.source_chat_id, message_ids=[fid])
+                    t_msg = fetch_res[0] if isinstance(fetch_res, list) and fetch_res else fetch_res
+                    if t_msg and not t_msg.empty:
+                        await engine._migrate_single_message(t_msg)
+                        from migration import remove_failed_message
+                        remove_failed_message(engine.config.source_chat_id, engine.config.dest_chat_id, fid)
+                        recovered_count += 1
+                except Exception as bf_e:
+                    logger.warning(f"Append failed for #{fid}: {bf_e}")
+
+            await query.message.edit_text(
+                f"🏁 <b>Backfill Completed!</b>\n\n"
+                f"✅ Successfully uploaded <b>{recovered_count} / {len(missing_ids)}</b> missing videos to the end of the destination channel.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]]),
+                parse_mode=enums.ParseMode.HTML
+            )
 
     @bot.on_callback_query()
     async def handle_callback_query(_, query: CallbackQuery):
