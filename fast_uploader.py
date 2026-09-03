@@ -85,6 +85,17 @@ async def reset_client_sessions(client: Optional[Client] = None) -> None:
     except Exception:
         pass
     try:
+        fast_pool = getattr(client, "_fast_media_pool", [])
+        for sess in list(fast_pool):
+            try:
+                await sess.stop()
+            except Exception:
+                pass
+        if hasattr(client, "_fast_media_pool") and isinstance(client._fast_media_pool, list):
+            client._fast_media_pool.clear()
+    except Exception:
+        pass
+    try:
         session = getattr(client, "session", None)
         if session and hasattr(session, "restart"):
             await session.restart()
@@ -159,20 +170,49 @@ async def fast_save_file(
             test_mode = await self.storage.test_mode()
             auth_key = await self.storage.auth_key()
 
+            if not hasattr(self, "_fast_media_pool") or not isinstance(self._fast_media_pool, list):
+                self._fast_media_pool = []
+
+            # Reuse existing warm sessions that are still connected
+            active_pool: List[Session] = []
+            for s in self._fast_media_pool:
+                if s and hasattr(s, "is_started") and s.is_started.is_set():
+                    active_pool.append(s)
+                else:
+                    try:
+                        await s.stop()
+                    except Exception:
+                        pass
+
             # 5 Parallel Media TCP sockets = ~28-35 MB/s sustained upload throughput
-            num_sessions = 5 if total_parts > 30 else (3 if total_parts > 4 else 1)
-            for _ in range(num_sessions):
-                s = Session(
-                    self, dc_id,
-                    auth_key,
-                    test_mode,
-                    is_media=True
-                )
-                await s.start()
-                sessions.append(s)
+            desired_sessions = 5 if total_parts > 30 else (3 if total_parts > 4 else 1)
+            # Create additional sessions up to desired count with resilient individual attempts
+            while len(active_pool) < desired_sessions:
+                try:
+                    s = Session(
+                        self, dc_id,
+                        auth_key,
+                        test_mode,
+                        is_media=True
+                    )
+                    await s.start()
+                    active_pool.append(s)
+                except Exception as sess_err:
+                    logger.debug(f"Auxiliary media socket notice: {sess_err}")
+                    if len(active_pool) >= 2:
+                        break
+                    await asyncio.sleep(0.5)
+                    try:
+                        s = Session(self, dc_id, auth_key, test_mode, is_media=True)
+                        await s.start()
+                        active_pool.append(s)
+                    except Exception:
+                        break
+
+            self._fast_media_pool = active_pool
+            sessions = list(active_pool)
         except Exception as sess_err:
-            logger.debug(f"Media upload session pool fallback to primary session: {sess_err}")
-            sessions = [getattr(self, "session", None)]
+            logger.debug(f"Media upload session pool fallback notice: {sess_err}")
 
     if not sessions:
         sessions = [getattr(self, "session", None)]
@@ -314,8 +354,9 @@ async def fast_save_file(
             return raw.types.InputFile(id=file_id, parts=total_parts, name=file_name, md5_checksum="")
     finally:
         watchdog_done.set()
+        pool_set = set(getattr(self, "_fast_media_pool", []))
         for s in sessions:
-            if s and s != getattr(self, "session", None):
+            if s and s != getattr(self, "session", None) and s not in pool_set:
                 try:
                     await s.stop()
                 except Exception:
