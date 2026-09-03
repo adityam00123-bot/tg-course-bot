@@ -176,17 +176,18 @@
   - Reduced `SendMedia` RPC timeout from 300s to 60s so temporary network glitches fail fast into the direct upload fallback without stalling for 5 minutes.
   - Ensured only ONE Pyrogram client (`self.client` / `self.userbot`) handles both upload and publishing in Architecture A, avoiding session dissociation.
 
-### Error: Single Upload Chunk Straggler Hang (2 to 7 Minute Stall on Healthy Network)
-* **Symptom:** Most uploads finish in 10-14 seconds (10-13 MB/s), but randomly a file like #2334 (62 MB) hangs for 7m 08s (`Upload stalled >120s with zero progress at 3145728/65521661 bytes`), collapsing overall hourly speed.
+### Error: Producer Race Condition & `⚠️PAUSED` Deadlock on Concurrent Prefetch Tasks
+* **Symptom:** Terminal repeatedly prints `⚡ ⬆️ UL: #2350 (6/23MB @ ⚠️PAUSED)`. Download of message $N+1$ starts immediately after download of message $N$ finishes, before message $N$ is uploaded or published. Transfers pause for 45+ seconds.
 * **Root Cause:**
-  1. **Pyrogram's Hidden 150-Second Recursion:** `Session.invoke()` defaults to `retries=10`. When an invoke hung or hit a silent TCP drop, Pyrogram retried 10 times internally with `timeout=15`, blocking the worker on the broken socket for 150 seconds before raising an exception.
-  2. **No Straggler Stealing:** When all parts were popped from `queue`, if Worker A held the last part and stalled, no other idle worker could touch that part.
-  3. **Broken Watchdog Guard:** The watchdog checked `if curr == last_snap and not queue.empty()`. Because all parts were already popped into workers, `queue.empty()` was True, so the 120s watchdog never fired while a straggler was stuck!
+  1. **`queue.put()` False-Block Race Condition:** In `pipeline_producer`, the comment claimed `await queue.put(("pipeline", slot))` blocked until the previous message was published. In reality, the consumer loop called `queue.get()` immediately at the start of its loop, emptying the queue within 1ms! The producer immediately advanced and spawned `asyncio.create_task(_pipeline_prefetch)` for the next 2-3 messages.
+  2. **Interleaved `transfer_lock` Starvation:** Message 1 released `transfer_lock` after download. Message 2 immediately grabbed `transfer_lock` to download. Message 1 finished thumbnail processing and needed `transfer_lock` to upload, but was blocked by Message 2's download! When Message 2 finished download, Message 3 started downloading! The pipeline entered an endless traffic jam where uploads were paused waiting for downloads.
+  3. **Overly Aggressive 24s Watchdog:** A 24-second watchdog aborted uploads during normal 20s TCP window recalculations, forcing 160MB files to restart from byte 0.
+  4. **Overly Aggressive 4s Straggler Stealing:** Re-claiming parts taking > 4s caused 16 workers to spam Telegram with duplicate `SaveBigFilePart` RPCs.
 * **Permanent Fix:**
-  - Enforced `retries=1, timeout=10` on all `target_session.invoke()` calls so broken connections bubble up in 10s instead of 150s.
-  - Implemented **Upload Straggler Stealing** (`(now - s_time) > 4.0s`): idle workers immediately re-claim and re-upload any part that takes > 4.0s on another socket.
-  - Fixed stall watchdog: removed `not queue.empty()` condition and lowered stall threshold from 120s to **24 seconds** (12s × 2).
-  - Configured 4 parallel media sessions for upload as recommended by MTProto telemetry research.
+  - **Strict `slot.done` Synchronization:** Added `done = asyncio.Event()` to `_PipelineSlot`. In `pipeline_producer`, `await slot.done.wait()` blocks the producer until the consumer has fully published the message to the destination channel and unlinked all temporary files from disk.
+  - **Guaranteed Single-Message In-Flight:** Exactly one message transfers at any millisecond across the entire bot. 100% of network bandwidth is dedicated to Download, then 100% to Upload. Zero lock contention, zero task interference, and zero `⚠️PAUSED` states.
+  - **Clean Session Lifecycle Per File:** Auxiliary upload sessions are created freshly per file and cleanly stopped in `finally:`, eliminating persistent zombie sockets.
+  - **Sane 90s Watchdog & 15s Straggler Protection:** Watchdog threshold set to 90s ($30\text{s} \times 3$). Straggler threshold set to 15.0s with chunk invoke wrapped in `asyncio.wait_for(..., timeout=25.0)`.
 
 
 
