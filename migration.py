@@ -2449,10 +2449,10 @@ class MigrationEngine:
                 total_cpus = os.cpu_count() or 2
                 has_gpu = bool(shutil.which("nvidia-smi"))
 
-                # Architecture A: Strict Sequential Turbo
-                # Transfer lock enforces strict mutual-exclusion between DL (40 MB/s) and UL (55 MB/s)
-                # Eliminates event loop contention, MTProto head-of-line blocking, and Kaggle disk stalls!
-                transfer_lock = asyncio.Lock()
+                # True Sliding Window Conveyor Belt Pipeline
+                # Dedicated _fast_media_pool (5 UL sockets) & _fast_dl_pools (6 DL sockets) allow
+                # concurrent Download of N+1 and Upload of N with ZERO session contention!
+                transfer_lock = None
                 num_downloads = 1
                 num_uploads = 1
                 num_ffmpeg = max(2, min(total_cpus, 4))
@@ -2468,20 +2468,18 @@ class MigrationEngine:
                 
                 hw_type = "GPU (NVENC)" if has_gpu else "Standard CPU"
                 logger.info(
-                    f"🚀 [Pipeline] Strict Sequential Turbo (Architecture A) ACTIVE ({hw_type}) — "
-                    f"40 MB/s Download -> 55 MB/s Upload (Zero Contention) | "
+                    f"🚀 [Pipeline] True Sliding Window Conveyor Belt ACTIVE ({hw_type}) — "
+                    f"Simultaneous DL (N+1) & UL (N) | Max disk footprint: 2 files (~2-4 GB) | "
                     f"Disk buffer budget ~{budget_mb} MB"
                 )
 
-                # In Architecture A, transfer_lock serializes DL and UL on the unified client.
-                # Zero duplicate clients, zero session collisions, zero auth key desync!
                 downloader_pool = None
                 uploader_pool = None
-                logger.info("⚡ [Pipeline] Unified MTProto Client Engine active for Sequential Turbo.")
+                logger.info("⚡ [Pipeline] Decoupled MTProto Engine active (5 Upload Sockets + 6 Download Sockets).")
 
-            # -- Strict Sequential Streaming Pipeline (Architecture A) --
-            # maxsize=1 guarantees 1 active media message at a time: zero disk accumulation, zero concurrency conflict
-            queue = asyncio.Queue(maxsize=1)
+            # -- Sliding Window Conveyor Belt Queue (maxsize=2) --
+            # maxsize=2 allows Video N to upload while Video N+1 downloads concurrently!
+            queue = asyncio.Queue(maxsize=2)
             producer_done = asyncio.Event()
             
             async def pipeline_producer():
@@ -2542,7 +2540,7 @@ class MigrationEngine:
             self._active_pipeline_tasks.add(prod_task)
             prod_task.add_done_callback(lambda t: self._active_pipeline_tasks.discard(t))
             if pipeline_active:
-                logger.info("🔄 [Pipeline] Strict Sequential Turbo Pipeline Started (1 active message at a time)")
+                logger.info("🔄 [Pipeline] True Sliding Window Conveyor Belt Started (Concurrent DL of N+1 & UL of N)")
             else:
                 logger.info("🔄 [Pipeline] Direct Mode Stream Started")
 

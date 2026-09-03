@@ -538,25 +538,55 @@ async def fast_download_media(
             num_workers = min(getattr(self, "max_concurrent_transmissions", 12) or 12, total_parts)
             num_workers = max(1, min(num_workers, 16))
 
-            async def _dl_worker():
+            completed_parts: set = set()
+            part_start_times: dict = {}
+            lock = asyncio.Lock()
+            dl_done = asyncio.Event()
+
+            async def _dl_worker(worker_id: int):
                 nonlocal downloaded_bytes, dl_error
-                while not part_queue.empty() and dl_error is None:
+                while len(completed_parts) < total_parts and dl_error is None and not dl_done.is_set():
+                    part_info = None
                     try:
-                        part_idx, offset = part_queue.get_nowait()
+                        part_info = part_queue.get_nowait()
                     except asyncio.QueueEmpty:
-                        break
+                        pass
+
+                    if part_info is None:
+                        # Queue is empty: check for stalled straggler parts taking >3.0s
+                        async with lock:
+                            now = time.time()
+                            straggler_idx = None
+                            for p_idx, s_time in list(part_start_times.items()):
+                                if p_idx not in completed_parts and (now - s_time) > 3.0:
+                                    straggler_idx = p_idx
+                                    part_start_times[p_idx] = now  # claim straggler
+                                    break
+                        if straggler_idx is not None:
+                            part_info = (straggler_idx, straggler_idx * chunk_size)
+                        else:
+                            if len(completed_parts) >= total_parts or dl_error is not None:
+                                break
+                            try:
+                                await asyncio.wait_for(dl_done.wait(), timeout=0.25)
+                            except asyncio.TimeoutError:
+                                pass
+                            continue
+
+                    part_idx, offset = part_info
+                    part_start_times[part_idx] = time.time()
 
                     part_attempts = 0
-                    max_part_attempts = 15
+                    max_part_attempts = 10
                     chunk_data = None
-                    session_idx = part_idx % len(sessions)
+                    session_idx = (part_idx + worker_id) % len(sessions)
 
-                    while part_attempts < max_part_attempts and dl_error is None:
+                    while part_attempts < max_part_attempts and part_idx not in completed_parts and dl_error is None:
                         target_session = sessions[session_idx % len(sessions)]
                         try:
                             r = await target_session.invoke(
                                 raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
-                                timeout=15,
+                                timeout=5,
                                 sleep_threshold=30
                             )
                             if isinstance(r, raw.types.upload.File):
@@ -577,29 +607,32 @@ async def fast_download_media(
                                         await target_session.invoke(raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes))
                                 except Exception:
                                     pass
-                            session_idx += 1  # rotate to next healthy socket in the pool
+                            session_idx += 1  # rotate to next healthy socket immediately
                             if part_attempts >= max_part_attempts:
                                 dl_error = err
                                 break
-                            await asyncio.sleep(min(0.2 * (1.5 ** min(part_attempts, 6)), 2.5))
+                            await asyncio.sleep(0.05)
 
-                    if chunk_data is not None:
+                    if chunk_data is not None and part_idx not in completed_parts:
                         async with file_lock:
-                            out_fp.seek(offset)
-                            out_fp.write(chunk_data)
+                            if part_idx not in completed_parts:
+                                out_fp.seek(offset)
+                                out_fp.write(chunk_data)
+                                completed_parts.add(part_idx)
+                                downloaded_bytes += len(chunk_data)
+                                if len(completed_parts) >= total_parts:
+                                    dl_done.set()
 
-                        async with progress_lock:
-                            downloaded_bytes += len(chunk_data)
-                            if progress:
-                                try:
-                                    res_prog = progress(downloaded_bytes, file_size, *progress_args)
-                                    if asyncio.iscoroutine(res_prog):
-                                        await res_prog
-                                except Exception:
-                                    pass
+                        if progress:
+                            try:
+                                res_prog = progress(downloaded_bytes, file_size, *progress_args)
+                                if asyncio.iscoroutine(res_prog):
+                                    await res_prog
+                            except Exception:
+                                pass
 
             try:
-                workers = [asyncio.create_task(_dl_worker()) for _ in range(num_workers)]
+                workers = [asyncio.create_task(_dl_worker(w_id)) for w_id in range(num_workers)]
                 await asyncio.gather(*workers)
 
                 if dl_error is not None:
