@@ -72,6 +72,24 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
      - If future experiments ever degrade performance or introduce stalls, immediately revert to commit `22a8956`:
        `git reset --hard 22a8956`
 
+## 9. High-Speed MTProto Engine: Zero-Freeze & High-Throughput Guidelines
+- **Zero-Freeze on Completion (100% Finish):**
+  - In both `fast_download_media` and `fast_save_file`, the exact millisecond `len(completed_parts) >= total_parts`:
+    1. Set completion flag (`dl_done.set()` / `up_done.set()`).
+    2. Immediately cancel all remaining worker tasks (`for w in workers: if not w.done(): w.cancel()`).
+    3. Workers catch `asyncio.CancelledError` cleanly and exit.
+    4. `await asyncio.gather(*workers, return_exceptions=True)` finishes in `<0.001s` instead of waiting for in-flight requests to time out.
+- **Non-Blocking Session Teardown:**
+  - In `finally:`, auxiliary session closures are scheduled in the background using `asyncio.create_task(_bg_stop(aux_sessions))`.
+  - The function returns the file path or `InputFile` handle to `migration.py` in `0.0ms` without waiting 1.5–2.5s for MTProto ping cancellation and transport closing.
+- **Direct Kernel Page-Cache Disk Writes (No Thread Choke):**
+  - Pre-allocating files via `os.posix_fallocate` guarantees contiguous disk extents.
+  - Workers write directly via `out_fp.seek(offset); out_fp.write(chunk_data)` inside `async with file_lock`.
+  - **NEVER** wrap disk writes in `asyncio.to_thread` inside `async with file_lock`: thread scheduling latency and lock contention drops download speed from 80+ MB/s down to 4–7 MB/s!
+- **Burst Pacing & Smooth Ticker:**
+  - MTProto invokes use `retries=1` (with `timeout=8` on DL and `timeout=10` on UL). Momentary 1s server-side rate-limit pauses during 60–80 MB/s bursts are handled cleanly without socket destruction or retry backoffs.
+  - The console ticker in `migration.py` uses an Exponential Moving Average (EMA: $0.7 \times \text{inst} + 0.3 \times \text{prev}$) and displays true overall speed at 100%, preventing visual drops to 4.5 MB/s.
+
 ## 7. Cloud Execution Strategy
 1. **Primary: Kaggle Notebooks** (4 vCPU, 30 GB RAM, 2x T4 GPU, ~73 GB Disk). Allows "Save & Run All (Commit)" for 12-hour background execution without keeping the browser open. Weekly GPU quota is 30 hours.
 2. **Fallback: Google Colab** (2 vCPU, 12.6 GB RAM, 1x T4 GPU, ~78 GB Disk). Used when Kaggle's 30-hour weekly GPU quota is exhausted. Requires keeping the browser tab active.

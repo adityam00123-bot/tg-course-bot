@@ -277,6 +277,8 @@ async def fast_save_file(
                 stall_rounds = 0
             last_snap = curr
 
+    workers: list = []
+
     async def _worker(worker_id: int):
         nonlocal uploaded_bytes, upload_error
         fp = None if is_stream else open(file_path, "rb")
@@ -356,10 +358,10 @@ async def fast_save_file(
                     target_session = sessions[session_idx % len(sessions)] or getattr(self, "session", None)
                     t_chunk_start = time.time()
                     try:
-                        # Wrap with 25s timeout so writer.drain() or TCP stall cannot hang worker indefinitely
+                        # 10s MTProto timeout with retries=1 and 18s wait_for wrapper prevents indefinite hang
                         res = await asyncio.wait_for(
-                            target_session.invoke(rpc, timeout=15, sleep_threshold=60),
-                            timeout=25.0
+                            target_session.invoke(rpc, timeout=10, retries=1, sleep_threshold=60),
+                            timeout=18.0
                         )
                         if res is True or res:
                             part_ack = True
@@ -394,6 +396,10 @@ async def fast_save_file(
                             uploaded_bytes += len(chunk)
                             if len(completed_parts) >= total_parts:
                                 up_done.set()
+                                # Instant completion: cancel all remaining in-flight worker tasks
+                                for w in workers:
+                                    if not w.done():
+                                        w.cancel()
 
                     if progress:
                         try:
@@ -407,6 +413,8 @@ async def fast_save_file(
                         f"Upload failed: Part {part_idx + 1}/{total_parts} could not be uploaded after {max_part_attempts} attempts."
                     )
                     break
+        except asyncio.CancelledError:
+            return
         finally:
             if fp:
                 try:
@@ -416,10 +424,10 @@ async def fast_save_file(
 
     try:
         watchdog_task = asyncio.create_task(_stall_watchdog())
-        workers = [asyncio.create_task(_worker(w_id)) for w_id in range(num_workers)]
+        workers.extend(asyncio.create_task(_worker(w_id)) for w_id in range(num_workers))
         await asyncio.gather(*workers, return_exceptions=True)
         watchdog_done.set()
-        await watchdog_task
+        watchdog_task.cancel()
 
         if upload_error is not None:
             raise upload_error
@@ -433,9 +441,17 @@ async def fast_save_file(
             return raw.types.InputFile(id=file_id, parts=total_parts, name=file_name, md5_checksum="")
     finally:
         watchdog_done.set()
-        stop_coros = [s.stop() for s in sessions if s and s != getattr(self, "session", None)]
-        if stop_coros:
-            await asyncio.gather(*stop_coros, return_exceptions=True)
+        # Clean background teardown: do not block return path on session close
+        aux_sessions = [s for s in sessions if s and s != getattr(self, "session", None)]
+        if aux_sessions:
+            async def _bg_stop_upload_sessions(sess_list):
+                try:
+                    stop_coros = [s.stop() for s in sess_list if s]
+                    if stop_coros:
+                        await asyncio.gather(*stop_coros, return_exceptions=True)
+                except Exception:
+                    pass
+            asyncio.create_task(_bg_stop_upload_sessions(aux_sessions))
 
 
 # Monkeypatch Pyrogram Client.save_file to use our robust uploader
@@ -585,115 +601,120 @@ async def fast_download_media(
             part_start_times: dict = {}
             lock = asyncio.Lock()
             dl_done = asyncio.Event()
-
-            def _sync_write_chunk(fp, pos: int, data: bytes):
-                fp.seek(pos)
-                fp.write(data)
+            workers: list = []
 
             async def _dl_worker(worker_id: int):
                 nonlocal downloaded_bytes, dl_error
-                while len(completed_parts) < total_parts and dl_error is None and not dl_done.is_set():
-                    part_info = None
-                    try:
-                        part_info = part_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-
-                    is_stolen = False
-                    if part_info is None:
-                        # Queue is empty: check for stalled straggler parts
-                        # When remaining uncompleted parts <= 4, drop threshold to 2.5s for fast tail-finish
-                        async with lock:
-                            now = time.time()
-                            straggler_idx = None
-                            remaining_uncompleted = total_parts - len(completed_parts)
-                            tail_threshold = 2.5 if remaining_uncompleted <= 4 else 8.0
-                            for p_idx, s_time in list(part_start_times.items()):
-                                if p_idx not in completed_parts and (now - s_time) > tail_threshold:
-                                    straggler_idx = p_idx
-                                    part_start_times[p_idx] = now  # claim straggler
-                                    is_stolen = True
-                                    break
-                        if straggler_idx is not None:
-                            part_info = (straggler_idx, straggler_idx * chunk_size)
-                        else:
-                            if len(completed_parts) >= total_parts or dl_error is not None:
-                                break
-                            try:
-                                await asyncio.wait_for(dl_done.wait(), timeout=0.25)
-                            except asyncio.TimeoutError:
-                                pass
-                            continue
-
-                    part_idx, offset = part_info
-                    part_start_times[part_idx] = time.time()
-
-                    part_attempts = 0
-                    max_part_attempts = 8
-                    chunk_data = None
-                    # Strict round-robin across both sockets (if stolen, route to alternate socket)
-                    session_idx = (part_idx + (1 if is_stolen else 0)) % len(sessions)
-
-                    while part_attempts < max_part_attempts and part_idx not in completed_parts and dl_error is None:
-                        target_session = sessions[session_idx % len(sessions)]
+                try:
+                    while len(completed_parts) < total_parts and dl_error is None and not dl_done.is_set():
+                        part_info = None
                         try:
-                            # 15s MTProto timeout with retries=0 for instant socket rotation on lag
-                            r = await asyncio.wait_for(
-                                target_session.invoke(
-                                    raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
-                                    timeout=15,
-                                    retries=0,
-                                    sleep_threshold=30
-                                ),
-                                timeout=20.0
-                            )
-                            if isinstance(r, raw.types.upload.File):
-                                chunk_data = r.bytes
-                                break
-                            elif isinstance(r, raw.types.upload.FileCdnRedirect):
-                                raise NotImplementedError("CDN redirect handled by fallback")
-                        except Exception as err:
-                            part_attempts += 1
-                            err_l = str(err).lower()
-                            if any(k in err_l for k in ("file_reference_expired", "filereferenceexpired")):
-                                dl_error = err
-                                break
-                            # Do NOT restart session on transient timeouts (restarting tears down socket for all other workers!)
-                            # Only restart if the socket was physically closed or broken:
-                            if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "closed=true")):
+                            part_info = part_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+
+                        is_stolen = False
+                        if part_info is None:
+                            # Queue is empty: check for stalled straggler parts
+                            # When remaining uncompleted parts <= 4, drop threshold to 2.5s for fast tail-finish
+                            async with lock:
+                                now = time.time()
+                                straggler_idx = None
+                                remaining_uncompleted = total_parts - len(completed_parts)
+                                tail_threshold = 2.5 if remaining_uncompleted <= 4 else 8.0
+                                for p_idx, s_time in list(part_start_times.items()):
+                                    if p_idx not in completed_parts and (now - s_time) > tail_threshold:
+                                        straggler_idx = p_idx
+                                        part_start_times[p_idx] = now  # claim straggler
+                                        is_stolen = True
+                                        break
+                            if straggler_idx is not None:
+                                part_info = (straggler_idx, straggler_idx * chunk_size)
+                            else:
+                                if len(completed_parts) >= total_parts or dl_error is not None:
+                                    break
                                 try:
-                                    await _safe_session_restart(target_session)
-                                    if dc_id != await self.storage.dc_id():
-                                        exp_fresh = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
-                                        await target_session.invoke(raw.functions.auth.ImportAuthorization(id=exp_fresh.id, bytes=exp_fresh.bytes))
+                                    await asyncio.wait_for(dl_done.wait(), timeout=0.25)
+                                except asyncio.TimeoutError:
+                                    pass
+                                continue
+
+                        part_idx, offset = part_info
+                        part_start_times[part_idx] = time.time()
+
+                        part_attempts = 0
+                        max_part_attempts = 8
+                        chunk_data = None
+                        # Strict round-robin across both sockets (if stolen, route to alternate socket)
+                        session_idx = (part_idx + (1 if is_stolen else 0)) % len(sessions)
+
+                        while part_attempts < max_part_attempts and part_idx not in completed_parts and dl_error is None:
+                            target_session = sessions[session_idx % len(sessions)]
+                            try:
+                                # 8s MTProto timeout with retries=1 and 15s wait_for wrapper prevents hang
+                                r = await asyncio.wait_for(
+                                    target_session.invoke(
+                                        raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
+                                        timeout=8,
+                                        retries=1,
+                                        sleep_threshold=30
+                                    ),
+                                    timeout=15.0
+                                )
+                                if isinstance(r, raw.types.upload.File):
+                                    chunk_data = r.bytes
+                                    break
+                                elif isinstance(r, raw.types.upload.FileCdnRedirect):
+                                    raise NotImplementedError("CDN redirect handled by fallback")
+                            except Exception as err:
+                                part_attempts += 1
+                                err_l = str(err).lower()
+                                if any(k in err_l for k in ("file_reference_expired", "filereferenceexpired")):
+                                    dl_error = err
+                                    break
+                                # Do NOT restart session on transient timeouts (restarting tears down socket for all other workers!)
+                                # Only restart if the socket was physically closed or broken:
+                                if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "closed=true")):
+                                    try:
+                                        await _safe_session_restart(target_session)
+                                        if dc_id != await self.storage.dc_id():
+                                            exp_fresh = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                                            await target_session.invoke(raw.functions.auth.ImportAuthorization(id=exp_fresh.id, bytes=exp_fresh.bytes))
+                                    except Exception:
+                                        pass
+                                session_idx += 1  # rotate to next healthy socket immediately
+                                if part_attempts >= max_part_attempts:
+                                    dl_error = err
+                                    break
+                                await asyncio.sleep(0.1)
+
+                        if chunk_data is not None and part_idx not in completed_parts:
+                            async with file_lock:
+                                if part_idx not in completed_parts:
+                                    out_fp.seek(offset)
+                                    out_fp.write(chunk_data)
+                                    completed_parts.add(part_idx)
+                                    downloaded_bytes += len(chunk_data)
+                                    if len(completed_parts) >= total_parts:
+                                        dl_done.set()
+                                        # Instant completion: cancel all remaining in-flight worker tasks
+                                        for w in workers:
+                                            if not w.done():
+                                                w.cancel()
+
+                            if progress:
+                                try:
+                                    res_prog = progress(downloaded_bytes, file_size, *progress_args)
+                                    if asyncio.iscoroutine(res_prog):
+                                        await res_prog
                                 except Exception:
                                     pass
-                            session_idx += 1  # rotate to next healthy socket immediately
-                            if part_attempts >= max_part_attempts:
-                                dl_error = err
-                                break
-                            await asyncio.sleep(0.1)
-
-                    if chunk_data is not None and part_idx not in completed_parts:
-                        async with file_lock:
-                            if part_idx not in completed_parts:
-                                await asyncio.to_thread(_sync_write_chunk, out_fp, offset, chunk_data)
-                                completed_parts.add(part_idx)
-                                downloaded_bytes += len(chunk_data)
-                                if len(completed_parts) >= total_parts:
-                                    dl_done.set()
-
-                        if progress:
-                            try:
-                                res_prog = progress(downloaded_bytes, file_size, *progress_args)
-                                if asyncio.iscoroutine(res_prog):
-                                    await res_prog
-                            except Exception:
-                                pass
+                except asyncio.CancelledError:
+                    return
 
             try:
-                workers = [asyncio.create_task(_dl_worker(w_id)) for w_id in range(num_workers)]
-                await asyncio.gather(*workers)
+                workers.extend(asyncio.create_task(_dl_worker(w_id)) for w_id in range(num_workers))
+                await asyncio.gather(*workers, return_exceptions=True)
 
                 if dl_error is not None:
                     raise dl_error
@@ -708,9 +729,17 @@ async def fast_download_media(
                 except Exception:
                     pass
         finally:
-            stop_coros = [s.stop() for s in sessions if s and s != getattr(self, "session", None)]
-            if stop_coros:
-                await asyncio.gather(*stop_coros, return_exceptions=True)
+            # Clean background teardown: do not block return path on session close
+            aux_sessions = [s for s in sessions if s and s != getattr(self, "session", None)]
+            if aux_sessions:
+                async def _bg_stop_download_sessions(sess_list):
+                    try:
+                        stop_coros = [s.stop() for s in sess_list if s]
+                        if stop_coros:
+                            await asyncio.gather(*stop_coros, return_exceptions=True)
+                    except Exception:
+                        pass
+                asyncio.create_task(_bg_stop_download_sessions(aux_sessions))
 
     except Exception as e:
         logger.debug(f"Parallel chunk download exception: {e}")

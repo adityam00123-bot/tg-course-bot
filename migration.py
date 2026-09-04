@@ -392,9 +392,18 @@ class MigrationEngine:
             dt = now - entry["last_time"]
             if dt >= 1.0:
                 db = current - entry["last_bytes"]
-                entry["speed"] = max(0.0, (db / 1048576) / max(dt, 0.1))
+                inst_spd = max(0.0, (db / 1048576) / max(dt, 0.1))
+                if entry["speed"] > 0:
+                    entry["speed"] = 0.7 * inst_spd + 0.3 * entry["speed"]
+                else:
+                    entry["speed"] = inst_spd
                 entry["last_bytes"] = current
                 entry["last_time"] = now
+
+            if total > 0 and current >= total:
+                # At 100% completion, display true overall speed instead of tail-end interval drop
+                dur = max(now - entry["start_time"], 0.1)
+                entry["speed"] = (total / 1048576) / dur
 
     def _clear_progress_line(self):
         """Clears the in-place \\r progress line before printing a new logger line."""
