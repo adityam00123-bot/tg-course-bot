@@ -534,37 +534,24 @@ async def fast_download_media(
         chunk_size = 1024 * 1024  # 1MB per MTProto part (strictly divisible by 4096)
         total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
 
-        if total_parts > 4:
+        # Up to 4 Parallel Media TCP sockets for files >30 parts, 3 for >10, 2 for >4 (matching fast_save_file)
+        num_target_sessions = 4 if total_parts > 30 else (3 if total_parts > 10 else (2 if total_parts > 4 else 1))
+        while len(sessions) < num_target_sessions:
             try:
-                s2 = Session(
+                s_extra = Session(
                     self, dc_id,
                     auth_key,
                     await self.storage.test_mode(),
                     is_media=True
                 )
-                await s2.start()
+                await s_extra.start()
                 if dc_id != await self.storage.dc_id():
-                    exp2 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
-                    await s2.invoke(raw.functions.auth.ImportAuthorization(id=exp2.id, bytes=exp2.bytes))
-                sessions.append(s2)
-            except Exception as s2_err:
-                logger.debug(f"Media download session expansion fallback: {s2_err}")
-
-        if total_parts > 20 and len(sessions) >= 2:
-            try:
-                s3 = Session(
-                    self, dc_id,
-                    auth_key,
-                    await self.storage.test_mode(),
-                    is_media=True
-                )
-                await s3.start()
-                if dc_id != await self.storage.dc_id():
-                    exp3 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
-                    await s3.invoke(raw.functions.auth.ImportAuthorization(id=exp3.id, bytes=exp3.bytes))
-                sessions.append(s3)
-            except Exception as s3_err:
-                logger.debug(f"Media download 3rd session expansion fallback: {s3_err}")
+                    exp_extra = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                    await s_extra.invoke(raw.functions.auth.ImportAuthorization(id=exp_extra.id, bytes=exp_extra.bytes))
+                sessions.append(s_extra)
+            except Exception as sess_err:
+                logger.debug(f"Media download session expansion fallback: {sess_err}")
+                break
 
         try:
             part_queue: asyncio.Queue = asyncio.Queue()
@@ -590,9 +577,10 @@ async def fast_download_media(
 
             out_fp = open(out_path, "r+b")
 
-            # 2 workers per dedicated TCP session eliminates socket contention & dogpiling
-            num_workers = min(len(sessions) * 2, total_parts)
-            num_workers = max(1, min(num_workers, 6))
+            # Dedicated high-speed download workers pipelining across the session pool (~3-4 in-flight 1MB chunks per socket)
+            # Exactly mirrors high-speed upload configuration (which delivers ~35 MB/s)
+            num_workers = min(getattr(self, "max_concurrent_transmissions", 14) or 14, total_parts)
+            num_workers = max(1, min(num_workers, 16))
 
             completed_parts: set = set()
             part_start_times: dict = {}
