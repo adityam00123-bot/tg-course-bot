@@ -373,19 +373,13 @@ async def fast_save_file(
                         )
                         if res is True or res:
                             part_ack = True
-                            # If a 512KB chunk took unusually long (>4.0s = <128 KB/s), refresh that socket in background
-                            chunk_dur = time.time() - t_chunk_start
-                            if chunk_dur > 4.0 and len(sessions) > 1:
-                                try:
-                                    asyncio.create_task(_safe_session_restart(target_session))
-                                except Exception:
-                                    pass
                             break
                     except Exception as err:
                         part_attempts += 1
                         err_str = str(err).lower()
                         # Auto-recover broken or closed socket without dropping parts
-                        if any(k in err_str for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "operation on", "closed=true", "timed out", "timeout")):
+                        # Do NOT restart session on transient timeouts (restarting tears down socket for all other workers!)
+                        if any(k in err_str for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "closed=true")):
                             try:
                                 await _safe_session_restart(target_session)
                             except Exception:
