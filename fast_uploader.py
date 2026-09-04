@@ -25,14 +25,6 @@ try:
 except Exception:
     pass
 
-# Upgrade Pyrogram TCP transport read timeout from 10s to 60s
-# Prevents connection drops when Telegram server pauses data during high-speed bursts (>80 MB/s)
-try:
-    from pyrogram.connection.transport.tcp.tcp import TCP
-    TCP.TIMEOUT = 60
-except Exception as e:
-    logger.debug(f"Could not set TCP.TIMEOUT: {e}")
-
 
 
 # ---------------------------------------------------------------------------
@@ -373,13 +365,19 @@ async def fast_save_file(
                         )
                         if res is True or res:
                             part_ack = True
+                            # If a 512KB chunk took unusually long (>4.0s = <128 KB/s), refresh that socket in background
+                            chunk_dur = time.time() - t_chunk_start
+                            if chunk_dur > 4.0 and len(sessions) > 1:
+                                try:
+                                    asyncio.create_task(_safe_session_restart(target_session))
+                                except Exception:
+                                    pass
                             break
                     except Exception as err:
                         part_attempts += 1
                         err_str = str(err).lower()
                         # Auto-recover broken or closed socket without dropping parts
-                        # Do NOT restart session on transient timeouts (restarting tears down socket for all other workers!)
-                        if any(k in err_str for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "closed=true")):
+                        if any(k in err_str for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "operation on", "closed=true", "timed out", "timeout")):
                             try:
                                 await _safe_session_restart(target_session)
                             except Exception:
@@ -417,11 +415,6 @@ async def fast_save_file(
                     break
         except asyncio.CancelledError:
             return
-        except Exception as e:
-            logger.error(f"Upload Worker {worker_id} crashed unexpectedly: {e}", exc_info=True)
-            if upload_error is None:
-                upload_error = e
-            return
         finally:
             if fp:
                 try:
@@ -432,15 +425,9 @@ async def fast_save_file(
     try:
         watchdog_task = asyncio.create_task(_stall_watchdog())
         workers.extend(asyncio.create_task(_worker(w_id)) for w_id in range(num_workers))
-        worker_results = await asyncio.gather(*workers, return_exceptions=True)
+        await asyncio.gather(*workers, return_exceptions=True)
         watchdog_done.set()
         watchdog_task.cancel()
-
-        for res in worker_results:
-            if isinstance(res, Exception) and not isinstance(res, asyncio.CancelledError):
-                logger.error(f"Upload Worker task exception: {res}", exc_info=res)
-                if upload_error is None:
-                    upload_error = res
 
         if upload_error is not None:
             raise upload_error
@@ -616,12 +603,6 @@ async def fast_download_media(
             dl_done = asyncio.Event()
             workers: list = []
 
-            # Dynamic Flow Pacer: caps peak burst at ~85 MB/s to prevent Telegram DC ZeroWindow clamp
-            # Keeps line-rate smooth and continuous at 75-85 MB/s without 10s server pauses
-            pacer_lock = asyncio.Lock()
-            pacer_state = {"start_time": time.time(), "bytes": 0}
-            MAX_LINE_RATE_BYTES_SEC = 85 * 1024 * 1024  # 85 MB/s
-
             async def _dl_worker(worker_id: int):
                 nonlocal downloaded_bytes, dl_error
                 try:
@@ -662,7 +643,7 @@ async def fast_download_media(
                         part_start_times[part_idx] = time.time()
 
                         part_attempts = 0
-                        max_part_attempts = 12
+                        max_part_attempts = 8
                         chunk_data = None
                         # Strict round-robin across both sockets (if stolen, route to alternate socket)
                         session_idx = (part_idx + (1 if is_stolen else 0)) % len(sessions)
@@ -685,8 +666,6 @@ async def fast_download_media(
                                     break
                                 elif isinstance(r, raw.types.upload.FileCdnRedirect):
                                     raise NotImplementedError("CDN redirect handled by fallback")
-                                else:
-                                    raise RuntimeError(f"Unexpected GetFile response type: {type(r)}")
                             except Exception as err:
                                 part_attempts += 1
                                 err_l = str(err).lower()
@@ -730,40 +709,12 @@ async def fast_download_media(
                                         await res_prog
                                 except Exception:
                                     pass
-
-                            # Flow pacer check: keep line rate at ~80-85 MB/s to prevent Telegram DC clamp
-                            now_p = time.time()
-                            sleep_time = 0.0
-                            async with pacer_lock:
-                                dt_p = now_p - pacer_state["start_time"]
-                                if dt_p >= 1.0:
-                                    pacer_state["start_time"] = now_p
-                                    pacer_state["bytes"] = len(chunk_data)
-                                else:
-                                    pacer_state["bytes"] += len(chunk_data)
-                                    if pacer_state["bytes"] > MAX_LINE_RATE_BYTES_SEC:
-                                        rem = 1.0 - dt_p
-                                        if rem > 0.005:
-                                            sleep_time = min(rem, 0.1)
-                            if sleep_time > 0 and len(completed_parts) < total_parts:
-                                await asyncio.sleep(sleep_time)
                 except asyncio.CancelledError:
-                    return
-                except Exception as e:
-                    logger.error(f"DL Worker {worker_id} crashed unexpectedly: {e}", exc_info=True)
-                    if dl_error is None:
-                        dl_error = e
                     return
 
             try:
                 workers.extend(asyncio.create_task(_dl_worker(w_id)) for w_id in range(num_workers))
-                worker_results = await asyncio.gather(*workers, return_exceptions=True)
-
-                for res in worker_results:
-                    if isinstance(res, Exception) and not isinstance(res, asyncio.CancelledError):
-                        logger.error(f"DL Worker task exception: {res}", exc_info=res)
-                        if dl_error is None:
-                            dl_error = res
+                await asyncio.gather(*workers, return_exceptions=True)
 
                 if dl_error is not None:
                     raise dl_error

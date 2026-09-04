@@ -1257,7 +1257,7 @@ class MigrationEngine:
                         if self.cancel_event.is_set():
                             break
                         idle = time.time() - dl_progress_tracker["last_time"]
-                        if idle > 120.0:
+                        if idle > 45.0:
                             logger.warning(
                                 f"⚠️ [Download #{msg.id}] Download stall detected (no data for {idle:.0f}s @ {dl_progress_tracker['current'] / 1048576:.1f} MB) — aborting for fresh reconnect..."
                             )

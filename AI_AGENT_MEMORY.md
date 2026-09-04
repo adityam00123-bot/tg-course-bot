@@ -89,14 +89,6 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
 - **Burst Pacing & Smooth Ticker:**
   - MTProto invokes use `retries=1` (with `timeout=8` on DL and `timeout=10` on UL). Momentary 1s server-side rate-limit pauses during 60–80 MB/s bursts are handled cleanly without socket destruction or retry backoffs.
   - The console ticker in `migration.py` uses an Exponential Moving Average (EMA: $0.7 \times \text{inst} + 0.3 \times \text{prev}$) and displays true overall speed at 100%, preventing visual drops to 4.5 MB/s.
-- **Pyrogram `TCP.TIMEOUT = 60` Socket Protection:**
-  - Upgraded Pyrogram's hardcoded 10s TCP read timeout to `60` seconds. Prevents Pyrogram's `recv_worker` from prematurely timing out and killing the socket when Telegram DC enforces a momentary rate-limit hold after high-speed bursts.
-- **Dynamic 85 MB/s Flow Pacer (Strictly 2 Sockets):**
-  - In `fast_download_media`, a lightweight rolling 1-second pacer limits peak throughput to ~85 MB/s.
-  - If speed is naturally below 85 MB/s (e.g. 20–70 MB/s), it adds 0ms delay.
-  - When line rate spikes to 100–120 MB/s, it micro-paces chunks to prevent Telegram DC server buffer overflow and TCP ZeroWindow 10-second hard freezes, delivering a **smooth, unbroken 75–85 MB/s continuous stream**.
-- **120s Idle Stall Watchdog:**
-  - `_dl_stall_watchdog` idle threshold is strictly set to `idle > 120.0s`, ensuring large 2GB transfers are never prematurely aborted or wiped.
 
 ## 7. Cloud Execution Strategy
 1. **Primary: Kaggle Notebooks** (4 vCPU, 30 GB RAM, 2x T4 GPU, ~73 GB Disk). Allows "Save & Run All (Commit)" for 12-hour background execution without keeping the browser open. Weekly GPU quota is 30 hours.

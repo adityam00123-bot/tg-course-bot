@@ -286,39 +286,3 @@
         asyncio.create_task(_bg_stop(aux_sessions))
     ```
     `fast_download_media` and `fast_save_file` return instantly to `migration.py` in **0.0 milliseconds**, completely eliminating the 100% completion freeze!
-
-### Error: 120 MB/s Burst-Lockup at 768 MB & Premature Watchdog Abortion
-* **Symptom:** Large files (e.g. 1.8 GB) burst to 100–120 MB/s, but suddenly freeze at exactly ~768 MB (`DL: #3291 (768/1797MB @ ⚠️ PAUSED)`). After 47 seconds of silence, the watchdog prints:
-  `⚠️ Download stall detected (no data for 47s @ 768.0 MB) — aborting for fresh reconnect...`
-  wiping all 768 MB and restarting the download from 0 MB!
-* **Root Cause:**
-  1. **Telegram Token Bucket Burst Exhaustion:** Telegram MTProto servers provide a ~700MB burst bucket. Draining 768 MB in 8 seconds at 120 MB/s completely empties the bucket, causing Telegram's server to pause the TCP connection for 5–10s to refill.
-  2. **Pyrogram's Hardcoded `TCP.TIMEOUT = 10`:** In `pyrogram/connection/transport/tcp/tcp.py`, socket read timeout was hardcoded to 10s. When Telegram paused for >10s, `TCP.recv()` timed out, returned `None`, and **permanently killed `recv_worker`**, leaving both sockets dead.
-  3. **Premature Watchdog Abort:** `_dl_stall_watchdog` in `migration.py` had an idle threshold of only 45s, aborting healthy transfers and wiping files.
-* **Permanent Fix:**
-  - **`TCP.TIMEOUT = 60` Monkeypatch:** Set `pyrogram.connection.transport.tcp.tcp.TCP.TIMEOUT = 60`. This is a non-blocking deadline (maximum wait), NOT a sleep. If data arrives in 0.01s, it returns in 0.01s. It ensures sockets now comfortably survive Telegram's 5–10s rate-limit holds without killing `recv_worker`.
-  - **Dynamic 85 MB/s Flow Pacer (Strictly 2 Sockets):** Added a rolling 1-second pacer in `fast_download_media`. When speed is below 85 MB/s, delay is 0ms. When speed spikes toward 120 MB/s, it micro-paces chunks to keep speed at a smooth, continuous **75–85 MB/s**, preventing Telegram server buffer overflows and eliminating the 10-second ZeroWindow hard freeze!
-  - **120s Stall Watchdog:** Increased `idle > 45.0` to `idle > 120.0` in `migration.py`.
-
-### Error: 50 MB/s Upload Pause (8–10s Stalls Caused by Restart Storm)
-* **Symptom:** During uploads, when throughput crosses ~50 MB/s, transfer pauses for 8–10 seconds before resuming.
-* **Root Cause:**
-  1. In `fast_save_file`, if a 512KB chunk took >4.0s (`chunk_dur > 4.0`), it triggered `_safe_session_restart(target_session)` in the background even though the chunk had uploaded successfully (`res is True`).
-  2. At 50 MB/s, Telegram server naturally takes 4–5s to ACK incoming blocks. Destroying and recreating healthy sockets mid-transfer caused other workers on that socket to time out, triggering a cascade restart storm.
-* **Permanent Fix:**
-  - Removed socket restart on successful chunk uploads.
-  - Restricted upload socket restarts strictly to fatal transport errors (`BrokenPipe`, `ConnectionReset`, `closed=true`), while transient timeouts rotate cleanly to the next socket (`session_idx += 1`) without socket destruction.
-
-### Error: Download Incomplete at Exactly 12MB (12582912 Bytes)
-* **Symptom:** Downloads immediately fail after receiving exactly 12 MB (`Download incomplete: 12582912/263307160 bytes received`) across all retry attempts.
-* **Root Cause:**
-  - In `fast_download_media`, the flow pacer defined `pacer_start_time` and `pacer_bytes_accum` in the outer function scope.
-  - Inside `_dl_worker`, assignments like `pacer_start_time = now_p` occurred without declaring `nonlocal`.
-  - In Python, reassigning an outer variable in an inner function without `nonlocal` causes Python to treat it as a local variable. On chunk completion, reading `pacer_start_time` threw `UnboundLocalError`.
-  - Because `asyncio.gather(*workers, return_exceptions=True)` swallowed worker exceptions without logging, each of the 12 workers died after processing exactly 1 chunk ($12 \times 1\text{MB} = 12582912$ bytes). `fast_download_media` exited with `Download incomplete`.
-* **Permanent Fix:**
-  - Encapsulated pacer state into a mutable dict `pacer_state = {"start_time": ..., "bytes": ...}` to eliminate variable scoping issues entirely.
-  - Added explicit exception logging (`exc_info=True`) inside `_dl_worker` and `_worker`.
-  - Inspected `gather` returned results to re-raise any uncaught worker exceptions.
-
-
