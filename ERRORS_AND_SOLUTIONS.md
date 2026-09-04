@@ -221,7 +221,38 @@
   - Added **Live Progress Reporting** and **User Cancellation** (`[ ⏹️ Stop / Cancel Scan ]` button via `engine.audit_cancel_event`).
   - Cached audit scan results (`engine._cached_missing_ids`) so restoring sequence or appending starts instantly without duplicate re-scanning.
 
+---
 
+## 5. MTProto Session Optimization & Bandwidth Flow Control
 
+### Error: Session Parity Math Starvation & Single-Socket Overload
+* **Symptom:** Download speeds drop from 35–45 MB/s down to 6–12 MB/s on multi-socket downloads, and large uploads trigger crawling watchdogs (<1.0 MB/s) despite having multiple sessions.
+* **Root Cause:**
+  - In both `fast_download_media` and `fast_save_file`, chunk dispatch used:
+    `session_idx = (part_idx + worker_id) % len(sessions)`
+  - In download with 2 sessions (`len = 2`): Worker $k$ taking Part $k$ resulted in $(k + k) \pmod 2 = 2k \pmod 2 \equiv \mathbf{0}$ for every single worker. Socket 1 (`s2`) was **100% idle**, while all 12 workers dogpiled onto Socket 0, choking the single TCP connection.
+  - In upload with 4 sessions (`len = 4`): $(k + k) \pmod 4 \in \{\mathbf{0}, \mathbf{2}\}$. Sockets 1 and 3 were **100% idle**, forcing all traffic onto only 2 sockets.
+* **Permanent Fix:**
+  - Replaced formula with strict round-robin:
+    `session_idx = (part_idx + (1 if is_stolen else 0)) % len(sessions)`
+  - Guarantees an exact 50/50 split across download sockets and an exact 25/25/25/25 split across all 4 upload sockets.
 
+### Error: Tail-End Straggler Freeze (8–15s Stalls on Final 5–10% in DL & UL)
+* **Symptom:** Files download or upload smoothly at 35–50 MB/s until reaching 90–95%, then freeze completely for 8–15 seconds at `0.1–1.0 MB/s` on the final 2–3 chunks.
+* **Root Cause:**
+  - Once the chunk queue is empty, only 1–2 chunks remain in-flight. The other 10–14 workers become idle.
+  - The straggler theft check required waiting **15.0 seconds** (`(now - s_time) > 15.0`) before any idle worker could claim an unfinished chunk. Any transient WAN delay on the last chunk forced all workers to wait out the full 15 seconds.
+  - At 100%, sessions were stopped sequentially in a `for s in sessions: await s.stop()` loop, adding another 1–2 seconds of pause.
+* **Permanent Fix:**
+  - **Dynamic Tail-Sniping:** When `queue` is empty and uncompleted parts $\le 4$, the straggler timeout dynamically drops to **2.5s** (down from 15.0s).
+  - **Dual-Socket Sniping:** Idle workers claiming a tail straggler automatically route the duplicate request to the **alternate socket** (`(part_idx + 1) % len(sessions)`). Whichever socket returns first finishes the part.
+  - **Concurrent Parallel Teardown:** Replaced sequential teardown with `await asyncio.gather(*(s.stop() ...))` across all sessions in parallel (<0.05s).
 
+### Error: ~60 MB/s Sawtooth Oscillation & Synchronous Disk I/O Event Loop Freeze
+* **Symptom:** Transfers burst to 60–64 MB/s, freeze for 2 seconds, drop to 4.5 MB/s, surge back to 60 MB/s, and repeat in an oscillating sawtooth cycle.
+* **Root Cause:**
+  1. **Telegram DC 500 Mbps Clamping:** 62.5 MB/s = 500 Mbps (Telegram DC per-IP token bucket limit). Bursts exceeding 500 Mbps trigger 1–2 second TCP ZeroWindow pauses from the DC.
+  2. **Synchronous Disk I/O on Event Loop:** At 60 MB/s (60 chunks/sec), `out_fp.write()` was running synchronously inside `async with file_lock` on the asyncio thread. Linux dirty page writebacks froze the event loop for 300–800ms, causing TCP receive buffer overflows and packet drops.
+* **Permanent Fix:**
+  - **Non-blocking Asynchronous Disk Writes:** Offloaded disk writes using `await asyncio.to_thread(_sync_write_chunk, out_fp, offset, chunk_data)`, completely freeing the event loop from kernel disk I/O pauses.
+  - **Instant Failover:** Set `retries=0` inside `target_session.invoke(GetFile)` so any socket delay immediately rotates to the alternate healthy socket in <0.05s.

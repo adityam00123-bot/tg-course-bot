@@ -288,15 +288,20 @@ async def fast_save_file(
                 except asyncio.QueueEmpty:
                     pass
 
+                is_stolen = False
                 if part_info is None:
-                    # Queue is empty: check for stalled straggler parts taking > 15.0s
+                    # Queue is empty: check for stalled straggler parts
+                    # When remaining uncompleted parts <= 4, lower threshold to 2.5s for fast tail-finish
                     async with parts_lock:
                         now = time.time()
                         straggler_idx = None
+                        remaining_uncompleted = total_parts - len(completed_parts)
+                        tail_threshold = 2.5 if remaining_uncompleted <= 4 else 8.0
                         for p_idx, s_time in list(part_start_times.items()):
-                            if p_idx not in completed_parts and (now - s_time) > 15.0:
+                            if p_idx not in completed_parts and (now - s_time) > tail_threshold:
                                 straggler_idx = p_idx
                                 part_start_times[p_idx] = now  # re-claim straggler
+                                is_stolen = True
                                 break
                     if straggler_idx is not None:
                         offset = straggler_idx * CHUNK_SIZE
@@ -344,7 +349,8 @@ async def fast_save_file(
                 part_attempts = 0
                 max_part_attempts = 10
                 part_ack = False
-                session_idx = (part_idx + worker_id) % len(sessions)
+                # Strict round-robin across all sockets (if stolen straggler, route to alternate socket)
+                session_idx = (part_idx + (1 if is_stolen else 0)) % len(sessions)
 
                 while part_attempts < max_part_attempts and part_idx not in completed_parts and upload_error is None:
                     target_session = sessions[session_idx % len(sessions)] or getattr(self, "session", None)
@@ -427,12 +433,9 @@ async def fast_save_file(
             return raw.types.InputFile(id=file_id, parts=total_parts, name=file_name, md5_checksum="")
     finally:
         watchdog_done.set()
-        for s in sessions:
-            if s and s != getattr(self, "session", None):
-                try:
-                    await s.stop()
-                except Exception:
-                    pass
+        stop_coros = [s.stop() for s in sessions if s and s != getattr(self, "session", None)]
+        if stop_coros:
+            await asyncio.gather(*stop_coros, return_exceptions=True)
 
 
 # Monkeypatch Pyrogram Client.save_file to use our robust uploader
@@ -583,6 +586,10 @@ async def fast_download_media(
             lock = asyncio.Lock()
             dl_done = asyncio.Event()
 
+            def _sync_write_chunk(fp, pos: int, data: bytes):
+                fp.seek(pos)
+                fp.write(data)
+
             async def _dl_worker(worker_id: int):
                 nonlocal downloaded_bytes, dl_error
                 while len(completed_parts) < total_parts and dl_error is None and not dl_done.is_set():
@@ -592,15 +599,20 @@ async def fast_download_media(
                     except asyncio.QueueEmpty:
                         pass
 
+                    is_stolen = False
                     if part_info is None:
-                        # Queue is empty: check for stalled straggler parts taking >15.0s
+                        # Queue is empty: check for stalled straggler parts
+                        # When remaining uncompleted parts <= 4, drop threshold to 2.5s for fast tail-finish
                         async with lock:
                             now = time.time()
                             straggler_idx = None
+                            remaining_uncompleted = total_parts - len(completed_parts)
+                            tail_threshold = 2.5 if remaining_uncompleted <= 4 else 8.0
                             for p_idx, s_time in list(part_start_times.items()):
-                                if p_idx not in completed_parts and (now - s_time) > 15.0:
+                                if p_idx not in completed_parts and (now - s_time) > tail_threshold:
                                     straggler_idx = p_idx
                                     part_start_times[p_idx] = now  # claim straggler
+                                    is_stolen = True
                                     break
                         if straggler_idx is not None:
                             part_info = (straggler_idx, straggler_idx * chunk_size)
@@ -619,20 +631,21 @@ async def fast_download_media(
                     part_attempts = 0
                     max_part_attempts = 8
                     chunk_data = None
-                    session_idx = (part_idx + worker_id) % len(sessions)
+                    # Strict round-robin across both sockets (if stolen, route to alternate socket)
+                    session_idx = (part_idx + (1 if is_stolen else 0)) % len(sessions)
 
                     while part_attempts < max_part_attempts and part_idx not in completed_parts and dl_error is None:
                         target_session = sessions[session_idx % len(sessions)]
                         try:
-                            # 15s MTProto timeout with 25s wait_for wrapper prevents WAN stalls
+                            # 15s MTProto timeout with retries=0 for instant socket rotation on lag
                             r = await asyncio.wait_for(
                                 target_session.invoke(
                                     raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
                                     timeout=15,
-                                    retries=2,
+                                    retries=0,
                                     sleep_threshold=30
                                 ),
-                                timeout=25.0
+                                timeout=20.0
                             )
                             if isinstance(r, raw.types.upload.File):
                                 chunk_data = r.bytes
@@ -664,8 +677,7 @@ async def fast_download_media(
                     if chunk_data is not None and part_idx not in completed_parts:
                         async with file_lock:
                             if part_idx not in completed_parts:
-                                out_fp.seek(offset)
-                                out_fp.write(chunk_data)
+                                await asyncio.to_thread(_sync_write_chunk, out_fp, offset, chunk_data)
                                 completed_parts.add(part_idx)
                                 downloaded_bytes += len(chunk_data)
                                 if len(completed_parts) >= total_parts:
@@ -696,12 +708,9 @@ async def fast_download_media(
                 except Exception:
                     pass
         finally:
-            for s in sessions:
-                if s and s != getattr(self, "session", None):
-                    try:
-                        await s.stop()
-                    except Exception:
-                        pass
+            stop_coros = [s.stop() for s in sessions if s and s != getattr(self, "session", None)]
+            if stop_coros:
+                await asyncio.gather(*stop_coros, return_exceptions=True)
 
     except Exception as e:
         logger.debug(f"Parallel chunk download exception: {e}")
