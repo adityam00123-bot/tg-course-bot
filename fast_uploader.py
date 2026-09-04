@@ -593,8 +593,7 @@ async def fast_download_media(
 
             out_fp = open(out_path, "r+b")
 
-            # Golden Concurrency Budget (2 DL sockets, 12-16 workers pipelining 1MB chunks)
-            num_workers = min(getattr(self, "max_concurrent_transmissions", 16) or 16, total_parts)
+            num_workers = min(getattr(self, "max_concurrent_transmissions", 12) or 12, total_parts)
             num_workers = max(1, min(num_workers, 16))
 
             completed_parts: set = set()
@@ -602,10 +601,6 @@ async def fast_download_media(
             lock = asyncio.Lock()
             dl_done = asyncio.Event()
             workers: list = []
-
-            def _sync_write_chunk(fp, pos: int, data: bytes):
-                fp.seek(pos)
-                fp.write(data)
 
             async def _dl_worker(worker_id: int):
                 nonlocal downloaded_bytes, dl_error
@@ -617,20 +612,15 @@ async def fast_download_media(
                         except asyncio.QueueEmpty:
                             pass
 
-                        is_stolen = False
                         if part_info is None:
-                            # Queue is empty: check for stalled straggler parts
-                            # When remaining uncompleted parts <= 4, drop threshold to 2.5s for fast tail-finish
+                            # Queue is empty: check for stalled straggler parts taking >3.0s
                             async with lock:
                                 now = time.time()
                                 straggler_idx = None
-                                remaining_uncompleted = total_parts - len(completed_parts)
-                                tail_threshold = 2.5 if remaining_uncompleted <= 4 else 8.0
                                 for p_idx, s_time in list(part_start_times.items()):
-                                    if p_idx not in completed_parts and (now - s_time) > tail_threshold:
+                                    if p_idx not in completed_parts and (now - s_time) > 3.0:
                                         straggler_idx = p_idx
                                         part_start_times[p_idx] = now  # claim straggler
-                                        is_stolen = True
                                         break
                             if straggler_idx is not None:
                                 part_info = (straggler_idx, straggler_idx * chunk_size)
@@ -649,21 +639,16 @@ async def fast_download_media(
                         part_attempts = 0
                         max_part_attempts = 10
                         chunk_data = None
-                        # Strict round-robin across both sockets (if stolen, route to alternate socket)
-                        session_idx = (part_idx + (1 if is_stolen else 0)) % len(sessions)
+                        session_idx = (part_idx + worker_id) % len(sessions)
 
                         while part_attempts < max_part_attempts and part_idx not in completed_parts and dl_error is None:
                             target_session = sessions[session_idx % len(sessions)]
                             try:
-                                # 15s MTProto timeout with retries=0 for instant socket rotation on lag
-                                r = await asyncio.wait_for(
-                                    target_session.invoke(
-                                        raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
-                                        timeout=15,
-                                        retries=0,
-                                        sleep_threshold=30
-                                    ),
-                                    timeout=20.0
+                                r = await target_session.invoke(
+                                    raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
+                                    timeout=5,
+                                    retries=1,
+                                    sleep_threshold=30
                                 )
                                 if isinstance(r, raw.types.upload.File):
                                     chunk_data = r.bytes
@@ -678,9 +663,7 @@ async def fast_download_media(
                                 if any(k in err_l for k in ("file_reference_expired", "filereferenceexpired")):
                                     dl_error = err
                                     break
-                                # Do NOT restart session on transient timeouts (restarting tears down socket for all other workers!)
-                                # Only restart if the socket was physically closed or broken:
-                                if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "closed=true")):
+                                if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "timed out", "timeout", "handler is closed", "tcptransport", "operation on", "closed=true")):
                                     try:
                                         await _safe_session_restart(target_session)
                                         if dc_id != await self.storage.dc_id():
@@ -692,17 +675,17 @@ async def fast_download_media(
                                 if part_attempts >= max_part_attempts:
                                     dl_error = err
                                     break
-                                await asyncio.sleep(0.1)
+                                await asyncio.sleep(0.05)
 
                         if chunk_data is not None and part_idx not in completed_parts:
                             async with file_lock:
                                 if part_idx not in completed_parts:
-                                    await asyncio.to_thread(_sync_write_chunk, out_fp, offset, chunk_data)
+                                    out_fp.seek(offset)
+                                    out_fp.write(chunk_data)
                                     completed_parts.add(part_idx)
                                     downloaded_bytes += len(chunk_data)
                                     if len(completed_parts) >= total_parts:
                                         dl_done.set()
-                                        # Instant completion: cancel all remaining in-flight worker tasks
                                         for w in workers:
                                             if not w.done():
                                                 w.cancel()
