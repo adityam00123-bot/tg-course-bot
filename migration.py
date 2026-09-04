@@ -418,9 +418,13 @@ class MigrationEngine:
                 ul_parts = []
                 now_tick = time.time()
                 for key, item in list(self._active_transfers.items()):
+                    time_since_update = now_tick - item.get("last_time", now_tick)
+                    # Auto-prune stale zombie transfers after 60s of silence
+                    if time_since_update > 60.0:
+                        self._active_transfers.pop(key, None)
+                        continue
                     curr_mb = item["current"] / 1048576
                     tot_mb = item["total"] / 1048576 if item["total"] else 0
-                    time_since_update = now_tick - item.get("last_time", now_tick)
                     spd = item.get("speed", 0.0)
                     if time_since_update > 45.0 and item["current"] > 0:
                         spd_str = "⚠️PAUSED"
@@ -1171,201 +1175,207 @@ class MigrationEngine:
         elif msg.audio and msg.audio.file_size:
             expected_size = msg.audio.file_size
 
-        max_dl_attempts = 10
-        for attempt in range(1, max_dl_attempts + 1):
-            if self.cancel_event.is_set():
-                return None
-
-            # Clean any stale partial file before attempting
-            if temp_target.exists():
-                try:
-                    temp_target.unlink()
-                except Exception:
-                    pass
-
-            dl_start_t = time.time()
-            file_name_display = getattr(msg.document, "file_name", None) or getattr(msg.video, "file_name", None) or f"media_{msg.id}"
-            dl_key = f"dl_{msg.id}"
-
-            dl_progress_tracker = {"last_time": time.time(), "current": 0}
-
-            def _prog(current: int, total: int):
+        max_dl_attempts = 4
+        dl_key = f"dl_{msg.id}"
+        try:
+            for attempt in range(1, max_dl_attempts + 1):
                 if self.cancel_event.is_set():
-                    raise asyncio.CancelledError("Download aborted by cancellation event")
-                dl_progress_tracker["current"] = current
-                dl_progress_tracker["last_time"] = time.time()
-                self._update_transfer_progress(dl_key, "DL", msg.id, file_name_display, current, total)
+                    return None
 
-            dl_client = client or self.userbot or self.client
-            wait_sec = min(2 ** min(attempt, 5), 30)
-
-            # If retrying after a failure, refresh message from Telegram to renew expired file_reference tokens
-            if attempt > 1:
-                try:
-                    chat_id = (msg.chat.id if msg.chat else None) or self.config.source_chat_id
-                    refreshed = await dl_client.get_messages(chat_id, message_ids=[msg.id])
-                    if isinstance(refreshed, list) and refreshed and refreshed[0]:
-                        msg = refreshed[0]
-                    elif refreshed and not isinstance(refreshed, list):
-                        msg = refreshed
-                    logger.info(f"🔄 [Download #{msg.id}] Refreshed fresh file_reference token from Telegram (Attempt {attempt}).")
-                except Exception as ref_err:
-                    logger.debug(f"Could not refresh file_reference for #{msg.id}: {ref_err}")
-
-            watchdog_done = asyncio.Event()
-
-            async def _dl_stall_watchdog(target_task: asyncio.Task):
-                """Monitors download activity. If stalled for >30s, cancels the download task to reconnect."""
-                while not watchdog_done.is_set() and not self.cancel_event.is_set():
+                # Clean any stale partial file before attempting
+                if temp_target.exists():
                     try:
-                        await asyncio.wait_for(watchdog_done.wait(), timeout=10.0)
-                        break
-                    except asyncio.TimeoutError:
+                        temp_target.unlink()
+                    except Exception:
                         pass
+
+                dl_start_t = time.time()
+                file_name_display = getattr(msg.document, "file_name", None) or getattr(msg.video, "file_name", None) or f"media_{msg.id}"
+
+                dl_progress_tracker = {"last_time": time.time(), "current": 0}
+
+                def _prog(current: int, total: int):
                     if self.cancel_event.is_set():
-                        break
-                    idle = time.time() - dl_progress_tracker["last_time"]
-                    if idle > 45.0:
-                        logger.warning(
-                            f"⚠️ [Download #{msg.id}] Download stall detected (no data for {idle:.0f}s @ {dl_progress_tracker['current'] / 1048576:.1f} MB) — aborting for fresh reconnect..."
-                        )
-                        if not target_task.done():
-                            target_task.cancel()
-                        break
+                        raise asyncio.CancelledError("Download aborted by cancellation event")
+                    dl_progress_tracker["current"] = current
+                    dl_progress_tracker["last_time"] = time.time()
+                    self._update_transfer_progress(dl_key, "DL", msg.id, file_name_display, current, total)
 
-            dl_task = asyncio.create_task(
-                self._execute_with_flood_retry(
-                    dl_client.download_media,
-                    message=msg,
-                    file_name=str(temp_target),
-                    progress=_prog
+                dl_client = client or self.userbot or self.client
+                wait_sec = min(2 ** min(attempt, 4), 16)
+
+                # If retrying after a failure, refresh message from Telegram to renew expired file_reference tokens
+                if attempt > 1:
+                    try:
+                        chat_id = (msg.chat.id if msg.chat else None) or self.config.source_chat_id
+                        refreshed = await dl_client.get_messages(chat_id, message_ids=[msg.id])
+                        if isinstance(refreshed, list) and refreshed and refreshed[0]:
+                            msg = refreshed[0]
+                        elif refreshed and not isinstance(refreshed, list):
+                            msg = refreshed
+                        logger.info(f"🔄 [Download #{msg.id}] Refreshed fresh file_reference token from Telegram (Attempt {attempt}).")
+                    except Exception as ref_err:
+                        logger.debug(f"Could not refresh file_reference for #{msg.id}: {ref_err}")
+
+                watchdog_done = asyncio.Event()
+
+                async def _dl_stall_watchdog(target_task: asyncio.Task):
+                    """Monitors download activity. If stalled for >30s, cancels the download task to reconnect."""
+                    while not watchdog_done.is_set() and not self.cancel_event.is_set():
+                        try:
+                            await asyncio.wait_for(watchdog_done.wait(), timeout=10.0)
+                            break
+                        except asyncio.TimeoutError:
+                            pass
+                        if self.cancel_event.is_set():
+                            break
+                        idle = time.time() - dl_progress_tracker["last_time"]
+                        if idle > 45.0:
+                            logger.warning(
+                                f"⚠️ [Download #{msg.id}] Download stall detected (no data for {idle:.0f}s @ {dl_progress_tracker['current'] / 1048576:.1f} MB) — aborting for fresh reconnect..."
+                            )
+                            if not target_task.done():
+                                target_task.cancel()
+                            break
+
+                dl_task = asyncio.create_task(
+                    self._execute_with_flood_retry(
+                        dl_client.download_media,
+                        message=msg,
+                        file_name=str(temp_target),
+                        progress=_prog
+                    )
                 )
-            )
-            watchdog_task = asyncio.create_task(_dl_stall_watchdog(dl_task))
+                watchdog_task = asyncio.create_task(_dl_stall_watchdog(dl_task))
 
-            try:
-                downloaded = await dl_task
-            except asyncio.CancelledError:
-                if self.cancel_event.is_set():
-                    raise
-                self._remove_transfer_progress(dl_key)
-                await reset_client_sessions(dl_client)
-                logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/{max_dl_attempts} aborted due to connection stall. Retrying in {wait_sec}s...")
-                downloaded = None
-            except Exception as dl_err:
-                self._remove_transfer_progress(dl_key)
-                err_str = str(dl_err)
-                if "FILE_REFERENCE_EXPIRED" in err_str or "FileReferenceExpired" in type(dl_err).__name__:
-                    logger.warning(f"⚠️ [Download #{msg.id}] file_reference expired. Refreshing message from Telegram...")
-                    try:
-                        chat_id = (msg.chat.id if msg.chat else None) or self.config.source_chat_id
-                        refreshed = await dl_client.get_messages(chat_id, message_ids=[msg.id])
-                        if isinstance(refreshed, list) and refreshed and refreshed[0]:
-                            msg = refreshed[0]
-                        elif refreshed and not isinstance(refreshed, list):
-                            msg = refreshed
-                    except Exception:
-                        pass
-                
-                # Fallback: if userbot fails (AUTH_BYTES_INVALID on different DC), try bot client
-                if self.userbot and self.client and "AUTH_BYTES_INVALID" in err_str:
-                    logger.info(f"🔄 [Download #{msg.id}] Retrying via Bot client (DC auth fallback)...")
-                    try:
-                        downloaded = await self._execute_with_flood_retry(
-                            self.client.download_media,
-                            message=msg,
-                            file_name=str(temp_target),
-                            progress=_prog
-                        )
-                    except Exception as bot_dl_err:
-                        logger.warning(f"⚠️ [Download #{msg.id}] Bot fallback also failed: {bot_dl_err}")
-                        downloaded = None
-                else:
-                    if any(k in err_str for k in ("Broken pipe", "ConnectionResetError", "OSError", "ConnectionLost")):
-                        await reset_client_sessions(dl_client)
-                    logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/{max_dl_attempts} failed: {dl_err}. Retrying in {wait_sec}s...")
+                try:
+                    downloaded = await dl_task
+                except asyncio.CancelledError:
+                    if self.cancel_event.is_set():
+                        raise
+                    self._remove_transfer_progress(dl_key)
+                    await reset_client_sessions(dl_client)
+                    logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/{max_dl_attempts} aborted due to connection stall. Retrying in {wait_sec}s...")
                     downloaded = None
-            finally:
-                watchdog_done.set()
-                if not watchdog_task.done():
-                    watchdog_task.cancel()
-
-            if not downloaded or not os.path.exists(downloaded):
-                self._remove_transfer_progress(dl_key)
-                await asyncio.sleep(wait_sec)
-                continue
-
-            if downloaded and os.path.exists(downloaded):
-                self._remove_transfer_progress(dl_key)
-                actual_size = os.path.getsize(downloaded)
-                
-                if actual_size == 0:
-                    logger.warning(f"⚠️ [Download #{msg.id}] Pyrogram returned 0-byte file (possible AUTH_BYTES_INVALID or expired reference).")
-                    try:
-                        os.unlink(downloaded)
-                    except Exception:
-                        pass
-                    # Refresh message before bot fallback
-                    try:
-                        chat_id = (msg.chat.id if msg.chat else None) or self.config.source_chat_id
-                        refreshed = await dl_client.get_messages(chat_id, message_ids=[msg.id])
-                        if isinstance(refreshed, list) and refreshed and refreshed[0]:
-                            msg = refreshed[0]
-                        elif refreshed and not isinstance(refreshed, list):
-                            msg = refreshed
-                    except Exception:
-                        pass
-
-                    if dl_client == self.userbot and self.client:
+                except Exception as dl_err:
+                    self._remove_transfer_progress(dl_key)
+                    err_str = str(dl_err)
+                    if "FILE_REFERENCE_EXPIRED" in err_str or "FileReferenceExpired" in type(dl_err).__name__:
+                        logger.warning(f"⚠️ [Download #{msg.id}] file_reference expired. Refreshing message from Telegram...")
+                        try:
+                            chat_id = (msg.chat.id if msg.chat else None) or self.config.source_chat_id
+                            refreshed = await dl_client.get_messages(chat_id, message_ids=[msg.id])
+                            if isinstance(refreshed, list) and refreshed and refreshed[0]:
+                                msg = refreshed[0]
+                            elif refreshed and not isinstance(refreshed, list):
+                                msg = refreshed
+                        except Exception:
+                            pass
+                    
+                    # Fallback: if userbot fails (AUTH_BYTES_INVALID on different DC), try bot client
+                    if self.userbot and self.client and "AUTH_BYTES_INVALID" in err_str:
                         logger.info(f"🔄 [Download #{msg.id}] Retrying via Bot client (DC auth fallback)...")
                         try:
                             downloaded = await self._execute_with_flood_retry(
-                                self.client.download_media, message=msg, file_name=str(temp_target), progress=_prog
+                                self.client.download_media,
+                                message=msg,
+                                file_name=str(temp_target),
+                                progress=_prog
                             )
-                            if downloaded and os.path.exists(downloaded):
-                                actual_size = os.path.getsize(downloaded)
-                                if actual_size == 0:
-                                    os.unlink(downloaded)
-                                    downloaded = None
                         except Exception as bot_dl_err:
                             logger.warning(f"⚠️ [Download #{msg.id}] Bot fallback also failed: {bot_dl_err}")
                             downloaded = None
-                    if not downloaded or actual_size == 0:
-                        await asyncio.sleep(wait_sec)
-                        continue
+                        finally:
+                            self._remove_transfer_progress(dl_key)
+                    else:
+                        if any(k in err_str for k in ("Broken pipe", "ConnectionResetError", "OSError", "ConnectionLost")):
+                            await reset_client_sessions(dl_client)
+                        logger.warning(f"⚠️ [Download #{msg.id}] Attempt {attempt}/{max_dl_attempts} failed: {dl_err}. Retrying in {wait_sec}s...")
+                        downloaded = None
+                finally:
+                    watchdog_done.set()
+                    if not watchdog_task.done():
+                        watchdog_task.cancel()
 
-                # Verify complete download (within 99% margin for metadata)
-                if expected_size is not None and expected_size > 0 and actual_size < (expected_size * 0.99):
-                    logger.warning(
-                        f"⚠️ [Download #{msg.id}] Incomplete file detected: "
-                        f"Got {actual_size / 1048576:.1f} MB / expected {expected_size / 1048576:.1f} MB. "
-                        f"Retrying download (Attempt {attempt}/{max_dl_attempts}) in {wait_sec}s..."
-                    )
-                    await reset_client_sessions(dl_client)
-                    try:
-                        os.unlink(downloaded)
-                    except Exception:
-                        pass
+                if not downloaded or not os.path.exists(downloaded):
+                    self._remove_transfer_progress(dl_key)
                     await asyncio.sleep(wait_sec)
                     continue
 
-                dur = time.time() - dl_start_t
-                spd = (actual_size / 1048576) / max(dur, 0.1)
-                self._clear_progress_line()
-                logger.info(f"✅ [Downloaded #{msg.id}] {file_name_display} ({actual_size / 1048576:.1f} MB) in {format_seconds(dur)} ({spd:.1f} MB/s)")
+                if downloaded and os.path.exists(downloaded):
+                    self._remove_transfer_progress(dl_key)
+                    actual_size = os.path.getsize(downloaded)
+                    
+                    if actual_size == 0:
+                        logger.warning(f"⚠️ [Download #{msg.id}] Pyrogram returned 0-byte file (possible AUTH_BYTES_INVALID or expired reference).")
+                        try:
+                            os.unlink(downloaded)
+                        except Exception:
+                            pass
+                        # Refresh message before bot fallback
+                        try:
+                            chat_id = (msg.chat.id if msg.chat else None) or self.config.source_chat_id
+                            refreshed = await dl_client.get_messages(chat_id, message_ids=[msg.id])
+                            if isinstance(refreshed, list) and refreshed and refreshed[0]:
+                                msg = refreshed[0]
+                            elif refreshed and not isinstance(refreshed, list):
+                                msg = refreshed
+                        except Exception:
+                            pass
 
-                p = Path(downloaded)
-                # Ensure the downloaded file has a valid photo extension for Telegram send_photo
-                if msg.photo and p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp"):
-                    fixed_p = p.with_suffix(".jpg")
-                    try:
-                        p.rename(fixed_p)
-                        return fixed_p
-                    except Exception:
-                        return p
-                return p
+                        if dl_client == self.userbot and self.client:
+                            logger.info(f"🔄 [Download #{msg.id}] Retrying via Bot client (DC auth fallback)...")
+                            try:
+                                downloaded = await self._execute_with_flood_retry(
+                                    self.client.download_media, message=msg, file_name=str(temp_target), progress=_prog
+                                )
+                                if downloaded and os.path.exists(downloaded):
+                                    actual_size = os.path.getsize(downloaded)
+                                    if actual_size == 0:
+                                        os.unlink(downloaded)
+                                        downloaded = None
+                            except Exception as bot_dl_err:
+                                logger.warning(f"⚠️ [Download #{msg.id}] Bot fallback also failed: {bot_dl_err}")
+                                downloaded = None
+                            finally:
+                                self._remove_transfer_progress(dl_key)
+                        if not downloaded or actual_size == 0:
+                            await asyncio.sleep(wait_sec)
+                            continue
 
-        self._remove_transfer_progress(dl_key)
+                    # Verify complete download (within 99% margin for metadata)
+                    if expected_size is not None and expected_size > 0 and actual_size < (expected_size * 0.99):
+                        logger.warning(
+                            f"⚠️ [Download #{msg.id}] Incomplete file detected: "
+                            f"Got {actual_size / 1048576:.1f} MB / expected {expected_size / 1048576:.1f} MB. "
+                            f"Retrying download (Attempt {attempt}/{max_dl_attempts}) in {wait_sec}s..."
+                        )
+                        await reset_client_sessions(dl_client)
+                        try:
+                            os.unlink(downloaded)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(wait_sec)
+                        continue
+
+                    dur = time.time() - dl_start_t
+                    spd = (actual_size / 1048576) / max(dur, 0.1)
+                    self._clear_progress_line()
+                    logger.info(f"✅ [Downloaded #{msg.id}] {file_name_display} ({actual_size / 1048576:.1f} MB) in {format_seconds(dur)} ({spd:.1f} MB/s)")
+
+                    p = Path(downloaded)
+                    # Ensure the downloaded file has a valid photo extension for Telegram send_photo
+                    if msg.photo and p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp"):
+                        fixed_p = p.with_suffix(".jpg")
+                        try:
+                            p.rename(fixed_p)
+                            return fixed_p
+                        except Exception:
+                            return p
+                    return p
+        finally:
+            self._remove_transfer_progress(dl_key)
+
         logger.error(f"❌ [Download #{msg.id}] Failed completely after {max_dl_attempts} download attempts.")
         return None
 

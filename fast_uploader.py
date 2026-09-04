@@ -550,6 +550,22 @@ async def fast_download_media(
             except Exception as s2_err:
                 logger.debug(f"Media download session expansion fallback: {s2_err}")
 
+        if total_parts > 20 and len(sessions) >= 2:
+            try:
+                s3 = Session(
+                    self, dc_id,
+                    auth_key,
+                    await self.storage.test_mode(),
+                    is_media=True
+                )
+                await s3.start()
+                if dc_id != await self.storage.dc_id():
+                    exp3 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                    await s3.invoke(raw.functions.auth.ImportAuthorization(id=exp3.id, bytes=exp3.bytes))
+                sessions.append(s3)
+            except Exception as s3_err:
+                logger.debug(f"Media download 3rd session expansion fallback: {s3_err}")
+
         try:
             part_queue: asyncio.Queue = asyncio.Queue()
             for i in range(total_parts):
@@ -574,8 +590,9 @@ async def fast_download_media(
 
             out_fp = open(out_path, "r+b")
 
-            num_workers = min(getattr(self, "max_concurrent_transmissions", 12) or 12, total_parts)
-            num_workers = max(1, min(num_workers, 16))
+            # 2 workers per dedicated TCP session eliminates socket contention & dogpiling
+            num_workers = min(len(sessions) * 2, total_parts)
+            num_workers = max(1, min(num_workers, 6))
 
             completed_parts: set = set()
             part_start_times: dict = {}
@@ -592,12 +609,12 @@ async def fast_download_media(
                         pass
 
                     if part_info is None:
-                        # Queue is empty: check for stalled straggler parts taking >3.0s
+                        # Queue is empty: check for stalled straggler parts taking >15.0s
                         async with lock:
                             now = time.time()
                             straggler_idx = None
                             for p_idx, s_time in list(part_start_times.items()):
-                                if p_idx not in completed_parts and (now - s_time) > 3.0:
+                                if p_idx not in completed_parts and (now - s_time) > 15.0:
                                     straggler_idx = p_idx
                                     part_start_times[p_idx] = now  # claim straggler
                                     break
@@ -616,18 +633,22 @@ async def fast_download_media(
                     part_start_times[part_idx] = time.time()
 
                     part_attempts = 0
-                    max_part_attempts = 10
+                    max_part_attempts = 8
                     chunk_data = None
                     session_idx = (part_idx + worker_id) % len(sessions)
 
                     while part_attempts < max_part_attempts and part_idx not in completed_parts and dl_error is None:
                         target_session = sessions[session_idx % len(sessions)]
                         try:
-                            r = await target_session.invoke(
-                                raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
-                                timeout=5,
-                                retries=1,
-                                sleep_threshold=30
+                            # 15s MTProto timeout with 25s wait_for wrapper prevents WAN stalls
+                            r = await asyncio.wait_for(
+                                target_session.invoke(
+                                    raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
+                                    timeout=15,
+                                    retries=2,
+                                    sleep_threshold=30
+                                ),
+                                timeout=25.0
                             )
                             if isinstance(r, raw.types.upload.File):
                                 chunk_data = r.bytes
@@ -640,7 +661,9 @@ async def fast_download_media(
                             if any(k in err_l for k in ("file_reference_expired", "filereferenceexpired")):
                                 dl_error = err
                                 break
-                            if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "timed out", "timeout", "handler is closed", "tcptransport", "operation on", "closed=true")):
+                            # Do NOT restart session on transient timeouts (restarting tears down socket for all other workers!)
+                            # Only restart if the socket was physically closed or broken:
+                            if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "closed=true")):
                                 try:
                                     await _safe_session_restart(target_session)
                                     if dc_id != await self.storage.dc_id():
@@ -652,7 +675,7 @@ async def fast_download_media(
                             if part_attempts >= max_part_attempts:
                                 dl_error = err
                                 break
-                            await asyncio.sleep(0.05)
+                            await asyncio.sleep(0.1)
 
                     if chunk_data is not None and part_idx not in completed_parts:
                         async with file_lock:
