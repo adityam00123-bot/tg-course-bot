@@ -189,6 +189,38 @@
   - **Clean Session Lifecycle Per File:** Auxiliary upload sessions are created freshly per file and cleanly stopped in `finally:`, eliminating persistent zombie sockets.
   - **Sane 90s Watchdog & 15s Straggler Protection:** Watchdog threshold set to 90s ($30\text{s} \times 3$). Straggler threshold set to 15.0s with chunk invoke wrapped in `asyncio.wait_for(..., timeout=25.0)`.
 
+### Error: Persistent TCPTransport Closed Loop (`the handler is closed`)
+* **Symptom:** Terminal repeatedly prints:
+  `[WARNING] Transient Telegram error on get_chat: unable to perform operation on <TCPTransport closed=True reading=False 0x...>; the handler is closed. Retrying in 2s... 4s... 8s... 16s... 30s...`
+  The bot retries in an endless loop without ever recovering the connection.
+* **Root Cause:**
+  Pyrogram's main MTProto TCP transport socket dropped (due to cloud network reset or DC idle timeout). Python's `asyncio` marks the `TCPTransport` as `closed=True`. Whenever Pyrogram attempts an RPC like `get_chat`, `RuntimeError("unable to perform operation on <TCPTransport closed=True...>")` is raised.
+  Because `RuntimeError` was not explicitly mapped as a connection-reset trigger in `_execute_with_flood_retry`, the bot only slept and retried on the *same already-closed socket instance*, leading to an endless retry loop.
+* **Permanent Fix:**
+  - Added `RuntimeError` to the caught exception tuple in `_execute_with_flood_retry`.
+  - Added string matching for `"HANDLER IS CLOSED"`, `"CLOSED=TRUE"`, `"TCPTRANSPORT"`, and `"OPERATION ON"`.
+  - When detected, the bot automatically triggers `await reset_client_sessions(self.client)` (and `self.userbot`), cleanly tearing down the dead transport and instantiating a fresh MTProto TCP connection before the next retry.
+
+---
+
+## 4. Channel Audit & Sequential Alignment
+
+### Issue: False Missing Lectures & Range Scan Limitations in Gap Auditor
+* **Symptom:**
+  1. Gap auditor falsely reported hundreds of missing lectures that were already present in the destination channel.
+  2. Whole-channel gap audits could not be cancelled or scoped, taking a long time on large channels.
+  3. Clicking "Restore Sequence" or "Simple Append" immediately re-scanned the entire destination channel from scratch, doubling the wait time.
+* **Root Cause:**
+  1. Destination channel scan was limited to `limit=800` messages, ignoring older migrated messages in large channels and falsely marking them as missing.
+  2. Videos processed with FFmpeg watermarking or thumbnail replacement had slightly different byte sizes, causing content-length fingerprinting to fail.
+  3. No live progress callback, cancellation token, or scope selection was provided in the UI.
+* **Permanent Fix:**
+  - Removed artificial message limit when indexing destination channel fingerprints.
+  - Added **Video Duration Fingerprinting** (`duration > 10` seconds) so watermarked videos with minor byte variance match correctly.
+  - Added **Scope Selection Menu** (`🚀 Entire Channel`, `🎯 Up to Checkpoint`, `✏️ Custom Range`).
+  - Added **Live Progress Reporting** and **User Cancellation** (`[ ⏹️ Stop / Cancel Scan ]` button via `engine.audit_cancel_event`).
+  - Cached audit scan results (`engine._cached_missing_ids`) so restoring sequence or appending starts instantly without duplicate re-scanning.
+
 
 
 

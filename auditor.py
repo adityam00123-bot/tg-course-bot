@@ -164,16 +164,19 @@ async def scan_channel_gaps(
     dest_chat_id: Union[int, str],
     start_id: Optional[int] = None,
     end_id: Optional[int] = None,
-    in_memory_failed_ids: Optional[List[int]] = None
+    in_memory_failed_ids: Optional[List[int]] = None,
+    progress_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+    cancel_event: Optional[asyncio.Event] = None
 ) -> Dict[str, Any]:
     """
     Scans source channel vs destination channel and failed_messages.json to identify missing lecture gaps.
     Uses multi-layered detection:
     1. Explicit failed_messages.json registry + in-memory error list.
     2. Persistent message_map.json.
-    3. Content & File-Size Fingerprinting: Compares exact byte sizes and text between Source and Destination.
+    3. Content & File-Size Fingerprinting: Compares exact byte sizes, video durations, and text.
     """
     from migration import get_failed_messages, load_checkpoint
+    from utils import format_progress_bar
 
     # 1. Gather all recorded failed IDs
     failed_ids = set(get_failed_messages(source_chat_id, dest_chat_id))
@@ -182,15 +185,22 @@ async def scan_channel_gaps(
 
     # 2. Determine effective range:
     cp = load_checkpoint(source_chat_id, dest_chat_id)
-    if not start_id:
+    if not start_id or start_id < 1:
         start_id = 1
-    if not end_id:
-        end_id = max(cp, 1)
+    if not end_id or end_id < start_id:
+        try:
+            latest_id = 1
+            async for m in client.get_chat_history(source_chat_id, limit=1):
+                latest_id = m.id
+            end_id = max(latest_id, cp, 1)
+        except Exception:
+            end_id = max(cp, 1)
 
     # 3. Read destination channel messages to build fingerprints
     dest_video_sizes = set()
     dest_doc_sizes = set()
     dest_photo_sizes = set()
+    dest_durations = set()
     dest_texts = set()
     dest_mapped_source_ids = set()
 
@@ -198,14 +208,25 @@ async def scan_channel_gaps(
     for sid in msg_map.keys():
         dest_mapped_source_ids.add(int(sid))
 
-    logger.info(f"🔍 [Auditor] Inspecting destination channel for content fingerprints...")
+    logger.info("🔍 [Auditor] Inspecting destination channel for content fingerprints...")
+    dest_count = 0
+    last_update_t = time.time()
+    discovered_map = {}
+
     try:
-        discovered_map = {}
-        async for dmsg in client.get_chat_history(dest_chat_id, limit=800):
+        async for dmsg in client.get_chat_history(dest_chat_id):
+            if cancel_event and cancel_event.is_set():
+                logger.info("[Auditor] Destination history scan cancelled by user.")
+                break
+
+            dest_count += 1
             if dmsg.empty or dmsg.service:
                 continue
-            if dmsg.video and getattr(dmsg.video, "file_size", None):
-                dest_video_sizes.add(dmsg.video.file_size)
+            if dmsg.video:
+                if getattr(dmsg.video, "file_size", None):
+                    dest_video_sizes.add(dmsg.video.file_size)
+                if getattr(dmsg.video, "duration", None):
+                    dest_durations.add(dmsg.video.duration)
             if dmsg.document and getattr(dmsg.document, "file_size", None):
                 dest_doc_sizes.add(dmsg.document.file_size)
             if dmsg.photo and getattr(dmsg.photo, "file_size", None):
@@ -218,6 +239,16 @@ async def scan_channel_gaps(
                 dest_mapped_source_ids.add(extracted_sid)
                 discovered_map[extracted_sid] = dmsg.id
 
+            now = time.time()
+            if progress_callback and (now - last_update_t) >= 1.5:
+                last_update_t = now
+                await progress_callback(
+                    f"📥 <b>Indexing Destination Channel...</b>\n\n"
+                    f"📊 <b>Indexed:</b> {dest_count} messages\n"
+                    f"🔗 <b>Recognized Mappings:</b> {len(dest_mapped_source_ids)}\n\n"
+                    f"<i>Scanning destination history to guarantee zero false-alarms...</i>"
+                )
+
         if discovered_map:
             update_message_map_batch(source_chat_id, dest_chat_id, discovered_map)
             msg_map.update(discovered_map)
@@ -226,14 +257,25 @@ async def scan_channel_gaps(
 
     # 4. Now scan source channel messages in the range [start_id, end_id]
     missing_ids = set(failed_ids)
+    scanned_up_to = start_id
+    is_cancelled = bool(cancel_event and cancel_event.is_set())
 
-    if end_id > start_id:
+    if end_id >= start_id and not is_cancelled:
         logger.info(f"🔍 [Auditor] Comparing Source #{start_id}..#{end_id} against Destination channel...")
-        scan_limit = 5000
-        target_ids = list(range(start_id, min(end_id + 1, start_id + scan_limit)))
+        target_ids = list(range(start_id, end_id + 1))
+        total_to_scan = len(target_ids)
+        scanned_count = 0
 
         for i in range(0, len(target_ids), 100):
+            if cancel_event and cancel_event.is_set():
+                logger.info("[Auditor] Source scan cancelled by user.")
+                is_cancelled = True
+                break
+
             batch = target_ids[i:i + 100]
+            scanned_count += len(batch)
+            scanned_up_to = batch[-1]
+
             try:
                 msgs = await client.get_messages(source_chat_id, message_ids=batch)
                 if not isinstance(msgs, list):
@@ -251,8 +293,12 @@ async def scan_channel_gaps(
 
                     # Check by content fingerprint
                     is_present = False
-                    if m.video and getattr(m.video, "file_size", None):
-                        if m.video.file_size in dest_video_sizes or m.video.file_size in dest_doc_sizes:
+                    if m.video:
+                        f_size = getattr(m.video, "file_size", None)
+                        f_dur = getattr(m.video, "duration", None)
+                        if f_size and (f_size in dest_video_sizes or f_size in dest_doc_sizes):
+                            is_present = True
+                        elif f_dur and f_dur in dest_durations and f_dur > 10:
                             is_present = True
                     elif m.document and getattr(m.document, "file_size", None):
                         if m.document.file_size in dest_doc_sizes or m.document.file_size in dest_video_sizes:
@@ -270,6 +316,19 @@ async def scan_channel_gaps(
             except Exception as scan_err:
                 logger.debug(f"[Auditor] Source scan error for batch {batch}: {scan_err}")
 
+            now = time.time()
+            if progress_callback and (now - last_update_t) >= 1.5:
+                last_update_t = now
+                pct = min(100, int((scanned_count / total_to_scan) * 100))
+                pbar = format_progress_bar(scanned_count, total_to_scan, length=10)
+                await progress_callback(
+                    f"🔍 <b>Auditing Messages ({pct}%)...</b>\n\n"
+                    f"📊 <code>{pbar}</code>\n"
+                    f"🔢 <b>Progress:</b> #{scanned_up_to} / #{end_id}\n"
+                    f"⚠️ <b>Missing Detected:</b> <b>{len(missing_ids)}</b>\n\n"
+                    f"<i>Scanning lectures in chronological sequence...</i>"
+                )
+
     missing_list = sorted(list(missing_ids))
     return {
         "source_chat_id": source_chat_id,
@@ -277,7 +336,8 @@ async def scan_channel_gaps(
         "missing_ids": missing_list,
         "count": len(missing_list),
         "mapped_count": len(msg_map),
-        "scanned_range": f"#{start_id} to #{end_id}"
+        "scanned_range": f"#{start_id} to #{scanned_up_to if is_cancelled else end_id}",
+        "cancelled": is_cancelled
     }
 
 

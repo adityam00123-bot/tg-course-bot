@@ -338,6 +338,10 @@ class MigrationEngine:
         self.deletion_cancel_event = asyncio.Event()
         self._deletion_task: Optional[asyncio.Task] = None
 
+        # Gap Audit state
+        self.audit_cancel_event = asyncio.Event()
+        self._audit_task: Optional[asyncio.Task] = None
+
         # Cache resolved peers across MTProto operations
         self._resolved_peers: Dict[Union[int, str], Any] = {}
         self._chat_forwards_restricted: bool = False
@@ -585,6 +589,20 @@ class MigrationEngine:
                     t.cancel()
         return True
 
+    def is_auditing(self) -> bool:
+        """Returns True if a gap audit scan is currently active."""
+        return bool(self._audit_task and not self._audit_task.done())
+
+    def cancel_audit(self) -> bool:
+        """Signals the active gap audit scan to stop immediately."""
+        if not self.is_auditing():
+            return False
+        logger.info("Gap audit cancellation requested by user.")
+        self.audit_cancel_event.set()
+        if self._audit_task and not self._audit_task.done():
+            self._audit_task.cancel()
+        return True
+
     async def start_migration(self, progress_callback: Optional[Callable[[str], Awaitable[None]]] = None) -> None:
         """Initiates the migration job asynchronously."""
         if self.is_busy():
@@ -657,7 +675,7 @@ class MigrationEngine:
 
                 await asyncio.sleep(sleep_duration)
 
-            except (RPCError, TimeoutError, ConnectionError, OSError) as e:
+            except (RPCError, TimeoutError, ConnectionError, OSError, RuntimeError) as e:
                 err_str = str(e).upper()
                 if "MESSAGE_NOT_MODIFIED" in err_str:
                     return None
@@ -678,7 +696,7 @@ class MigrationEngine:
                 if any(nr in err_str for nr in non_retryable):
                     raise
 
-                if any(k in err_str for k in ("BROKEN PIPE", "CONNECTIONRESET", "CONNECTIONLOST", "SOCKET")):
+                if any(k in err_str for k in ("BROKEN PIPE", "CONNECTIONRESET", "CONNECTIONLOST", "SOCKET", "HANDLER IS CLOSED", "CLOSED=TRUE", "TCPTRANSPORT", "OPERATION ON")):
                     try:
                         await reset_client_sessions(self.client)
                         if self.userbot:
