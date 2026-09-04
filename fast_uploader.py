@@ -534,24 +534,21 @@ async def fast_download_media(
         chunk_size = 1024 * 1024  # 1MB per MTProto part (strictly divisible by 4096)
         total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
 
-        # Up to 4 Parallel Media TCP sockets for files >30 parts, 3 for >10, 2 for >4 (matching fast_save_file)
-        num_target_sessions = 4 if total_parts > 30 else (3 if total_parts > 10 else (2 if total_parts > 4 else 1))
-        while len(sessions) < num_target_sessions:
+        if total_parts > 4:
             try:
-                s_extra = Session(
+                s2 = Session(
                     self, dc_id,
                     auth_key,
                     await self.storage.test_mode(),
                     is_media=True
                 )
-                await s_extra.start()
+                await s2.start()
                 if dc_id != await self.storage.dc_id():
-                    exp_extra = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
-                    await s_extra.invoke(raw.functions.auth.ImportAuthorization(id=exp_extra.id, bytes=exp_extra.bytes))
-                sessions.append(s_extra)
-            except Exception as sess_err:
-                logger.debug(f"Media download session expansion fallback: {sess_err}")
-                break
+                    exp2 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                    await s2.invoke(raw.functions.auth.ImportAuthorization(id=exp2.id, bytes=exp2.bytes))
+                sessions.append(s2)
+            except Exception as s2_err:
+                logger.debug(f"Media download session expansion fallback: {s2_err}")
 
         try:
             part_queue: asyncio.Queue = asyncio.Queue()
@@ -577,9 +574,8 @@ async def fast_download_media(
 
             out_fp = open(out_path, "r+b")
 
-            # Dedicated high-speed download workers pipelining across the session pool (~3-4 in-flight 1MB chunks per socket)
-            # Exactly mirrors high-speed upload configuration (which delivers ~35 MB/s)
-            num_workers = min(getattr(self, "max_concurrent_transmissions", 14) or 14, total_parts)
+            # Golden Concurrency Budget (2 DL sockets, 12-16 workers pipelining 1MB chunks)
+            num_workers = min(getattr(self, "max_concurrent_transmissions", 12) or 12, total_parts)
             num_workers = max(1, min(num_workers, 16))
 
             completed_parts: set = set()
