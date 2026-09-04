@@ -309,3 +309,16 @@
   - Removed socket restart on successful chunk uploads.
   - Restricted upload socket restarts strictly to fatal transport errors (`BrokenPipe`, `ConnectionReset`, `closed=true`), while transient timeouts rotate cleanly to the next socket (`session_idx += 1`) without socket destruction.
 
+### Error: Download Incomplete at Exactly 12MB (12582912 Bytes)
+* **Symptom:** Downloads immediately fail after receiving exactly 12 MB (`Download incomplete: 12582912/263307160 bytes received`) across all retry attempts.
+* **Root Cause:**
+  - In `fast_download_media`, the flow pacer defined `pacer_start_time` and `pacer_bytes_accum` in the outer function scope.
+  - Inside `_dl_worker`, assignments like `pacer_start_time = now_p` occurred without declaring `nonlocal`.
+  - In Python, reassigning an outer variable in an inner function without `nonlocal` causes Python to treat it as a local variable. On chunk completion, reading `pacer_start_time` threw `UnboundLocalError`.
+  - Because `asyncio.gather(*workers, return_exceptions=True)` swallowed worker exceptions without logging, each of the 12 workers died after processing exactly 1 chunk ($12 \times 1\text{MB} = 12582912$ bytes). `fast_download_media` exited with `Download incomplete`.
+* **Permanent Fix:**
+  - Encapsulated pacer state into a mutable dict `pacer_state = {"start_time": ..., "bytes": ...}` to eliminate variable scoping issues entirely.
+  - Added explicit exception logging (`exc_info=True`) inside `_dl_worker` and `_worker`.
+  - Inspected `gather` returned results to re-raise any uncaught worker exceptions.
+
+
