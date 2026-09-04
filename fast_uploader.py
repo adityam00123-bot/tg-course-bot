@@ -594,7 +594,7 @@ async def fast_download_media(
             out_fp = open(out_path, "r+b")
 
             # Golden Concurrency Budget (2 DL sockets, 12-16 workers pipelining 1MB chunks)
-            num_workers = min(getattr(self, "max_concurrent_transmissions", 12) or 12, total_parts)
+            num_workers = min(getattr(self, "max_concurrent_transmissions", 16) or 16, total_parts)
             num_workers = max(1, min(num_workers, 16))
 
             completed_parts: set = set()
@@ -602,6 +602,10 @@ async def fast_download_media(
             lock = asyncio.Lock()
             dl_done = asyncio.Event()
             workers: list = []
+
+            def _sync_write_chunk(fp, pos: int, data: bytes):
+                fp.seek(pos)
+                fp.write(data)
 
             async def _dl_worker(worker_id: int):
                 nonlocal downloaded_bytes, dl_error
@@ -643,7 +647,7 @@ async def fast_download_media(
                         part_start_times[part_idx] = time.time()
 
                         part_attempts = 0
-                        max_part_attempts = 8
+                        max_part_attempts = 10
                         chunk_data = None
                         # Strict round-robin across both sockets (if stolen, route to alternate socket)
                         session_idx = (part_idx + (1 if is_stolen else 0)) % len(sessions)
@@ -651,21 +655,23 @@ async def fast_download_media(
                         while part_attempts < max_part_attempts and part_idx not in completed_parts and dl_error is None:
                             target_session = sessions[session_idx % len(sessions)]
                             try:
-                                # 8s MTProto timeout with retries=1 and 15s wait_for wrapper prevents hang
+                                # 15s MTProto timeout with retries=0 for instant socket rotation on lag
                                 r = await asyncio.wait_for(
                                     target_session.invoke(
                                         raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
-                                        timeout=8,
-                                        retries=1,
+                                        timeout=15,
+                                        retries=0,
                                         sleep_threshold=30
                                     ),
-                                    timeout=15.0
+                                    timeout=20.0
                                 )
                                 if isinstance(r, raw.types.upload.File):
                                     chunk_data = r.bytes
                                     break
                                 elif isinstance(r, raw.types.upload.FileCdnRedirect):
                                     raise NotImplementedError("CDN redirect handled by fallback")
+                                else:
+                                    raise RuntimeError(f"Unexpected GetFile response type: {type(r)}")
                             except Exception as err:
                                 part_attempts += 1
                                 err_l = str(err).lower()
@@ -691,8 +697,7 @@ async def fast_download_media(
                         if chunk_data is not None and part_idx not in completed_parts:
                             async with file_lock:
                                 if part_idx not in completed_parts:
-                                    out_fp.seek(offset)
-                                    out_fp.write(chunk_data)
+                                    await asyncio.to_thread(_sync_write_chunk, out_fp, offset, chunk_data)
                                     completed_parts.add(part_idx)
                                     downloaded_bytes += len(chunk_data)
                                     if len(completed_parts) >= total_parts:
@@ -711,10 +716,21 @@ async def fast_download_media(
                                     pass
                 except asyncio.CancelledError:
                     return
+                except Exception as e:
+                    logger.error(f"DL Worker {worker_id} crashed unexpectedly: {e}", exc_info=True)
+                    if dl_error is None:
+                        dl_error = e
+                    return
 
             try:
                 workers.extend(asyncio.create_task(_dl_worker(w_id)) for w_id in range(num_workers))
-                await asyncio.gather(*workers, return_exceptions=True)
+                worker_results = await asyncio.gather(*workers, return_exceptions=True)
+
+                for res in worker_results:
+                    if isinstance(res, Exception) and not isinstance(res, asyncio.CancelledError):
+                        logger.error(f"DL Worker task exception: {res}", exc_info=res)
+                        if dl_error is None:
+                            dl_error = res
 
                 if dl_error is not None:
                     raise dl_error
