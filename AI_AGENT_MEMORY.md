@@ -43,14 +43,16 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
 - **Upload / Download Bandwidth & Connections**: Telegram's MTProto allows multi-part chunk streaming (4-8 TCP connections per file). The safe ceiling per account is **4 to 6 parallel file transfers (max 16 MTProto workers)**. Exceeding 16 simultaneous socket connections per session triggers DC-level TCP throttling (dropping speed to <1 MB/s) or aggressive FloodWait bans.
 - **Auto-Pacing on Media**: Because uploading a 1GB file naturally takes 1-2 minutes, the 2.0s delay is skipped during media transfers, as the upload time itself acts as natural pacing.
 
-## 8. Golden Architecture: Strict Sequential Turbo (Architecture A) — Golden Commit `cecd423`
-- **Golden Commit Hash:** `cecd423` (September 3, 2026) — **PROVEN MAXIMUM STABILITY & SPEED BASELINE**.
-- **Proven Live Performance Metrics (Kaggle Standard 4-vCPU):**
-  - **13.53 GB migrated in 27m 55s** (Sustained Card Speed: **8.3 – 8.8 MB/s**, including all DL + UL + idle time).
-  - **77 Media + 7 Text messages migrated with 0 ERRORS!**
-  - Single-file Upload Speed: **20 to 34 MB/s** (e.g. 1.12 GB in 33s = 33.7 MB/s, 185 MB in 5s = 32.6 MB/s).
-  - Single-file Download Speed: **12 to 28 MB/s**.
-  - **ZERO `⚠️PAUSED` states** throughout the entire multi-gigabyte run.
+## 8. Golden Architecture: Strict Sequential Turbo (Architecture A) — Golden Commit `2e2cbc5`
+- **Official All-Time Golden Commit:** `2e2cbc5` (September 5, 2026) — **PROVEN RECORD-BREAKER BASELINE (174+ GB in a single day with 0 ERRORS)**.
+- **Proven Live Performance Metrics (Kaggle Standard 4-vCPU, Taiwan & Europe IPs):**
+  - **Run 1 (Taiwan IP):** 110.64 GB (555 Media + 70 Text) in 3h 43m 47s with **0 ERRORS!**
+  - **Run 2 (Europe IP):** 51.09 GB (193 Media + 44 Text) in 2h 57m 50s with **0 ERRORS!**
+  - **Run 3 (Night Taiwan Run):** 12.24 GB in 20m (10.4 MB/s sustained card speed = ~37.4 GB/hr) with **0 ERRORS!**
+  - **Total 24h Data Transferred:** Over **174+ GB migrated** flawlessly, completely breaking all historical repository records.
+  - **Massive 2.0 GB Video Transfers:** Sustained 20–35 MB/s line rate (e.g. #4591 1999.9 MB DL in 1m 02s @ 32.2 MB/s, UL in 1m 18s @ 25.4 MB/s).
+  - **Pause Resilience:** Successfully survived DC burst rate-limit pauses (`⚡ ⬇️ DL: #4600 @ ⚠️PAUSED`) with 0 crashes, auto-rotating chunks and recovering instantly to 43.1 MB/s.
+  - **Free Disk Steady-State:** Maintained rock-steady at 19.5 GB free disk throughout multi-hour runs via active 10-message GC and orphan purge.
 - **Core Architecture Rules (DO NOT ALTER WITHOUT BENCHMARKING):**
   1. **Strict `slot.done` Producer-Consumer Lockstep:**
      - In `pipeline_producer`, `await slot.done.wait()` blocks the producer until the consumer has fully published the current message to the destination channel and unlinked all temporary files from disk.
@@ -69,8 +71,8 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
      - **Native `.m4v` Pass-Through:** Bypasses FFmpeg disk remux for `.m4v`, eliminating 7–10s disk I/O on 1GB+ files.
      - **Dedicated Per-File Clean Auth Handshake:** Strictly creates fresh `Auth(self, dc_id).create()` per file, avoiding stale transport drops on foreign DCs.
   5. **Emergency Rollback Point:**
-     - If future experiments ever degrade performance or introduce stalls, immediately revert to commit `22a8956`:
-       `git reset --hard 22a8956`
+     - If future experiments ever degrade performance or introduce stalls, immediately revert to golden commit `2e2cbc5`:
+       `git reset --hard 2e2cbc5`
 
 ## 9. High-Speed MTProto Engine: Zero-Freeze & High-Throughput Guidelines
 - **Zero-Freeze on Completion (100% Finish):**

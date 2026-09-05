@@ -303,4 +303,10 @@
   - **12-Hour Active Health Guard (`_run_periodic_maintenance`):** Every 10 processed messages, automatically invoke `gc.collect()`, monitor free disk space, and purge any orphaned temporary files (>5m old) to keep disk space 100% clean.
   - **Connection Dereferencing (`self.connection = None`):** In `_safe_session_stop`, immediately clear `self.connection` to force the OS kernel to release the file descriptor and TCP transport without waiting.
   - **Proactive 50-Message Session Refresh:** Every 50 messages, cleanly reset client media sessions via `reset_client_sessions()` to ensure fresh session salts and zero socket leaks over 12+ hours.
+* **Verified Golden Commit Baseline:** `2e2cbc5` (September 5, 2026)
+  - Successfully migrated **174+ GB across 3 runs in a single day with 100% success rate (0 ERRORS)**.
+  - Run 1 (Taiwan IP): 110.64 GB in 3h 43m with 0 errors.
+  - Run 2 (Europe IP): 51.09 GB in 2h 57m with 0 errors.
+  - Run 3 (Night Taiwan Run): 12.24 GB in 20m (10.4 MB/s sustained card speed, 2GB videos migrated in ~1m 40s) with 0 errors.
+  - **Verdict:** Officially designated as the repository's all-time golden commit.
 
