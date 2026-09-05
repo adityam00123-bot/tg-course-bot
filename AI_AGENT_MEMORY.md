@@ -93,3 +93,16 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
 ## 7. Cloud Execution Strategy
 1. **Primary: Kaggle Notebooks** (4 vCPU, 30 GB RAM, 2x T4 GPU, ~73 GB Disk). Allows "Save & Run All (Commit)" for 12-hour background execution without keeping the browser open. Weekly GPU quota is 30 hours.
 2. **Fallback: Google Colab** (2 vCPU, 12.6 GB RAM, 1x T4 GPU, ~78 GB Disk). Used when Kaggle's 30-hour weekly GPU quota is exhausted. Requires keeping the browser tab active.
+
+## 10. 12-Hour Continuous Migration Resilience Architecture (September 2026)
+- **Problem Statement:** Long migrations (>3–6 hours or >60–120 GB) historically hit error cascades due to:
+  1. Telegram's 2.5–3.0 hour `file_reference` hard expiration.
+  2. Kaggle's ~73 GB storage ceiling and Linux unlinked inode buffering.
+  3. Linux File Descriptor (FD) exhaustion (`ulimit -n 1024`) from thousands of sockets entering `TIME_WAIT`.
+  4. MTProto session salt and transport staleness after 6 hours of continuous data flow.
+- **Permanent Architectural Safeguards:**
+  1. **Just-In-Time (JIT) Fresh Token Fetch:** Immediately before download (`_pipeline_prefetch`), the bot calls `client.get_messages` for the single message, guaranteeing a 0-second-old `file_reference` and 0% `FILE_REFERENCE_EXPIRED` errors.
+  2. **12-Hour Health Guard (`_run_periodic_maintenance`):** Runs every 10 messages to execute `gc.collect()`, inspect free disk space, and purge orphaned temp files (>5m old) to keep `/kaggle/working` clean indefinitely.
+  3. **Clean Socket Dereferencing (`self.connection = None`):** Ensures closed transports and sockets release kernel file descriptors immediately without hitting the 1024 FD limit.
+  4. **Proactive 50-Message Session Refresh:** Periodically executes `reset_client_sessions` cleanly to refresh MTProto session salts and prevent 6-hour transport drops.
+

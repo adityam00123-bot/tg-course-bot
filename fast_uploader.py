@@ -60,6 +60,7 @@ async def _safe_session_stop(self):
                 await conn.close()
             except Exception:
                 pass
+            self.connection = None
 
         if recv_task:
             try:

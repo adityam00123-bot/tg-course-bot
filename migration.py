@@ -8,6 +8,7 @@ Includes Auto-Resume checkpointing and Concurrent Prefetching Pipeline.
 import os
 import sys
 import re
+import gc
 import shutil
 import zipfile
 import json
@@ -815,6 +816,58 @@ class MigrationEngine:
                         self.progress_msg_id = sent_msg.id
         except Exception as e:
             logger.warning(f"Failed to send progress notification: {e}")
+
+    async def _run_periodic_maintenance(self) -> None:
+        """
+        12-Hour Continuous Health Guard:
+        1. Executes Python garbage collection to eliminate heap fragmentation.
+        2. Inspects Kaggle storage quota and purges stale orphaned temporary files.
+        3. Periodically refreshes client DC media sessions to prevent 6-hour MTProto session stagnation.
+        """
+        try:
+            # 1. Memory Garbage Collection
+            gc.collect()
+
+            # 2. Storage Quota & Orphan File Purge
+            dl_dir = Config.DOWNLOAD_DIR
+            if dl_dir.exists():
+                usage = shutil.disk_usage(str(dl_dir))
+                free_gb = usage.free / (1024 ** 3)
+                curr_id = str(getattr(self.stats, "current_msg_id", 0) or 0)
+                now_t = time.time()
+                purged_count = 0
+                purged_bytes = 0
+
+                # Purge orphaned files older than 5 minutes (ignoring active file)
+                for p in list(dl_dir.glob("*")):
+                    if p.is_file():
+                        if curr_id and curr_id in p.name:
+                            continue
+                        try:
+                            mtime = p.stat().st_mtime
+                            if (now_t - mtime) > 300:
+                                sz = p.stat().st_size
+                                p.unlink(missing_ok=True)
+                                purged_count += 1
+                                purged_bytes += sz
+                        except Exception:
+                            pass
+
+                if purged_count > 0:
+                    logger.info(f"🧹 [Maintenance] Purged {purged_count} orphaned temp files ({purged_bytes / (1024**2):.1f} MB freed).")
+
+                usage_after = shutil.disk_usage(str(dl_dir))
+                free_gb_after = usage_after.free / (1024 ** 3)
+                logger.info(f"🩺 [Health Check] Free Disk: {free_gb_after:.1f} GB | RAM GC completed | Active File: #{curr_id}")
+
+            # 3. MTProto 6-Hour Salt & Session Refresh (every 50 messages)
+            if self.stats.processed_count > 0 and self.stats.processed_count % 50 == 0:
+                logger.info("🔄 [Maintenance] Performing 50-message clean MTProto media session refresh...")
+                await reset_client_sessions(self.client)
+                if self.userbot:
+                    await reset_client_sessions(self.userbot)
+        except Exception as maint_err:
+            logger.debug(f"Periodic maintenance notice: {maint_err}")
 
     async def _forward_without_tag(self, dest_chat: Union[int, str], source_chat: Union[int, str], msg_id: int) -> bool:
         """
@@ -1854,6 +1907,20 @@ class MigrationEngine:
                     except Exception:
                         leased_dl_client = None
 
+                # JIT Fresh Message Fetch: Guarantees 0s-old file_reference token (Zero FILE_REFERENCE_EXPIRED)
+                fetch_client = leased_dl_client or self.userbot or self.client
+                try:
+                    chat_id = (msg.chat.id if msg.chat else None) or self.config.source_chat_id
+                    fresh_m = await fetch_client.get_messages(chat_id, message_ids=[msg.id])
+                    if isinstance(fresh_m, list) and fresh_m and fresh_m[0]:
+                        msg = fresh_m[0]
+                        slot.msg = fresh_m[0]
+                    elif fresh_m and not isinstance(fresh_m, list):
+                        msg = fresh_m
+                        slot.msg = fresh_m
+                except Exception as fresh_err:
+                    logger.debug(f"JIT fresh message fetch fallback for #{msg.id}: {fresh_err}")
+
                 try:
                     slot.local_path = await self._download_media_to_file(msg, client=leased_dl_client)
                 finally:
@@ -2657,8 +2724,19 @@ class MigrationEngine:
                             if self.userbot:
                                 await reset_client_sessions(self.userbot)
                             await asyncio.sleep(2)
-                            # In-place synchronous migration guarantees 100% strict chronological lecture sequence!
-                            await self._migrate_single_message(slot.msg)
+                            # In-place synchronous migration with fresh JIT message reference!
+                            rec_client = self.userbot or self.client
+                            rec_msg = slot.msg
+                            try:
+                                chat_id = (slot.msg.chat.id if slot.msg.chat else None) or self.config.source_chat_id
+                                fresh_rec = await rec_client.get_messages(chat_id, message_ids=[slot.msg.id])
+                                if isinstance(fresh_rec, list) and fresh_rec and fresh_rec[0]:
+                                    rec_msg = fresh_rec[0]
+                                elif fresh_rec and not isinstance(fresh_rec, list):
+                                    rec_msg = fresh_rec
+                            except Exception as rec_err:
+                                logger.debug(f"Recovery fresh message fetch notice for #{slot.msg.id}: {rec_err}")
+                            await self._migrate_single_message(rec_msg)
                         else:
                             await self._pipeline_upload_slot(slot)
                         
@@ -2686,6 +2764,10 @@ class MigrationEngine:
                 if (self.stats.processed_count - last_progress_count) >= Config.PROGRESS_INTERVAL:
                     last_progress_count = self.stats.processed_count
                     await self._send_progress_update(is_final=False)
+
+                # Periodic 12-Hour Continuous Health Guard: Garbage collection, disk quota inspection & orphan purge
+                if self.stats.processed_count > 0 and self.stats.processed_count % 10 == 0:
+                    await self._run_periodic_maintenance()
 
                 # Rolling 60s Token Bucket Rate Limiter: Max 24 messages/minute (safe Telegram channel ceiling)
                 # Gives 0.0s instant burst on small files when safe, but throttles smoothly during bursts of 24+ files

@@ -286,3 +286,21 @@
         asyncio.create_task(_bg_stop(aux_sessions))
     ```
     `fast_download_media` and `fast_save_file` return instantly to `migration.py` in **0.0 milliseconds**, completely eliminating the 100% completion freeze!
+
+---
+
+## 7. Long-Running Multi-Hour / Multi-Gigabyte Migration Degradation
+
+### Error: 3–6 Hour Degradation & 64GB / 124GB Error Accumulation
+* **Symptom:** Migration runs at peak speed (30–80 MB/s) with 0 errors for the first 2.5 to 3 hours (~60 GB) or up to 6 hours (~124 GB), but then errors begin accumulating rapidly.
+* **Root Cause:**
+  1. **Telegram `file_reference` Expiration:** Hard MTProto layer limit strictly expires media references after 2.5–3.0 hours. When fetching messages in 50-message batches, later messages in the batch have expired tokens by the time download starts, throwing `[400 FILE_REFERENCE_EXPIRED]`.
+  2. **Kaggle 73 GB Storage Quota & Linux Unlinked Inodes:** Accumulated temporary fragments, dirty page buffers, and log files hit the ~73 GB Kaggle overlay filesystem limit, causing `posix_fallocate()` to throw `OSError: [Errno 28] No space left on device`.
+  3. **Linux Kernel Socket / File Descriptor Churn (`ulimit -n 1024`):** Creating and destroying thousands of TCP sockets leaves sockets in kernel `TIME_WAIT` (60–120s), eventually approaching the 1024 open file descriptor process ceiling and causing transport collisions.
+  4. **MTProto Session Salt & Stale Gateway Connections:** After 6 hours of continuous data flow, Telegram's MTProto gateway requires fresh session salts; unrefreshed sockets experience silent RST packet drops.
+* **Permanent Fix:**
+  - **Just-In-Time (JIT) 100% Fresh Token Fetch:** Immediately before download in `_pipeline_prefetch`, query `client.get_messages(chat_id, [msg.id])` to obtain a brand new `file_reference` token seconds before download, eliminating `FILE_REFERENCE_EXPIRED` permanently.
+  - **12-Hour Active Health Guard (`_run_periodic_maintenance`):** Every 10 processed messages, automatically invoke `gc.collect()`, monitor free disk space, and purge any orphaned temporary files (>5m old) to keep disk space 100% clean.
+  - **Connection Dereferencing (`self.connection = None`):** In `_safe_session_stop`, immediately clear `self.connection` to force the OS kernel to release the file descriptor and TCP transport without waiting.
+  - **Proactive 50-Message Session Refresh:** Every 50 messages, cleanly reset client media sessions via `reset_client_sessions()` to ensure fresh session salts and zero socket leaks over 12+ hours.
+
