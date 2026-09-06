@@ -114,5 +114,9 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
   2. **Pause-Immune Dynamic Watchdogs:** Download watchdog threshold increased to **90s** to comfortably accommodate Telegram's 40–60s token refill window. Upload rolling average is only evaluated during active transmission (`stall_rounds == 0` and `span >= 50s`), preventing false triggers during ACK pauses.
   3. **Transport State Guarding:** Upload and download workers check `target_session.is_started.is_set()` before calling `.invoke()`, instantly rotating to another session if a socket is restarting.
   4. **Guaranteed Fresh JIT Token on Every Attempt:** `get_messages` is called immediately before each download attempt, eliminating `FILE_REFERENCE_EXPIRED` 100%.
+  5. **FloodWait Watchdog Immunity (Commit `ae3a906`):**
+     - **Verified Record:** 181.14 GB transferred in 5h 48m with **0 ERRORS** on Taiwan IP `35.185.154.61` (388 media files @ 8.9 MB/s).
+     - **Discovery:** After 181 GB, Telegram issued a standard 816s FloodWait cooling pause. While `_execute_with_flood_retry` was sleeping, the stall watchdog saw no data for 50s and aborted the sleep!
+     - **Safeguard:** Added `self._is_flood_waiting` flag. Watchdogs in both `migration.py` and `fast_uploader.py` now check this flag and pause their stall counters, allowing Telegram rate-limit penalties to elapse naturally and resume automatically without burning retry attempts.
 
 
