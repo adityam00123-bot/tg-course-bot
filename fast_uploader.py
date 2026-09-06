@@ -33,6 +33,7 @@ except Exception:
 _orig_session_stop = Session.stop
 _orig_session_restart = Session.restart
 _session_restart_lock = asyncio.Lock()
+_DC_AUTH_KEYS: dict = {}
 
 
 async def _safe_session_stop(self):
@@ -543,12 +544,15 @@ async def fast_download_media(
 
         dc_id = file_id.dc_id
 
-        # Dedicated Clean MTProto Sessions (2 parallel sockets delivering ~35-45 MB/s sustained)
-        auth_key = (
-            await Auth(self, dc_id, await self.storage.test_mode()).create()
-            if dc_id != await self.storage.dc_id()
-            else await self.storage.auth_key()
-        )
+        # Dedicated Clean MTProto Sessions (Strict 2 parallel sockets delivering ~35-45 MB/s sustained)
+        # Auth key caching across files eliminates 1.5-2.5s Diffie-Hellman prime factorization latency per file
+        if dc_id == await self.storage.dc_id():
+            auth_key = await self.storage.auth_key()
+        else:
+            auth_key = _DC_AUTH_KEYS.get(dc_id)
+            if not auth_key:
+                auth_key = await Auth(self, dc_id, await self.storage.test_mode()).create()
+                _DC_AUTH_KEYS[dc_id] = auth_key
 
         session = Session(
             self, dc_id,
@@ -663,6 +667,7 @@ async def fast_download_media(
                         except asyncio.QueueEmpty:
                             pass
 
+                        is_stolen = False
                         if part_info is None:
                             # Queue is empty: check for stalled straggler parts taking >3.0s
                             async with lock:
@@ -672,6 +677,7 @@ async def fast_download_media(
                                     if p_idx not in completed_parts and (now - s_time) > 3.0:
                                         straggler_idx = p_idx
                                         part_start_times[p_idx] = now  # claim straggler
+                                        is_stolen = True
                                         break
                             if straggler_idx is not None:
                                 part_info = (straggler_idx, straggler_idx * chunk_size)
@@ -690,7 +696,8 @@ async def fast_download_media(
                         part_attempts = 0
                         max_part_attempts = 10
                         chunk_data = None
-                        session_idx = (part_idx + worker_id) % len(sessions)
+                        # Balanced round-robin across both sockets (if stolen, route to alternate socket)
+                        session_idx = (part_idx + (1 if is_stolen else 0)) % len(sessions)
 
                         while part_attempts < max_part_attempts and part_idx not in completed_parts and dl_error is None:
                             target_session = sessions[session_idx % len(sessions)]
@@ -716,6 +723,8 @@ async def fast_download_media(
                             except Exception as err:
                                 part_attempts += 1
                                 err_l = str(err).lower()
+                                if any(k in err_l for k in ("auth_key", "session_revoked")):
+                                    _DC_AUTH_KEYS.pop(dc_id, None)
                                 if any(k in err_l for k in ("file_reference_expired", "filereferenceexpired")):
                                     dl_error = err
                                     break

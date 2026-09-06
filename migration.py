@@ -1346,20 +1346,19 @@ class MigrationEngine:
                 dl_client = client or self.userbot or self.client
                 wait_sec = min(2 ** min(attempt, 4), 16)
 
-                # Guarantee fresh file_reference token directly before download attempt
-                try:
-                    chat_id = (msg.chat.id if msg.chat else None) or self.config.source_chat_id
-                    refreshed = await dl_client.get_messages(chat_id, message_ids=[msg.id])
-                    if isinstance(refreshed, list) and refreshed and refreshed[0] and not refreshed[0].empty:
-                        msg = refreshed[0]
-                        if attempt > 1:
+                # If retrying after a connection drop or stall, refresh fresh file_reference token
+                if attempt > 1:
+                    try:
+                        chat_id = (msg.chat.id if msg.chat else None) or self.config.source_chat_id
+                        refreshed = await dl_client.get_messages(chat_id, message_ids=[msg.id])
+                        if isinstance(refreshed, list) and refreshed and refreshed[0] and not refreshed[0].empty:
+                            msg = refreshed[0]
                             logger.info(f"🔄 [Download #{msg.id}] Refreshed fresh file_reference token from Telegram (Attempt {attempt}).")
-                    elif refreshed and not isinstance(refreshed, list) and not refreshed.empty:
-                        msg = refreshed
-                        if attempt > 1:
+                        elif refreshed and not isinstance(refreshed, list) and not refreshed.empty:
+                            msg = refreshed
                             logger.info(f"🔄 [Download #{msg.id}] Refreshed fresh file_reference token from Telegram (Attempt {attempt}).")
-                except Exception as ref_err:
-                    logger.debug(f"Could not refresh file_reference for #{msg.id}: {ref_err}")
+                    except Exception as ref_err:
+                        logger.debug(f"Could not refresh file_reference for #{msg.id}: {ref_err}")
 
                 watchdog_done = asyncio.Event()
 
