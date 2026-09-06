@@ -683,7 +683,20 @@ class MigrationEngine:
                 except Exception:
                     pass
 
-                await asyncio.sleep(sleep_duration)
+                self._is_flood_waiting = True
+                if getattr(self, "client", None):
+                    self.client._is_flood_waiting = True
+                if getattr(self, "userbot", None):
+                    self.userbot._is_flood_waiting = True
+
+                try:
+                    await asyncio.sleep(sleep_duration)
+                finally:
+                    self._is_flood_waiting = False
+                    if getattr(self, "client", None):
+                        self.client._is_flood_waiting = False
+                    if getattr(self, "userbot", None):
+                        self.userbot._is_flood_waiting = False
 
             except (RPCError, TimeoutError, ConnectionError, OSError, RuntimeError) as e:
                 err_str = str(e).upper()
@@ -1313,6 +1326,10 @@ class MigrationEngine:
                             pass
                         if self.cancel_event.is_set():
                             break
+                        # If bot is legitimately waiting out a Telegram FloodWait, do NOT abort!
+                        if getattr(self, "_is_flood_waiting", False):
+                            dl_progress_tracker["last_time"] = time.time()
+                            continue
                         idle = time.time() - dl_progress_tracker["last_time"]
                         if idle > 90.0:
                             logger.warning(

@@ -249,6 +249,12 @@ async def fast_save_file(
             while history and (now - history[0][0]) > 60.0:
                 history.pop(0)
 
+            # If client is legitimately waiting out a FloodWait, pause watchdog counter
+            if getattr(self, "_is_flood_waiting", False):
+                last_snap = curr
+                stall_rounds = 0
+                continue
+
             if curr < file_size:
                 # 1. Zero Progress Check (18 rounds * 5s = 90s of continuous silence)
                 if curr == last_snap:
