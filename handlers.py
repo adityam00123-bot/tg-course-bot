@@ -911,35 +911,51 @@ def register_handlers(bot: Client) -> None:
         await message.reply_text(text, reply_markup=kb, parse_mode=enums.ParseMode.HTML)
 
     # -------------------------------------------------------------
-    # /scan or /audit Command Handler (Calculate Total Channel Data GBs)
+    # /scan or /size Command Handler (Calculate Total Channel Data GBs)
+    # Supports /scan (source), /scan source, or /scan dest
     # -------------------------------------------------------------
     @bot.on_message(filters.private & filters.command(["scan", "size"]))
     async def handle_scan_command(_, message: Message):
         user_id = message.from_user.id
         engine = get_user_engine(user_id, bot)
 
-        if not engine.config.source_chat_id:
+        arg = (message.command[1].lower() if len(message.command) > 1 else "").strip()
+        is_dest = arg in ("dest", "destination", "dst", "copy", "outgoing")
+
+        target_chat_id = engine.config.dest_chat_id if is_dest else engine.config.source_chat_id
+        target_title = (engine.config.dest_chat_title or "Destination Channel") if is_dest else (engine.config.source_chat_title or "Source Channel")
+        channel_icon = "📤" if is_dest else "📥"
+        role_label = "Destination (Migrated)" if is_dest else "Source"
+
+        if not target_chat_id:
+            ch_role = "Outgoing Destination Channel" if is_dest else "Incoming Source Channel"
             await message.reply_text(
-                "⚠️ <b>Please select an Incoming Source Channel first!</b>\n"
+                f"⚠️ <b>Please select an {ch_role} first!</b>\n"
                 "<i>Open /start or /dashboard to choose the channel to scan.</i>",
                 parse_mode=enums.ParseMode.HTML
             )
             return
 
-        if engine.is_busy():
-            await message.reply_text("⚠️ <b>A job is currently running!</b> Please wait for it to finish.", parse_mode=enums.ParseMode.HTML)
+        if engine.is_metadata_scanning():
+            await message.reply_text(
+                "⚠️ <b>A channel scan is already in progress!</b> Tap 'Stop Scan' to cancel.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏹️ Stop Scan", callback_data="action_stop_scan")]]),
+                parse_mode=enums.ParseMode.HTML
+            )
             return
 
         engine.owner_id = user_id
-        src_title = engine.config.source_chat_title or str(engine.config.source_chat_id)
-        start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else None
-        end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else None
+        start_id = engine.config.start_msg_id if (engine.config.mode == MigrationMode.RANGE and not is_dest) else None
+        end_id = engine.config.end_msg_id if (engine.config.mode == MigrationMode.RANGE and not is_dest) else None
+
+        stop_scan_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏹️ Stop / Cancel Scan", callback_data="action_stop_scan")]])
 
         status_msg = await message.reply_text(
-            f"🔍 <b>Scanning Channel Metadata...</b>\n\n"
-            f"📥 <b>Channel:</b> {src_title}\n"
+            f"🔍 <b>Scanning {role_label} Channel Metadata...</b>\n\n"
+            f"{channel_icon} <b>Channel:</b> {target_title}\n"
             f"⏳ <i>Auditing media items, files, and calculating total GBs...</i>\n\n"
             f"📈 <b>Progress:</b> <code>[░░░░░░░░░░] 0%</code>",
+            reply_markup=stop_scan_kb,
             parse_mode=enums.ParseMode.HTML
         )
 
@@ -950,13 +966,14 @@ def register_handlers(bot: Client) -> None:
             d_count = current_stats["document_count"]
             try:
                 await status_msg.edit_text(
-                    f"🔍 <b>Scanning Channel Metadata...</b>\n\n"
-                    f"📥 <b>Channel:</b> {src_title}\n"
+                    f"🔍 <b>Scanning {role_label} Channel Metadata...</b>\n\n"
+                    f"{channel_icon} <b>Channel:</b> {target_title}\n"
                     f"📈 <b>Progress:</b> {pbar} ({scanned}/{total})\n\n"
                     f"🎬 <b>Videos Found:</b> {v_count}\n"
                     f"📁 <b>Documents/PDFs:</b> {d_count}\n"
                     f"📦 <b>Current Tally:</b> ~{cur_gb:.2f} GB\n\n"
                     f"⏳ <i>Reading metadata headers (0 MB downloaded)...</i>",
+                    reply_markup=stop_scan_kb,
                     parse_mode=enums.ParseMode.HTML
                 )
             except Exception:
@@ -964,7 +981,7 @@ def register_handlers(bot: Client) -> None:
 
         try:
             stats = await engine.scan_channel_metadata(
-                chat_id=engine.config.source_chat_id,
+                chat_id=target_chat_id,
                 start_id=start_id,
                 end_id=end_id,
                 progress_callback=_cmd_scan_prog
@@ -976,36 +993,57 @@ def register_handlers(bot: Client) -> None:
             p_mb = stats["photo_bytes"] / (1024 ** 2)
             eta_str = format_seconds(stats["estimated_seconds"])
 
+            header_tag = "📊 <b>DESTINATION MIGRATED DATA REPORT</b>" if is_dest else "📊 <b>CHANNEL DATA AUDIT REPORT</b>"
+            stopped_notice = "\n⚠️ <i>Scan was stopped early by user. Results below reflect messages scanned so far.</i>\n" if stats.get("stopped_by_user") else ""
+
             report_text = (
-                "📊 <b>CHANNEL DATA AUDIT REPORT</b>\n"
+                f"{header_tag}\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📥 <b>Channel:</b> {src_title}\n"
-                f"🔢 <b>Scanned Range:</b> #{stats['start_id']} to #{stats['end_id']} ({stats['scanned_count']} msgs)\n\n"
+                f"{channel_icon} <b>Channel:</b> {stats.get('chat_title', target_title)}\n"
+                f"🔢 <b>Scanned Scope:</b> #{stats['start_id']} to #{stats['end_id']} ({stats['scanned_count']} msgs)\n"
+                f"{stopped_notice}\n"
                 f"🎬 <b>Videos:</b> {stats['video_count']} (<code>~{v_gb:.2f} GB</code>)\n"
                 f"📁 <b>Documents/PDFs:</b> {stats['document_count']} (<code>~{d_gb:.2f} GB</code>)\n"
                 f"🖼️ <b>Photos:</b> {stats['photo_count']} (<code>~{p_mb:.1f} MB</code>)\n"
                 f"💬 <b>Text / Links:</b> {stats['text_count']}\n"
                 f"⏭️ <b>Service / Empty:</b> {stats['skipped_count']}\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📦 <b>TOTAL DATA TO MIGRATE:</b> <b>{tot_gb:.2f} GB</b>\n"
-                f"⚡ <b>Estimated Time (@ ~8 MB/s):</b> ~{eta_str}\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "<i>Tap below to return to dashboard and start migration:</i>"
+                f"📦 <b>TOTAL DATA:</b> <b>{tot_gb:.2f} GB</b>\n"
             )
 
-            scan_kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("🚀 RUN MIGRATION", callback_data="action_run"),
-                    InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")
-                ]
-            ])
+            if not is_dest:
+                report_text += (
+                    f"⚡ <b>Estimated Time (@ ~8 MB/s):</b> ~{eta_str}\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "<i>Tap below to return to dashboard and start migration:</i>"
+                )
+                scan_kb = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("🚀 RUN MIGRATION", callback_data="action_run"),
+                        InlineKeyboardButton("📤 Scan Destination", callback_data="action_scan_dest")
+                    ],
+                    [
+                        InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")
+                    ]
+                ])
+            else:
+                report_text += (
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "<i>Above is the total verified content stored in your destination channel.</i>"
+                )
+                scan_kb = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("📥 Scan Source Channel", callback_data="action_scan_source"),
+                        InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")
+                    ]
+                ])
 
             await status_msg.edit_text(report_text, reply_markup=scan_kb, parse_mode=enums.ParseMode.HTML)
         except Exception as e:
             logger.error(f"Scan failed: {e}")
             await status_msg.edit_text(
                 f"❌ <b>Scan Failed:</b> {e}\n\n"
-                f"<i>Please ensure the source channel is accessible.</i>",
+                f"<i>Please ensure the channel is accessible.</i>",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]]),
                 parse_mode=enums.ParseMode.HTML
             )
@@ -2359,25 +2397,53 @@ def register_handlers(bot: Client) -> None:
             await query.message.edit_text(text, reply_markup=kb, parse_mode=enums.ParseMode.HTML)
 
         elif data == "action_scan_channel":
-            if not engine.config.source_chat_id:
-                await query.answer("⚠️ Please select an Incoming Source Channel first!", show_alert=True)
+            src_name = engine.config.source_chat_title or (str(engine.config.source_chat_id) if engine.config.source_chat_id else "None")
+            dst_name = engine.config.dest_chat_title or (str(engine.config.dest_chat_id) if engine.config.dest_chat_id else "None")
+            scan_choose_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📥 Scan Source Channel (Total)", callback_data="action_scan_source")],
+                [InlineKeyboardButton("📤 Scan Destination (Migrated)", callback_data="action_scan_dest")],
+                [InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]
+            ])
+            await query.message.edit_text(
+                "🔍 <b>Channel Data & Size Scanner</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📥 <b>Source:</b> {src_name}\n"
+                f"📤 <b>Destination:</b> {dst_name}\n\n"
+                "<i>Select which channel you want to audit for total media & GBs:</i>",
+                reply_markup=scan_choose_kb,
+                parse_mode=enums.ParseMode.HTML
+            )
+
+        elif data in ("action_scan_source", "action_scan_dest"):
+            is_dest = (data == "action_scan_dest")
+            target_chat_id = engine.config.dest_chat_id if is_dest else engine.config.source_chat_id
+            target_title = (engine.config.dest_chat_title or "Destination Channel") if is_dest else (engine.config.source_chat_title or "Source Channel")
+            channel_icon = "📤" if is_dest else "📥"
+            role_label = "Destination (Migrated)" if is_dest else "Source"
+
+            if not target_chat_id:
+                ch_role = "Outgoing Destination Channel" if is_dest else "Incoming Source Channel"
+                await query.answer(f"⚠️ Please select an {ch_role} first!", show_alert=True)
                 return
 
-            if engine.is_busy():
-                await query.answer("⚠️ A job is currently running. Please wait for it to finish.", show_alert=True)
+            if engine.is_metadata_scanning():
+                await query.answer("⚠️ A channel scan is already running! Tap 'Stop Scan' to cancel.", show_alert=True)
                 return
 
             engine.owner_id = user_id
-            await query.answer("🔍 Starting fast channel metadata scan...")
-            src_title = engine.config.source_chat_title or str(engine.config.source_chat_id)
-            start_id = engine.config.start_msg_id if engine.config.mode == MigrationMode.RANGE else None
-            end_id = engine.config.end_msg_id if engine.config.mode == MigrationMode.RANGE else None
+            await query.answer(f"🔍 Starting {role_label} channel scan...")
+
+            start_id = engine.config.start_msg_id if (engine.config.mode == MigrationMode.RANGE and not is_dest) else None
+            end_id = engine.config.end_msg_id if (engine.config.mode == MigrationMode.RANGE and not is_dest) else None
+
+            stop_scan_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏹️ Stop / Cancel Scan", callback_data="action_stop_scan")]])
 
             await query.message.edit_text(
-                f"🔍 <b>Scanning Channel Metadata...</b>\n\n"
-                f"📥 <b>Channel:</b> {src_title}\n"
+                f"🔍 <b>Scanning {role_label} Channel Metadata...</b>\n\n"
+                f"{channel_icon} <b>Channel:</b> {target_title}\n"
                 f"⏳ <i>Auditing media items, files, and calculating total GBs...</i>\n\n"
                 f"📈 <b>Progress:</b> <code>[░░░░░░░░░░] 0%</code>",
+                reply_markup=stop_scan_kb,
                 parse_mode=enums.ParseMode.HTML
             )
 
@@ -2388,13 +2454,14 @@ def register_handlers(bot: Client) -> None:
                 d_count = current_stats["document_count"]
                 try:
                     await query.message.edit_text(
-                        f"🔍 <b>Scanning Channel Metadata...</b>\n\n"
-                        f"📥 <b>Channel:</b> {src_title}\n"
+                        f"🔍 <b>Scanning {role_label} Channel Metadata...</b>\n\n"
+                        f"{channel_icon} <b>Channel:</b> {target_title}\n"
                         f"📈 <b>Progress:</b> {pbar} ({scanned}/{total})\n\n"
                         f"🎬 <b>Videos Found:</b> {v_count}\n"
                         f"📁 <b>Documents/PDFs:</b> {d_count}\n"
                         f"📦 <b>Current Tally:</b> ~{cur_gb:.2f} GB\n\n"
                         f"⏳ <i>Reading metadata headers (0 MB downloaded)...</i>",
+                        reply_markup=stop_scan_kb,
                         parse_mode=enums.ParseMode.HTML
                     )
                 except Exception:
@@ -2402,7 +2469,7 @@ def register_handlers(bot: Client) -> None:
 
             try:
                 stats = await engine.scan_channel_metadata(
-                    chat_id=engine.config.source_chat_id,
+                    chat_id=target_chat_id,
                     start_id=start_id,
                     end_id=end_id,
                     progress_callback=_scan_prog
@@ -2414,39 +2481,68 @@ def register_handlers(bot: Client) -> None:
                 p_mb = stats["photo_bytes"] / (1024 ** 2)
                 eta_str = format_seconds(stats["estimated_seconds"])
 
+                header_tag = "📊 <b>DESTINATION MIGRATED DATA REPORT</b>" if is_dest else "📊 <b>CHANNEL DATA AUDIT REPORT</b>"
+                stopped_notice = "\n⚠️ <i>Scan was stopped early by user. Results below reflect messages scanned so far.</i>\n" if stats.get("stopped_by_user") else ""
+
                 report_text = (
-                    "📊 <b>CHANNEL DATA AUDIT REPORT</b>\n"
+                    f"{header_tag}\n"
                     "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"📥 <b>Channel:</b> {src_title}\n"
-                    f"🔢 <b>Scanned Range:</b> #{stats['start_id']} to #{stats['end_id']} ({stats['scanned_count']} msgs)\n\n"
+                    f"{channel_icon} <b>Channel:</b> {stats.get('chat_title', target_title)}\n"
+                    f"🔢 <b>Scanned Scope:</b> #{stats['start_id']} to #{stats['end_id']} ({stats['scanned_count']} msgs)\n"
+                    f"{stopped_notice}\n"
                     f"🎬 <b>Videos:</b> {stats['video_count']} (<code>~{v_gb:.2f} GB</code>)\n"
                     f"📁 <b>Documents/PDFs:</b> {stats['document_count']} (<code>~{d_gb:.2f} GB</code>)\n"
                     f"🖼️ <b>Photos:</b> {stats['photo_count']} (<code>~{p_mb:.1f} MB</code>)\n"
                     f"💬 <b>Text / Links:</b> {stats['text_count']}\n"
                     f"⏭️ <b>Service / Empty:</b> {stats['skipped_count']}\n\n"
                     "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📦 <b>TOTAL DATA TO MIGRATE:</b> <b>{tot_gb:.2f} GB</b>\n"
-                    f"⚡ <b>Estimated Time (@ ~8 MB/s):</b> ~{eta_str}\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "<i>Tap below to return to dashboard and start migration:</i>"
+                    f"📦 <b>TOTAL DATA:</b> <b>{tot_gb:.2f} GB</b>\n"
                 )
 
-                scan_kb = InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("🚀 RUN MIGRATION", callback_data="action_run"),
-                        InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")
-                    ]
-                ])
+                if not is_dest:
+                    report_text += (
+                        f"⚡ <b>Estimated Time (@ ~8 MB/s):</b> ~{eta_str}\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        "<i>Tap below to return to dashboard and start migration:</i>"
+                    )
+                    scan_kb = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("🚀 RUN MIGRATION", callback_data="action_run"),
+                            InlineKeyboardButton("📤 Scan Destination", callback_data="action_scan_dest")
+                        ],
+                        [
+                            InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")
+                        ]
+                    ])
+                else:
+                    report_text += (
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        "<i>Above is the total verified content stored in your destination channel.</i>"
+                    )
+                    scan_kb = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("📥 Scan Source Channel", callback_data="action_scan_source"),
+                            InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")
+                        ]
+                    ])
 
                 await query.message.edit_text(report_text, reply_markup=scan_kb, parse_mode=enums.ParseMode.HTML)
             except Exception as e:
                 logger.error(f"Scan failed: {e}")
                 await query.message.edit_text(
                     f"❌ <b>Scan Failed:</b> {e}\n\n"
-                    f"<i>Please ensure the source channel is accessible.</i>",
+                    f"<i>Please ensure the channel is accessible.</i>",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Dashboard", callback_data="nav_forward_dash")]]),
                     parse_mode=enums.ParseMode.HTML
                 )
+
+        elif data == "action_stop_scan":
+            if engine.is_metadata_scanning():
+                engine.cancel_scan()
+                await query.answer("⏹️ Stopping channel scan...", show_alert=False)
+            else:
+                await query.answer("ℹ️ No active scan running.", show_alert=False)
+
 
         elif data == "action_audit_gaps":
             if not engine.config.source_chat_id or not engine.config.dest_chat_id:

@@ -343,6 +343,11 @@ class MigrationEngine:
         self.audit_cancel_event = asyncio.Event()
         self._audit_task: Optional[asyncio.Task] = None
 
+        # Channel Size Scan state
+        self.scan_cancel_event = asyncio.Event()
+        self._scan_task: Optional[asyncio.Task] = None
+        self.is_scanning: bool = False
+
         # Cache resolved peers across MTProto operations
         self._resolved_peers: Dict[Union[int, str], Any] = {}
         self._chat_forwards_restricted: bool = False
@@ -613,6 +618,20 @@ class MigrationEngine:
             self._audit_task.cancel()
         return True
 
+    def is_metadata_scanning(self) -> bool:
+        """Returns True if a channel size metadata scan is currently active."""
+        return bool(getattr(self, "is_scanning", False) or (self._scan_task and not self._scan_task.done()))
+
+    def cancel_scan(self) -> bool:
+        """Signals the active channel metadata scan to stop immediately."""
+        if not self.is_metadata_scanning():
+            return False
+        logger.info("Channel metadata scan cancellation requested by user.")
+        self.scan_cancel_event.set()
+        if self._scan_task and not self._scan_task.done():
+            self._scan_task.cancel()
+        return True
+
     async def start_migration(self, progress_callback: Optional[Callable[[str], Awaitable[None]]] = None) -> None:
         """Initiates the migration job asynchronously."""
         if self.is_busy():
@@ -647,17 +666,18 @@ class MigrationEngine:
             self._resolved_peers[chat_id] = await self.client.resolve_peer(chat_id)
         return self._resolved_peers[chat_id]
 
-    async def _execute_with_flood_retry(self, coro_fn: Callable, *args, **kwargs) -> Any:
+    async def _execute_with_flood_retry(self, coro_fn: Callable, *args, cancel_event: Optional[asyncio.Event] = None, **kwargs) -> Any:
         """
         Executes an asynchronous Pyrogram MTProto API call with automatic
         FloodWait backoff and transient network retry handling.
         """
         attempt = 0
         max_attempts = 10
+        active_cancel = cancel_event if cancel_event is not None else self.cancel_event
 
         while attempt < max_attempts:
-            if self.cancel_event.is_set():
-                raise asyncio.CancelledError("Migration cancelled by user.")
+            if active_cancel.is_set():
+                raise asyncio.CancelledError("Operation cancelled by user.")
 
             try:
                 return await coro_fn(*args, **kwargs)
@@ -920,149 +940,176 @@ class MigrationEngine:
         Scans message metadata in batches of 100 without downloading any media files.
         Calculates exact total bytes, video counts, document counts, and estimated migration duration.
         """
-        if not self.userbot:
-            from client import get_or_create_user_client
-            self.userbot = await get_or_create_user_client(self.owner_id)
+        self.scan_cancel_event.clear()
+        self.is_scanning = True
 
-        scan_client = self.userbot or self.client
-
-        # Ensure channel peer / access_hash is cached
         try:
-            await self._execute_with_flood_retry(scan_client.get_chat, chat_id)
-        except Exception:
+            if not self.userbot:
+                from client import get_or_create_user_client
+                self.userbot = await get_or_create_user_client(self.owner_id)
+
+            scan_client = self.userbot or self.client
+
+            # Ensure channel peer / access_hash is cached
+            chat_title = str(chat_id)
             try:
-                async for _ in scan_client.get_dialogs(limit=100):
-                    pass
+                ch_obj = await self._execute_with_flood_retry(scan_client.get_chat, chat_id, cancel_event=self.scan_cancel_event)
+                if ch_obj and getattr(ch_obj, "title", None):
+                    chat_title = ch_obj.title
             except Exception:
-                pass
-
-        # Determine channel max ID
-        latest_msg = None
-        try:
-            async for m in scan_client.get_chat_history(chat_id, limit=1):
-                latest_msg = m
-                break
-        except Exception:
-            try:
-                async for _ in scan_client.get_dialogs(limit=100):
+                try:
+                    async for _ in scan_client.get_dialogs(limit=100):
+                        pass
+                except Exception:
                     pass
+
+            # Determine channel max ID
+            latest_msg = None
+            try:
                 async for m in scan_client.get_chat_history(chat_id, limit=1):
                     latest_msg = m
                     break
-            except Exception as ch_err:
-                logger.error(f"Error accessing channel {chat_id}: {ch_err}")
-                raise
-
-        if not latest_msg:
-            raise ValueError("Channel appears to be empty or inaccessible.")
-
-        max_id = latest_msg.id
-        effective_start = start_id or 1
-        effective_end = min(end_id, max_id) if end_id else max_id
-        total_msgs = max(1, effective_end - effective_start + 1)
-
-        stats = {
-            "total_messages": total_msgs,
-            "start_id": effective_start,
-            "end_id": effective_end,
-            "scanned_count": 0,
-            "video_count": 0,
-            "video_bytes": 0,
-            "document_count": 0,
-            "document_bytes": 0,
-            "photo_count": 0,
-            "photo_bytes": 0,
-            "audio_count": 0,
-            "audio_bytes": 0,
-            "text_count": 0,
-            "skipped_count": 0,
-            "total_bytes": 0,
-            "estimated_seconds": 0.0
-        }
-
-        offset_id = 0
-        if effective_end < max_id:
-            offset_id = effective_end + 1
-
-        last_cb_time = time.time()
-
-        async for m in scan_client.get_chat_history(chat_id, offset_id=offset_id):
-            if self.cancel_event.is_set():
-                break
-
-            if m.id < effective_start:
-                break
-
-            if m.id > effective_end:
-                continue
-
-            stats["scanned_count"] += 1
-            if stats["scanned_count"] % 100 == 0:
-                await asyncio.sleep(0.6)  # Calibrated 600ms pacing per 100 messages to respect Telegram GetHistory API rate limits
-
-            if not m or m.empty or m.service:
-                stats["skipped_count"] += 1
-                continue
-
-            if m.video:
-                stats["video_count"] += 1
-                stats["video_bytes"] += (m.video.file_size or 0)
-            elif m.document:
-                fn = (m.document.file_name or "").lower()
-                if any(fn.endswith(ext) for ext in self._VIDEO_EXTS):
-                    stats["video_count"] += 1
-                    stats["video_bytes"] += (m.document.file_size or 0)
-                else:
-                    stats["document_count"] += 1
-                    stats["document_bytes"] += (m.document.file_size or 0)
-            elif m.photo:
-                stats["photo_count"] += 1
-                p_size = 0
-                if getattr(m.photo, "file_size", None):
-                    p_size = m.photo.file_size
-                elif getattr(m.photo, "sizes", None) and len(m.photo.sizes) > 0:
-                    p_size = getattr(m.photo.sizes[-1], "file_size", 0) or 0
-                stats["photo_bytes"] += (p_size or 500 * 1024)
-            elif m.audio or m.voice:
-                stats["audio_count"] += 1
-                a_size = (getattr(m.audio, "file_size", 0) or getattr(m.voice, "file_size", 0) or 0)
-                stats["audio_bytes"] += a_size
-            elif m.text or m.caption:
-                stats["text_count"] += 1
-            else:
-                stats["skipped_count"] += 1
-
-            now = time.time()
-            if now - last_cb_time >= 2.0 or stats["scanned_count"] >= total_msgs:
-                last_cb_time = now
-                stats["total_bytes"] = (
-                    stats["video_bytes"] +
-                    stats["document_bytes"] +
-                    stats["photo_bytes"] +
-                    stats["audio_bytes"]
-                )
-                stats["estimated_seconds"] = stats["total_bytes"] / (8 * 1024 * 1024)
-                if progress_callback:
-                    try:
-                        await progress_callback(stats["scanned_count"], total_msgs, stats)
-                    except Exception:
+            except Exception:
+                try:
+                    async for _ in scan_client.get_dialogs(limit=100):
                         pass
+                    async for m in scan_client.get_chat_history(chat_id, limit=1):
+                        latest_msg = m
+                        break
+                except Exception as ch_err:
+                    logger.error(f"Error accessing channel {chat_id}: {ch_err}")
+                    raise
 
-        stats["total_bytes"] = (
-            stats["video_bytes"] +
-            stats["document_bytes"] +
-            stats["photo_bytes"] +
-            stats["audio_bytes"]
-        )
-        stats["estimated_seconds"] = stats["total_bytes"] / (8 * 1024 * 1024)
+            if not latest_msg:
+                raise ValueError("Channel appears to be empty or inaccessible.")
 
-        logger.info(
-            f"✅ [Scan Complete] Scanned {stats['scanned_count']}/{total_msgs} messages | "
-            f"Videos: {stats['video_count']} ({stats['video_bytes']/(1024**3):.2f} GB) | "
-            f"Docs: {stats['document_count']} ({stats['document_bytes']/(1024**3):.2f} GB) | "
-            f"Total Data: {stats['total_bytes']/(1024**3):.2f} GB"
-        )
-        return stats
+            max_id = latest_msg.id
+            effective_start = start_id or 1
+            effective_end = min(end_id, max_id) if end_id else max_id
+            total_msgs = max(1, effective_end - effective_start + 1)
+
+            stats = {
+                "chat_id": chat_id,
+                "chat_title": chat_title,
+                "total_messages": total_msgs,
+                "start_id": effective_start,
+                "end_id": effective_end,
+                "scanned_count": 0,
+                "video_count": 0,
+                "video_bytes": 0,
+                "document_count": 0,
+                "document_bytes": 0,
+                "photo_count": 0,
+                "photo_bytes": 0,
+                "audio_count": 0,
+                "audio_bytes": 0,
+                "text_count": 0,
+                "skipped_count": 0,
+                "total_bytes": 0,
+                "estimated_seconds": 0.0,
+                "stopped_by_user": False
+            }
+
+            offset_id = 0
+            if effective_end < max_id:
+                offset_id = effective_end + 1
+
+            last_cb_time = time.time()
+
+            history_iter = scan_client.get_chat_history(chat_id, offset_id=offset_id).__aiter__()
+            while not self.scan_cancel_event.is_set():
+                try:
+                    m = await history_iter.__anext__()
+                except StopAsyncIteration:
+                    break
+                except FloodWait as fw:
+                    logger.warning(f"⚠️ Telegram FloodWait during channel scan: sleeping for {fw.value + 1}s")
+                    await asyncio.sleep(fw.value + 1)
+                    continue
+                except Exception as hist_err:
+                    logger.warning(f"Warning during channel scan get_chat_history: {hist_err}")
+                    break
+
+                if self.scan_cancel_event.is_set():
+                    break
+
+                if m.id < effective_start:
+                    break
+
+                if m.id > effective_end:
+                    continue
+
+                stats["scanned_count"] += 1
+                if stats["scanned_count"] % 100 == 0:
+                    await asyncio.sleep(0.6)  # Calibrated 600ms pacing per 100 messages to respect Telegram GetHistory API rate limits
+
+                if not m or m.empty or m.service:
+                    stats["skipped_count"] += 1
+                    continue
+
+                if m.video:
+                    stats["video_count"] += 1
+                    stats["video_bytes"] += (m.video.file_size or 0)
+                elif m.document:
+                    fn = (m.document.file_name or "").lower()
+                    if any(fn.endswith(ext) for ext in self._VIDEO_EXTS):
+                        stats["video_count"] += 1
+                        stats["video_bytes"] += (m.document.file_size or 0)
+                    else:
+                        stats["document_count"] += 1
+                        stats["document_bytes"] += (m.document.file_size or 0)
+                elif m.photo:
+                    stats["photo_count"] += 1
+                    p_size = 0
+                    if getattr(m.photo, "file_size", None):
+                        p_size = m.photo.file_size
+                    elif getattr(m.photo, "sizes", None) and len(m.photo.sizes) > 0:
+                        p_size = getattr(m.photo.sizes[-1], "file_size", 0) or 0
+                    stats["photo_bytes"] += (p_size or 500 * 1024)
+                elif m.audio or m.voice:
+                    stats["audio_count"] += 1
+                    a_size = (getattr(m.audio, "file_size", 0) or getattr(m.voice, "file_size", 0) or 0)
+                    stats["audio_bytes"] += a_size
+                elif m.text or m.caption:
+                    stats["text_count"] += 1
+                else:
+                    stats["skipped_count"] += 1
+
+                now = time.time()
+                if now - last_cb_time >= 2.0 or stats["scanned_count"] >= total_msgs:
+                    last_cb_time = now
+                    stats["total_bytes"] = (
+                        stats["video_bytes"] +
+                        stats["document_bytes"] +
+                        stats["photo_bytes"] +
+                        stats["audio_bytes"]
+                    )
+                    stats["estimated_seconds"] = stats["total_bytes"] / (8 * 1024 * 1024)
+                    if progress_callback:
+                        try:
+                            await progress_callback(stats["scanned_count"], total_msgs, stats)
+                        except Exception:
+                            pass
+
+            stats["stopped_by_user"] = self.scan_cancel_event.is_set()
+            stats["total_bytes"] = (
+                stats["video_bytes"] +
+                stats["document_bytes"] +
+                stats["photo_bytes"] +
+                stats["audio_bytes"]
+            )
+            stats["estimated_seconds"] = stats["total_bytes"] / (8 * 1024 * 1024)
+
+            status_note = " (Cancelled by user)" if stats["stopped_by_user"] else ""
+            logger.info(
+                f"✅ [Scan Complete{status_note}] Scanned {stats['scanned_count']}/{total_msgs} messages | "
+                f"Videos: {stats['video_count']} ({stats['video_bytes']/(1024**3):.2f} GB) | "
+                f"Docs: {stats['document_count']} ({stats['document_bytes']/(1024**3):.2f} GB) | "
+                f"Total Data: {stats['total_bytes']/(1024**3):.2f} GB"
+            )
+            return stats
+        finally:
+            self.is_scanning = False
 
     async def _try_instant_server_copy(self, msg: Message, dest_chat: Union[int, str]) -> bool:
         """
