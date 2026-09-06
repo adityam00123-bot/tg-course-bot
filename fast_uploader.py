@@ -228,7 +228,7 @@ async def fast_save_file(
     up_done = asyncio.Event()
 
     async def _stall_watchdog():
-        """Monitors upload progress. Aborts if stalled >90s or rolling 45s average < 1.0 MB/s."""
+        """Monitors upload progress. Aborts if stalled >90s or rolling 60s average < 0.5 MB/s during active transmission."""
         nonlocal upload_error
         last_snap = 0
         stall_rounds = 0
@@ -245,32 +245,33 @@ async def fast_save_file(
             curr = uploaded_bytes
             history.append((now, curr))
 
-            # Keep only entries from the last 45 seconds
-            while history and (now - history[0][0]) > 45.0:
+            # Keep only entries from the last 60 seconds
+            while history and (now - history[0][0]) > 60.0:
                 history.pop(0)
 
             if curr < file_size:
-                # 1. Zero Progress Check (18 rounds * 5s = 90s)
+                # 1. Zero Progress Check (18 rounds * 5s = 90s of continuous silence)
                 if curr == last_snap:
                     stall_rounds += 1
                     if stall_rounds >= 18:
                         upload_error = RuntimeError(
-                            f"Upload stalled >90s with zero progress at {curr}/{file_size} bytes."
+                            f"Upload stalled >90s with zero progress at {curr / 1048576:.1f}/{file_size / 1048576:.1f} MB."
                         )
                         break
                 else:
                     stall_rounds = 0
 
-                # 2. Cumulative Rolling Average Check over 45 seconds (Immune to momentary spikes!)
-                if file_size > 30 * 1024 * 1024 and history:
+                # 2. Cumulative Rolling Average Check: Only evaluate when transmission is actively progressing (stall_rounds == 0)
+                # and after at least 50s of sustained history, to prevent tripping during server ACK pauses
+                if file_size > 30 * 1024 * 1024 and stall_rounds == 0 and len(history) >= 10:
                     oldest_t, oldest_b = history[0]
                     span = now - oldest_t
-                    if span >= 35.0:  # Evaluated once we have 35-45s of cumulative history
+                    if span >= 50.0:
                         bytes_moved = curr - oldest_b
                         rolling_mbps = (bytes_moved / (1024 * 1024)) / span
-                        if rolling_mbps < 1.0:
+                        if rolling_mbps < 0.5 and bytes_moved > 0:
                             upload_error = RuntimeError(
-                                f"Upload crawling too slow (rolling 45s avg: {rolling_mbps:.2f} MB/s < 1.0 MB/s) "
+                                f"Upload crawling too slow (rolling 60s avg: {rolling_mbps:.2f} MB/s < 0.5 MB/s) "
                                 f"at {curr / 1048576:.1f}/{file_size / 1048576:.1f} MB. Aborting for fresh reconnect."
                             )
                             break
@@ -357,18 +358,23 @@ async def fast_save_file(
 
                 while part_attempts < max_part_attempts and part_idx not in completed_parts and upload_error is None:
                     target_session = sessions[session_idx % len(sessions)] or getattr(self, "session", None)
+                    if not target_session or not getattr(target_session, "is_started", None) or not target_session.is_started.is_set():
+                        session_idx += 1
+                        await asyncio.sleep(0.05)
+                        continue
+
                     t_chunk_start = time.time()
                     try:
-                        # 10s MTProto timeout with retries=1 and 18s wait_for wrapper prevents indefinite hang
+                        # 12s MTProto timeout with retries=1 and 20s wait_for wrapper prevents indefinite hang
                         res = await asyncio.wait_for(
-                            target_session.invoke(rpc, timeout=10, retries=1, sleep_threshold=60),
-                            timeout=18.0
+                            target_session.invoke(rpc, timeout=12, retries=1, sleep_threshold=60),
+                            timeout=20.0
                         )
                         if res is True or res:
                             part_ack = True
-                            # If a 512KB chunk took unusually long (>4.0s = <128 KB/s), refresh that socket in background
+                            # If a 512KB chunk took unusually long (>6.0s = <85 KB/s), refresh that socket in background
                             chunk_dur = time.time() - t_chunk_start
-                            if chunk_dur > 4.0 and len(sessions) > 1:
+                            if chunk_dur > 6.0 and len(sessions) > 1:
                                 try:
                                     asyncio.create_task(_safe_session_restart(target_session))
                                 except Exception:
@@ -380,7 +386,7 @@ async def fast_save_file(
                         # Auto-recover broken or closed socket without dropping parts
                         if any(k in err_str for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "operation on", "closed=true", "timed out", "timeout")):
                             try:
-                                await _safe_session_restart(target_session)
+                                asyncio.create_task(_safe_session_restart(target_session))
                             except Exception:
                                 pass
                         session_idx += 1  # rotate to next healthy socket in the pool
@@ -570,18 +576,35 @@ async def fast_download_media(
             except Exception as s2_err:
                 logger.debug(f"Media download session expansion fallback: {s2_err}")
 
-        try:
-            part_queue: asyncio.Queue = asyncio.Queue()
-            for i in range(total_parts):
-                offset = i * chunk_size
-                part_queue.put_nowait((i, offset))
+        parts_path = out_path.with_name(out_path.name + ".parts")
+        completed_parts: set = set()
+        downloaded_bytes = 0
 
-            downloaded_bytes = 0
-            progress_lock = asyncio.Lock()
-            file_lock = asyncio.Lock()
-            dl_error: Optional[Exception] = None
+        can_resume = (
+            out_path.exists()
+            and parts_path.exists()
+            and out_path.stat().st_size == file_size
+            and parts_path.stat().st_size == total_parts
+        )
 
-            # Pre-allocate output file using posix_fallocate (zero extents fragmentation on Linux/Kaggle)
+        if can_resume:
+            try:
+                parts_data = bytearray(parts_path.read_bytes())
+                completed_parts = {i for i, b in enumerate(parts_data) if b == 1}
+                downloaded_bytes = sum(
+                    chunk_size if i < total_parts - 1 else (file_size - i * chunk_size)
+                    for i in completed_parts
+                )
+                if completed_parts:
+                    logger.info(
+                        f"⚡ [Download Resume] Resuming {out_path.name}: "
+                        f"{len(completed_parts)}/{total_parts} parts ({downloaded_bytes / 1048576:.1f}/{file_size / 1048576:.1f} MB) already on disk!"
+                    )
+            except Exception as resume_err:
+                logger.debug(f"Resume check fallback: {resume_err}")
+                can_resume = False
+
+        if not can_resume:
             with open(out_path, "wb") as fp:
                 if file_size > 0:
                     try:
@@ -591,13 +614,34 @@ async def fast_download_media(
                             fp.truncate(file_size)
                     except Exception:
                         fp.truncate(file_size)
+            parts_path.write_bytes(b"\x00" * total_parts)
+            completed_parts = set()
+            downloaded_bytes = 0
+
+        if len(completed_parts) >= total_parts:
+            try:
+                parts_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return str(out_path)
+
+        try:
+            part_queue: asyncio.Queue = asyncio.Queue()
+            for i in range(total_parts):
+                if i not in completed_parts:
+                    offset = i * chunk_size
+                    part_queue.put_nowait((i, offset))
+
+            progress_lock = asyncio.Lock()
+            file_lock = asyncio.Lock()
+            dl_error: Optional[Exception] = None
 
             out_fp = open(out_path, "r+b")
+            parts_fp = open(parts_path, "r+b")
 
             num_workers = min(getattr(self, "max_concurrent_transmissions", 12) or 12, total_parts)
-            num_workers = max(1, min(num_workers, 16))
+            num_workers = max(1, min(num_workers, 12))
 
-            completed_parts: set = set()
             part_start_times: dict = {}
             lock = asyncio.Lock()
             dl_done = asyncio.Event()
@@ -644,10 +688,15 @@ async def fast_download_media(
 
                         while part_attempts < max_part_attempts and part_idx not in completed_parts and dl_error is None:
                             target_session = sessions[session_idx % len(sessions)]
+                            if not target_session or not getattr(target_session, "is_started", None) or not target_session.is_started.is_set():
+                                session_idx += 1
+                                await asyncio.sleep(0.05)
+                                continue
+
                             try:
                                 r = await target_session.invoke(
                                     raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size),
-                                    timeout=5,
+                                    timeout=12,
                                     retries=1,
                                     sleep_threshold=30
                                 )
@@ -666,10 +715,7 @@ async def fast_download_media(
                                     break
                                 if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "timed out", "timeout", "handler is closed", "tcptransport", "operation on", "closed=true")):
                                     try:
-                                        await _safe_session_restart(target_session)
-                                        if dc_id != await self.storage.dc_id():
-                                            exp_fresh = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
-                                            await target_session.invoke(raw.functions.auth.ImportAuthorization(id=exp_fresh.id, bytes=exp_fresh.bytes))
+                                        asyncio.create_task(_safe_session_restart(target_session))
                                     except Exception:
                                         pass
                                 session_idx += 1  # rotate to next healthy socket immediately
@@ -683,6 +729,8 @@ async def fast_download_media(
                                 if part_idx not in completed_parts:
                                     out_fp.seek(offset)
                                     out_fp.write(chunk_data)
+                                    parts_fp.seek(part_idx)
+                                    parts_fp.write(b"\x01")
                                     completed_parts.add(part_idx)
                                     downloaded_bytes += len(chunk_data)
                                     if len(completed_parts) >= total_parts:
@@ -722,10 +770,20 @@ async def fast_download_media(
                 if file_size > 0 and downloaded_bytes < file_size:
                     raise RuntimeError(f"Download incomplete: {downloaded_bytes}/{file_size} bytes received.")
 
+                if len(completed_parts) >= total_parts:
+                    try:
+                        parts_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
                 return str(out_path)
             finally:
                 try:
                     out_fp.close()
+                except Exception:
+                    pass
+                try:
+                    parts_fp.close()
                 except Exception:
                     pass
         finally:

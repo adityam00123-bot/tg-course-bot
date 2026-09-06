@@ -171,6 +171,12 @@ def cleanup_temp_file(path: Union[str, Path]) -> None:
 
     try:
         p = Path(path)
+        parts_p = p.with_name(p.name + ".parts")
+        if parts_p.exists():
+            try:
+                parts_p.unlink(missing_ok=True)
+            except Exception:
+                pass
         if p.exists() and p.is_file():
             for _ in range(3):
                 try:

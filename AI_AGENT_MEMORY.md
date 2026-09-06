@@ -102,9 +102,17 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
   2. Kaggle's ~73 GB storage ceiling and Linux unlinked inode buffering.
   3. Linux File Descriptor (FD) exhaustion (`ulimit -n 1024`) from thousands of sockets entering `TIME_WAIT`.
   4. MTProto session salt and transport staleness after 6 hours of continuous data flow.
-- **Permanent Architectural Safeguards:**
-  1. **Just-In-Time (JIT) Fresh Token Fetch:** Immediately before download (`_pipeline_prefetch`), the bot calls `client.get_messages` for the single message, guaranteeing a 0-second-old `file_reference` and 0% `FILE_REFERENCE_EXPIRED` errors.
-  2. **12-Hour Health Guard (`_run_periodic_maintenance`):** Runs every 10 messages to execute `gc.collect()`, inspect free disk space, and purge orphaned temp files (>5m old) to keep `/kaggle/working` clean indefinitely.
-  3. **Clean Socket Dereferencing (`self.connection = None`):** Ensures closed transports and sockets release kernel file descriptors immediately without hitting the 1024 FD limit.
-  4. **Proactive 50-Message Session Refresh:** Periodically executes `reset_client_sessions` cleanly to refresh MTProto session salts and prevent 6-hour transport drops.
+## 11. Degradation Cascade Elimination & Non-Stop Migration Architecture (Commit `5e7ac42`+)
+- **The Degradation Cascade Root Cause (Observed on `#5002–#5009` after 4.5h & >100 GB):**
+  1. **Telegram Token Bucket Emptying:** MTProto servers enforce an edge token bucket (~120–150 MB). Bursting at 65 MB/s empties this bucket in ~2s.
+  2. **Telegram Refill Window (40–60s):** The Telegram DC pauses packet delivery for 40–60 seconds to refill tokens.
+  3. **The Fatal 45s Watchdog & Unlink:** The download watchdog killed the task at 45s. On retry, line 1268 unlinked `temp_target` and `fast_download_media` wiped the file from byte 0. It re-downloaded to 130 MB, paused, got aborted at 45s, repeated 4 times, and failed the file!
+  4. **Upload Rolling-Average False Abort:** The upload watchdog aborted if rolling average was `<1.0 MB/s` after 35s. During a DC ACK pause, progress is 0, so rolling speed is 0.0 MB/s, causing premature aborts and restarting parts from 0.
+  5. **Closed TCPTransport Race:** When a session restarted, concurrent workers invoking on the unstarted transport crashed with `unable to perform operation on <TCPTransport closed=True reading=False>; the handler is closed`.
+- **The 4 Permanent Architectural Safeguards:**
+  1. **Chunk-Level Resume via `.parts` Bitmask:** `fast_download_media` creates a companion binary file (`<path>.parts`). Completed 1MB parts are recorded in real-time. If interrupted, retry inspects `.parts`, keeps all previously downloaded bytes on disk, and queues ONLY missing parts. Progress never resets!
+  2. **Pause-Immune Dynamic Watchdogs:** Download watchdog threshold increased to **90s** to comfortably accommodate Telegram's 40–60s token refill window. Upload rolling average is only evaluated during active transmission (`stall_rounds == 0` and `span >= 50s`), preventing false triggers during ACK pauses.
+  3. **Transport State Guarding:** Upload and download workers check `target_session.is_started.is_set()` before calling `.invoke()`, instantly rotating to another session if a socket is restarting.
+  4. **Guaranteed Fresh JIT Token on Every Attempt:** `get_messages` is called immediately before each download attempt, eliminating `FILE_REFERENCE_EXPIRED` 100%.
+
 

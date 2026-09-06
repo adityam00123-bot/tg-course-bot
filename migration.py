@@ -1262,12 +1262,14 @@ class MigrationEngine:
                 if self.cancel_event.is_set():
                     return None
 
-                # Clean any stale partial file before attempting
-                if temp_target.exists():
-                    try:
-                        temp_target.unlink()
-                    except Exception:
-                        pass
+                # If this is the initial attempt (attempt == 1), clean stale file only if no valid parts tracker exists
+                parts_target = temp_target.with_name(temp_target.name + ".parts")
+                if attempt == 1:
+                    if temp_target.exists() and not parts_target.exists():
+                        try:
+                            temp_target.unlink()
+                        except Exception:
+                            pass
 
                 dl_start_t = time.time()
                 file_name_display = getattr(msg.document, "file_name", None) or getattr(msg.video, "file_name", None) or f"media_{msg.id}"
@@ -1284,23 +1286,25 @@ class MigrationEngine:
                 dl_client = client or self.userbot or self.client
                 wait_sec = min(2 ** min(attempt, 4), 16)
 
-                # If retrying after a failure, refresh message from Telegram to renew expired file_reference tokens
-                if attempt > 1:
-                    try:
-                        chat_id = (msg.chat.id if msg.chat else None) or self.config.source_chat_id
-                        refreshed = await dl_client.get_messages(chat_id, message_ids=[msg.id])
-                        if isinstance(refreshed, list) and refreshed and refreshed[0]:
-                            msg = refreshed[0]
-                        elif refreshed and not isinstance(refreshed, list):
-                            msg = refreshed
-                        logger.info(f"🔄 [Download #{msg.id}] Refreshed fresh file_reference token from Telegram (Attempt {attempt}).")
-                    except Exception as ref_err:
-                        logger.debug(f"Could not refresh file_reference for #{msg.id}: {ref_err}")
+                # Guarantee fresh file_reference token directly before download attempt
+                try:
+                    chat_id = (msg.chat.id if msg.chat else None) or self.config.source_chat_id
+                    refreshed = await dl_client.get_messages(chat_id, message_ids=[msg.id])
+                    if isinstance(refreshed, list) and refreshed and refreshed[0] and not refreshed[0].empty:
+                        msg = refreshed[0]
+                        if attempt > 1:
+                            logger.info(f"🔄 [Download #{msg.id}] Refreshed fresh file_reference token from Telegram (Attempt {attempt}).")
+                    elif refreshed and not isinstance(refreshed, list) and not refreshed.empty:
+                        msg = refreshed
+                        if attempt > 1:
+                            logger.info(f"🔄 [Download #{msg.id}] Refreshed fresh file_reference token from Telegram (Attempt {attempt}).")
+                except Exception as ref_err:
+                    logger.debug(f"Could not refresh file_reference for #{msg.id}: {ref_err}")
 
                 watchdog_done = asyncio.Event()
 
                 async def _dl_stall_watchdog(target_task: asyncio.Task):
-                    """Monitors download activity. If stalled for >30s, cancels the download task to reconnect."""
+                    """Monitors download activity. If stalled for >90s, cancels the download task to reconnect."""
                     while not watchdog_done.is_set() and not self.cancel_event.is_set():
                         try:
                             await asyncio.wait_for(watchdog_done.wait(), timeout=10.0)
@@ -1310,7 +1314,7 @@ class MigrationEngine:
                         if self.cancel_event.is_set():
                             break
                         idle = time.time() - dl_progress_tracker["last_time"]
-                        if idle > 45.0:
+                        if idle > 90.0:
                             logger.warning(
                                 f"⚠️ [Download #{msg.id}] Download stall detected (no data for {idle:.0f}s @ {dl_progress_tracker['current'] / 1048576:.1f} MB) — aborting for fresh reconnect..."
                             )
