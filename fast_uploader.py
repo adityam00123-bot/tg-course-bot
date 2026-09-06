@@ -640,7 +640,7 @@ async def fast_download_media(
             parts_fp = open(parts_path, "r+b")
 
             num_workers = min(getattr(self, "max_concurrent_transmissions", 12) or 12, total_parts)
-            num_workers = max(1, min(num_workers, 12))
+            num_workers = max(1, min(num_workers, 16))
 
             part_start_times: dict = {}
             lock = asyncio.Lock()
