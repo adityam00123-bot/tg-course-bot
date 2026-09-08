@@ -2312,19 +2312,34 @@ class MigrationEngine:
         try:
             sent_via_preupload = False
             if slot.raw_input_file:
-                try:
-                    await self._send_pre_uploaded_media(slot, dest_chat, caption, caption_entities)
-                    self.stats.media_count += 1
-                    media_type = "video" if msg.video else "photo" if msg.photo else "document" if msg.document else "media"
-                    self._clear_progress_line()
-                    logger.info(f"⚡ [Pipeline] Fast-Published {media_type} #{msg.id} → Dest in ~50ms")
-                    sent_via_preupload = True
-                except Exception as pre_err:
-                    logger.warning(
-                        f"⚠️ [Pipeline] Pre-uploaded SendMedia failed for #{msg.id} ({pre_err}). "
-                        f"Falling back to direct local file upload to guarantee 100% delivery..."
-                    )
-                    sent_via_preupload = False
+                for pre_attempt in range(1, 4):
+                    try:
+                        await self._send_pre_uploaded_media(slot, dest_chat, caption, caption_entities)
+                        self.stats.media_count += 1
+                        media_type = "video" if msg.video else "photo" if msg.photo else "document" if msg.document else "media"
+                        self._clear_progress_line()
+                        logger.info(f"⚡ [Pipeline] Fast-Published {media_type} #{msg.id} → Dest in ~50ms")
+                        sent_via_preupload = True
+                        break
+                    except Exception as pre_err:
+                        err_str = str(pre_err).lower()
+                        is_net_err = any(k in err_str for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "operation on", "closed=true", "timed out", "timeout"))
+                        if is_net_err and pre_attempt < 3:
+                            logger.warning(
+                                f"⚠️ [Pipeline] Pre-uploaded SendMedia network hiccup for #{msg.id}: {pre_err}. "
+                                f"Refreshing client session (attempt {pre_attempt}/3)..."
+                            )
+                            await reset_client_sessions(self.client)
+                            await asyncio.sleep(1.5)
+                            continue
+                        else:
+                            logger.warning(
+                                f"⚠️ [Pipeline] Pre-uploaded SendMedia failed for #{msg.id} ({pre_err}). "
+                                f"Falling back to direct local file upload to guarantee 100% delivery..."
+                            )
+                            await reset_client_sessions(self.client)
+                            sent_via_preupload = False
+                            break
 
             if not sent_via_preupload:
                 upload_path = slot.upload_path or str(slot.local_path)

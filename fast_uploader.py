@@ -36,6 +36,28 @@ _session_restart_lock = asyncio.Lock()
 _DC_AUTH_KEYS: dict = {}
 
 
+def is_session_alive(sess: Any) -> bool:
+    """Checks if an MTProto session is started and its underlying TCP transport is healthy."""
+    if not sess or not getattr(sess, "is_started", None) or not sess.is_started.is_set():
+        return False
+    conn = getattr(sess, "connection", None)
+    if conn is None:
+        return False
+    if hasattr(conn, "is_connected") and not conn.is_connected:
+        return False
+    protocol = getattr(conn, "protocol", None)
+    if protocol is None:
+        return False
+    transport = getattr(protocol, "transport", None)
+    if transport is None:
+        return False
+    if hasattr(transport, "is_closing") and transport.is_closing():
+        return False
+    if getattr(transport, "_closed", False):
+        return False
+    return True
+
+
 async def _safe_session_stop(self):
     """Safely terminates transport & cancels tasks without raising StreamReader collision or lingering ping tasks."""
     try:
@@ -72,14 +94,40 @@ async def _safe_session_stop(self):
         logger.debug(f"Pyrogram session stop handled: {e}")
 
 
-async def _safe_session_restart(self):
-    """Guarantees only ONE coroutine restarts the MTProto session at a time, preventing deadlocks."""
-    async with _session_restart_lock:
+async def safe_restart_session(sess: Optional[Session]) -> bool:
+    """Safely restarts a broken session with task deduplication. Multiple callers await the same restart."""
+    if sess is None:
+        return False
+    existing_task = getattr(sess, "_restarting_task", None)
+    if existing_task and not existing_task.done():
         try:
-            await _safe_session_stop(self)
-            await self.start()
+            await asyncio.shield(existing_task)
+            return is_session_alive(sess)
+        except Exception:
+            pass
+
+    async def _do_restart():
+        try:
+            await _safe_session_stop(sess)
+            await asyncio.sleep(0.2)
+            await sess.start()
         except Exception as e:
-            logger.debug(f"Pyrogram session restart recovered: {e}")
+            logger.debug(f"Session restart recovered: {e}")
+
+    sess._restarting_task = asyncio.create_task(_do_restart())
+    try:
+        await sess._restarting_task
+    except Exception:
+        pass
+    finally:
+        sess._restarting_task = None
+
+    return is_session_alive(sess)
+
+
+async def _safe_session_restart(self):
+    """Session.restart monkeypatch using safe deduplicated restart."""
+    return await safe_restart_session(self)
 
 
 async def reset_client_sessions(client: Optional[Client] = None) -> None:
@@ -122,8 +170,8 @@ async def reset_client_sessions(client: Optional[Client] = None) -> None:
         pass
     try:
         session = getattr(client, "session", None)
-        if session and hasattr(session, "restart"):
-            await session.restart()
+        if session:
+            await safe_restart_session(session)
     except Exception:
         pass
 
@@ -365,10 +413,19 @@ async def fast_save_file(
 
                 while part_attempts < max_part_attempts and part_idx not in completed_parts and upload_error is None:
                     target_session = sessions[session_idx % len(sessions)] or getattr(self, "session", None)
-                    if not target_session or not getattr(target_session, "is_started", None) or not target_session.is_started.is_set():
-                        session_idx += 1
-                        await asyncio.sleep(0.05)
-                        continue
+                    if not is_session_alive(target_session):
+                        alive_sessions = [s for s in sessions if is_session_alive(s)]
+                        if alive_sessions:
+                            session_idx += 1
+                            target_session = alive_sessions[session_idx % len(alive_sessions)]
+                        else:
+                            await safe_restart_session(target_session)
+                            await asyncio.sleep(0.2)
+                            if not is_session_alive(target_session):
+                                part_attempts += 1
+                                backoff = min(0.2 * (1.5 ** part_attempts), 3.0)
+                                await asyncio.sleep(backoff)
+                                continue
 
                     t_chunk_start = time.time()
                     try:
@@ -383,7 +440,7 @@ async def fast_save_file(
                             chunk_dur = time.time() - t_chunk_start
                             if chunk_dur > 6.0 and len(sessions) > 1:
                                 try:
-                                    asyncio.create_task(_safe_session_restart(target_session))
+                                    asyncio.create_task(safe_restart_session(target_session))
                                 except Exception:
                                     pass
                             break
@@ -393,15 +450,16 @@ async def fast_save_file(
                         # Auto-recover broken or closed socket without dropping parts
                         if any(k in err_str for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "operation on", "closed=true", "timed out", "timeout")):
                             try:
-                                asyncio.create_task(_safe_session_restart(target_session))
+                                asyncio.create_task(safe_restart_session(target_session))
                             except Exception:
                                 pass
                         session_idx += 1  # rotate to next healthy socket in the pool
+                        backoff = min(0.2 * (1.5 ** part_attempts), 3.0)
                         if part_attempts >= 3:
                             logger.warning(
-                                f"⚠️ Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}"
+                                f"⚠️ Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}. (Backoff {backoff:.1f}s)"
                             )
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(backoff)
 
                 if part_ack and part_idx not in completed_parts:
                     async with parts_lock:
@@ -701,10 +759,19 @@ async def fast_download_media(
 
                         while part_attempts < max_part_attempts and part_idx not in completed_parts and dl_error is None:
                             target_session = sessions[session_idx % len(sessions)]
-                            if not target_session or not getattr(target_session, "is_started", None) or not target_session.is_started.is_set():
-                                session_idx += 1
-                                await asyncio.sleep(0.05)
-                                continue
+                            if not is_session_alive(target_session):
+                                alive_sessions = [s for s in sessions if is_session_alive(s)]
+                                if alive_sessions:
+                                    session_idx += 1
+                                    target_session = alive_sessions[session_idx % len(alive_sessions)]
+                                else:
+                                    await safe_restart_session(target_session)
+                                    await asyncio.sleep(0.2)
+                                    if not is_session_alive(target_session):
+                                        part_attempts += 1
+                                        backoff = min(0.2 * (1.5 ** part_attempts), 3.0)
+                                        await asyncio.sleep(backoff)
+                                        continue
 
                             try:
                                 r = await target_session.invoke(
@@ -730,14 +797,19 @@ async def fast_download_media(
                                     break
                                 if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "timed out", "timeout", "handler is closed", "tcptransport", "operation on", "closed=true")):
                                     try:
-                                        asyncio.create_task(_safe_session_restart(target_session))
+                                        asyncio.create_task(safe_restart_session(target_session))
                                     except Exception:
                                         pass
                                 session_idx += 1  # rotate to next healthy socket immediately
                                 if part_attempts >= max_part_attempts:
                                     dl_error = err
                                     break
-                                await asyncio.sleep(0.05)
+                                backoff = min(0.2 * (1.5 ** part_attempts), 3.0)
+                                if part_attempts >= 3:
+                                    logger.warning(
+                                        f"⚠️ DL Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}. (Backoff {backoff:.1f}s)"
+                                    )
+                                await asyncio.sleep(backoff)
 
                         if chunk_data is not None and part_idx not in completed_parts:
                             async with file_lock:
