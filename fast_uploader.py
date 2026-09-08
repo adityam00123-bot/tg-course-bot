@@ -48,9 +48,11 @@ def is_session_alive(sess: Any) -> bool:
     protocol = getattr(conn, "protocol", None)
     if protocol is None:
         return False
-    transport = getattr(protocol, "transport", None)
+    writer = getattr(protocol, "writer", None)
+    transport = getattr(writer, "transport", None) if writer else getattr(protocol, "transport", None)
     if transport is None:
-        return False
+        # If transport cannot be inspected directly, rely on is_started.is_set()
+        return True
     if hasattr(transport, "is_closing") and transport.is_closing():
         return False
     if getattr(transport, "_closed", False):
