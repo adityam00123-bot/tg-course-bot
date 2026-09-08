@@ -424,38 +424,53 @@ async def sync_user_dialogs(user_id: int, limit: int = 100, max_channels: int = 
     logger.info(f"🔄 Syncing dialogs for user ID {user_id}...")
     pinned_channels = []
     regular_channels = []
+    limits_to_try = [min(limit, 40), 20, 10]
+    last_err = None
 
-    try:
-        async for dialog in cl.get_dialogs(limit=limit):
-            chat = dialog.chat
-            if chat.type in (enums.ChatType.CHANNEL, enums.ChatType.SUPERGROUP, enums.ChatType.GROUP):
-                entry = {
-                    "id": chat.id,
-                    "title": chat.title or f"Chat {chat.id}",
-                    "username": chat.username,
-                    "is_pinned": bool(dialog.is_pinned),
-                    "type": chat.type.value,
-                    "display": format_chat_display(chat.id, chat.title, chat.username)
-                }
-                if dialog.is_pinned:
-                    pinned_channels.append(entry)
-                else:
-                    regular_channels.append(entry)
+    for cur_limit in limits_to_try:
+        try:
+            pinned_channels.clear()
+            regular_channels.clear()
+            async for dialog in cl.get_dialogs(limit=cur_limit):
+                chat = dialog.chat
+                if chat and chat.type in (enums.ChatType.CHANNEL, enums.ChatType.SUPERGROUP, enums.ChatType.GROUP):
+                    entry = {
+                        "id": chat.id,
+                        "title": chat.title or f"Chat {chat.id}",
+                        "username": chat.username,
+                        "is_pinned": bool(dialog.is_pinned),
+                        "type": chat.type.value,
+                        "display": format_chat_display(chat.id, chat.title, chat.username)
+                    }
+                    if dialog.is_pinned:
+                        pinned_channels.append(entry)
+                    else:
+                        regular_channels.append(entry)
 
-        seen_ids = set()
-        all_channels = []
-        for ch in (pinned_channels + regular_channels):
-            if ch["id"] not in seen_ids:
-                seen_ids.add(ch["id"])
-                all_channels.append(ch)
+            seen_ids = set()
+            all_channels = []
+            for ch in (pinned_channels + regular_channels):
+                if ch["id"] not in seen_ids:
+                    seen_ids.add(ch["id"])
+                    all_channels.append(ch)
 
-        USER_CACHED_CHANNELS[user_id] = all_channels[:max_channels]
-        logger.info(f"✅ Synced {len(all_channels)} channels for user {user_id}.")
-        return USER_CACHED_CHANNELS[user_id]
+            USER_CACHED_CHANNELS[user_id] = all_channels[:max_channels]
+            logger.info(f"✅ Synced {len(all_channels)} channels for user {user_id} (limit={cur_limit}).")
+            return USER_CACHED_CHANNELS[user_id]
 
-    except Exception as e:
-        logger.error(f"❌ Dialogs sync failed for user {user_id}: {e}")
-        return USER_CACHED_CHANNELS.get(user_id, [])
+        except Exception as e:
+            last_err = e
+            err_str = str(e).upper()
+            if "500" in err_str or "RPC_CALL_FAIL" in err_str:
+                logger.warning(f"⚠️ Telegram server 500 RPC_CALL_FAIL on dialog limit={cur_limit}. Retrying with smaller slice...")
+                await asyncio.sleep(1.5)
+                continue
+            else:
+                break
+
+    if last_err:
+        logger.warning(f"⚠️ Dialogs sync notice for user {user_id}: {last_err}. Continuing with cached channels if available.")
+    return USER_CACHED_CHANNELS.get(user_id, [])
 
 
 def get_user_cached_channels(user_id: int) -> List[Dict[str, Any]]:
