@@ -409,12 +409,23 @@ async def logout_user(user_id: int) -> bool:
         return False
 
 
-async def sync_user_dialogs(user_id: int, limit: int = 100, max_channels: int = 20) -> List[Dict[str, Any]]:
+_USER_DIALOGS_SYNC_TIME: Dict[int, float] = {}
+
+
+async def sync_user_dialogs(user_id: int, limit: int = 40, max_channels: int = 20, force_refresh: bool = False) -> List[Dict[str, Any]]:
     """
     Performs MTProto dialog sync ONLY for the specified user's active Userbot.
     Returns and caches that user's private/public channels.
+    Cached for 10 minutes to eliminate repetitive GetDialogs RPC calls and prevent FloodWait.
     """
-    global USER_CACHED_CHANNELS
+    global USER_CACHED_CHANNELS, _USER_DIALOGS_SYNC_TIME
+
+    now = time.time()
+    last_sync = _USER_DIALOGS_SYNC_TIME.get(user_id, 0)
+
+    # 1. Instant Cache Return: If cached within last 10 minutes, return instantly (<0.001ms)
+    if not force_refresh and user_id in USER_CACHED_CHANNELS and USER_CACHED_CHANNELS[user_id] and (now - last_sync) < 600:
+        return USER_CACHED_CHANNELS[user_id]
 
     cl = await get_or_create_user_client(user_id)
     if not cl:
@@ -455,12 +466,16 @@ async def sync_user_dialogs(user_id: int, limit: int = 100, max_channels: int = 
                     all_channels.append(ch)
 
             USER_CACHED_CHANNELS[user_id] = all_channels[:max_channels]
+            _USER_DIALOGS_SYNC_TIME[user_id] = time.time()
             logger.info(f"✅ Synced {len(all_channels)} channels for user {user_id} (limit={cur_limit}).")
             return USER_CACHED_CHANNELS[user_id]
 
         except Exception as e:
             last_err = e
             err_str = str(e).upper()
+            if "FLOOD_WAIT" in err_str:
+                logger.warning(f"⚠️ Telegram FloodWait on dialogs: {e}. Continuing with cached channels.")
+                break
             if "500" in err_str or "RPC_CALL_FAIL" in err_str:
                 logger.warning(f"⚠️ Telegram server 500 RPC_CALL_FAIL on dialog limit={cur_limit}. Retrying with smaller slice...")
                 await asyncio.sleep(1.5)

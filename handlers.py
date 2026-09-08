@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, Optional, Union, Any
 
 from pyrogram import Client, filters, enums
-from pyrogram.errors import MessageNotModified, UserNotParticipant, ChatAdminRequired
+from pyrogram.errors import MessageNotModified, UserNotParticipant, ChatAdminRequired, FloodWait
 from pyrogram.types import (
     Message,
     CallbackQuery,
@@ -1901,8 +1901,12 @@ def register_handlers(bot: Client) -> None:
                 await query.message.edit_text(warning_text, reply_markup=warning_kb, parse_mode=enums.ParseMode.HTML)
                 return
 
-            await query.answer("Fetching your channels...")
-            await sync_user_dialogs(user_id, limit=60)
+            cached_chs = get_user_cached_channels(user_id)
+            if not cached_chs:
+                await query.answer("Fetching your channels...")
+                await sync_user_dialogs(user_id, limit=40)
+            else:
+                await query.answer()
             kb = build_channel_picker_keyboard("sel_src", user_id)
             await query.message.edit_text(
                 "📥 <b>Select Incoming (Source) Channel:</b>\n"
@@ -1935,8 +1939,12 @@ def register_handlers(bot: Client) -> None:
                 await query.message.edit_text(warning_text, reply_markup=warning_kb, parse_mode=enums.ParseMode.HTML)
                 return
 
-            await query.answer("Fetching your channels...")
-            await sync_user_dialogs(user_id, limit=60)
+            cached_chs = get_user_cached_channels(user_id)
+            if not cached_chs:
+                await query.answer("Fetching your channels...")
+                await sync_user_dialogs(user_id, limit=40)
+            else:
+                await query.answer()
             kb = build_channel_picker_keyboard("sel_dst", user_id)
             await query.message.edit_text(
                 "📤 <b>Select Outgoing (Destination) Channel:</b>\n"
@@ -1972,7 +1980,7 @@ def register_handlers(bot: Client) -> None:
         elif data.startswith("refresh_ch_"):
             action_pfx = data.replace("refresh_ch_", "")
             await query.answer("🔄 Syncing your channels...", show_alert=False)
-            await sync_user_dialogs(user_id, limit=100)
+            await sync_user_dialogs(user_id, limit=40, force_refresh=True)
             kb = build_channel_picker_keyboard(action_pfx, user_id)
             header_type = "Target Deletion" if "del" in action_pfx else ("Incoming" if "src" in action_pfx else "Outgoing")
             await query.message.edit_text(
@@ -2082,8 +2090,12 @@ def register_handlers(bot: Client) -> None:
                 await query.message.edit_text(warning_text, reply_markup=warning_kb, parse_mode=enums.ParseMode.HTML)
                 return
 
-            await query.answer("Fetching your channels...")
-            await sync_user_dialogs(user_id, limit=60)
+            cached_chs = get_user_cached_channels(user_id)
+            if not cached_chs:
+                await query.answer("Fetching your channels...")
+                await sync_user_dialogs(user_id, limit=40)
+            else:
+                await query.answer()
             kb = build_channel_picker_keyboard("sel_del", user_id)
             await query.message.edit_text(
                 "🗑️ <b>Select Channel to Clean & Delete Messages:</b>\n"
@@ -2790,6 +2802,12 @@ def register_handlers(bot: Client) -> None:
             await _process_callback_query(query)
         except MessageNotModified:
             await query.answer()
+        except FloodWait as fw:
+            logger.warning(f"⏳ Telegram FloodWait on callback query: wait {fw.value}s")
+            try:
+                await query.answer(f"⏳ Telegram rate limit: please wait {fw.value}s before clicking again.", show_alert=True)
+            except Exception:
+                pass
         except Exception as err:
             logger.error(f"Callback query handler error: {err}", exc_info=True)
             try:
