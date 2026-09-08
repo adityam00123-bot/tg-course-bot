@@ -9,6 +9,7 @@ Includes per-user MTProto channel sync and authentication flows.
 
 import os
 import sys
+import time
 import asyncio
 import logging
 from pathlib import Path

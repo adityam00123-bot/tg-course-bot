@@ -18,12 +18,12 @@ if hasattr(sys.stderr, "reconfigure"):
 
 # Load environment variables from .env file explicitly (repo dir, cwd, and /kaggle/working)
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
-load_dotenv(dotenv_path=_ENV_PATH)
-load_dotenv()
+load_dotenv(dotenv_path=_ENV_PATH, encoding="utf-8-sig")
+load_dotenv(encoding="utf-8-sig")
 if Path("/kaggle/working/.env").exists():
-    load_dotenv(dotenv_path="/kaggle/working/.env")
+    load_dotenv(dotenv_path="/kaggle/working/.env", encoding="utf-8-sig")
 if (Path(__file__).resolve().parent.parent / ".env").exists():
-    load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
+    load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env", encoding="utf-8-sig")
 
 
 class Config:
@@ -102,9 +102,9 @@ class Config:
         ]
         for p in paths_to_check:
             if p.exists():
-                load_dotenv(dotenv_path=p, override=True)
+                load_dotenv(dotenv_path=p, override=True, encoding="utf-8-sig")
 
-        load_dotenv(override=True)
+        load_dotenv(override=True, encoding="utf-8-sig")
 
         cls.API_ID_RAW = (os.getenv("API_ID") or "").strip()
         cls.API_HASH = (os.getenv("API_HASH") or "").strip()
