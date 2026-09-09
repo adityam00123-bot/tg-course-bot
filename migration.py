@@ -892,13 +892,6 @@ class MigrationEngine:
                 usage_after = shutil.disk_usage(str(dl_dir))
                 free_gb_after = usage_after.free / (1024 ** 3)
                 logger.info(f"🩺 [Health Check] Free Disk: {free_gb_after:.1f} GB | RAM GC completed | Active File: #{curr_id}")
-
-            # 3. MTProto 6-Hour Salt & Session Refresh (every 50 messages)
-            if self.stats.processed_count > 0 and self.stats.processed_count % 50 == 0:
-                logger.info("🔄 [Maintenance] Performing 50-message clean MTProto media session refresh...")
-                await reset_client_sessions(self.client)
-                if self.userbot:
-                    await reset_client_sessions(self.userbot)
         except Exception as maint_err:
             logger.debug(f"Periodic maintenance notice: {maint_err}")
 
@@ -2678,20 +2671,46 @@ class MigrationEngine:
             # maxsize=1 guarantees 1 active media message at a time: zero disk accumulation, zero concurrency conflict
             queue = asyncio.Queue(maxsize=1)
             producer_done = asyncio.Event()
+            producer_error: Optional[Exception] = None
             
             async def pipeline_producer():
+                nonlocal producer_error
                 try:
-                    # Still fetch MTProto metadata in chunks of 50 to avoid API rate limits
+                    # Fetch MTProto metadata in chunks of 50 to avoid API rate limits
                     for i in range(0, len(msg_ids), 50):
                         if self.cancel_event.is_set():
                             break
                             
                         batch_ids = msg_ids[i:i + 50]
-                        batch_msgs = await self._execute_with_flood_retry(
-                            self.client.get_messages,
-                            chat_id=self.config.source_chat_id,
-                            message_ids=batch_ids
-                        )
+                        batch_msgs = None
+                        
+                        for b_attempt in range(1, 6):
+                            if self.cancel_event.is_set():
+                                break
+                            try:
+                                batch_msgs = await self._execute_with_flood_retry(
+                                    self.client.get_messages,
+                                    chat_id=self.config.source_chat_id,
+                                    message_ids=batch_ids
+                                )
+                                break
+                            except Exception as b_err:
+                                err_str = str(b_err).upper()
+                                if any(k in err_str for k in ("CHANNEL_PRIVATE", "CHAT_ADMIN_REQUIRED", "USER_BANNED")):
+                                    raise
+                                if b_attempt >= 5:
+                                    logger.error(f"❌ Failed to fetch batch #{batch_ids[0]}-#{batch_ids[-1]} after 5 attempts: {b_err}")
+                                    raise
+                                wait_s = min(2 * b_attempt, 10)
+                                logger.warning(f"⚠️ Batch fetch #{batch_ids[0]}-#{batch_ids[-1]} failed (attempt {b_attempt}/5): {b_err}. Retrying in {wait_s}s...")
+                                if b_attempt >= 2:
+                                    try:
+                                        await reset_client_sessions(self.client)
+                                        if self.userbot:
+                                            await reset_client_sessions(self.userbot)
+                                    except Exception:
+                                        pass
+                                await asyncio.sleep(wait_s)
                         
                         if not isinstance(batch_msgs, list):
                             batch_msgs = [batch_msgs] if batch_msgs else []
@@ -2700,8 +2719,9 @@ class MigrationEngine:
                             if self.cancel_event.is_set():
                                 break
                                 
+                            target_id = getattr(msg, "id", None) or (batch_ids[idx] if idx < len(batch_ids) else None)
                             if not msg or msg.empty or msg.service:
-                                await queue.put(("skip", msg, batch_ids[idx]))
+                                await queue.put(("skip", msg, target_id))
                                 continue
                                 
                             if pipeline_active and self._msg_needs_pipeline(msg):
@@ -2730,7 +2750,9 @@ class MigrationEngine:
                                 await queue.put(("direct", msg, done_ev))
                                 await done_ev.wait()
                 except Exception as e:
-                    logger.error(f"Producer error: {e}")
+                    logger.error(f"Producer error: {e}", exc_info=True)
+                    producer_error = e
+                    self.stats.error_message = f"Producer error: {e}"
                 finally:
                     producer_done.set()
 
@@ -2899,7 +2921,20 @@ class MigrationEngine:
                         logger.warning(f"⚠️ [Auto-Backfill] Message #{fid} recovery failed: {bf_err}")
 
             if not self.cancel_event.is_set() and self.stats.status == JobStatus.RUNNING:
-                self.stats.status = JobStatus.COMPLETED
+                if producer_error is not None:
+                    self.stats.status = JobStatus.FAILED
+                    self.stats.error_message = f"Producer error: {producer_error}"
+                    logger.error(f"❌ Migration marked FAILED due to producer crash: {producer_error}")
+                elif self.stats.total_messages > 0 and self.stats.processed_count < self.stats.total_messages:
+                    self.stats.status = JobStatus.FAILED
+                    self.stats.error_message = (
+                        f"Migration stopped prematurely ({self.stats.processed_count}/{self.stats.total_messages} messages processed)"
+                    )
+                    logger.error(
+                        f"❌ Migration stopped prematurely! Processed {self.stats.processed_count} out of {self.stats.total_messages} total messages."
+                    )
+                else:
+                    self.stats.status = JobStatus.COMPLETED
 
         except asyncio.CancelledError:
             self.stats.status = JobStatus.CANCELLED

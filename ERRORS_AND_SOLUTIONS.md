@@ -310,3 +310,19 @@
   - Run 3 (Night Taiwan Run): 12.24 GB in 20m (10.4 MB/s sustained card speed, 2GB videos migrated in ~1m 40s) with 0 errors.
   - **Verdict:** Officially designated as the repository's all-time golden commit.
 
+---
+
+## 8. Pipeline Batch Fetch & Premature Completion Guard (September 2026)
+
+### Error: Premature Auto-Termination at 50, 100, 150 Messages ("Migration Finished - Final Status: COMPLETED" at 0–1%)
+* **Symptom:** After processing exactly 50, 100, or 150 messages, the migration stops and reports `🏁 Migration Finished — Final Status: COMPLETED`, even though only 50/11008 (0%) or 150/11158 (1%) messages have been migrated.
+* **Root Cause:**
+  1. **Unconditional 50-Message Main Session Reset:** `_run_periodic_maintenance` previously called `await reset_client_sessions(self.client)` every 50 messages (`processed_count % 50 == 0`). This forcefully killed and restarted Pyrogram's main MTProto command session (`client.session`).
+  2. **Producer Crash on Batch Fetch:** While the session was restarting, `pipeline_producer` concurrently attempted to fetch the next batch of 50 messages (`client.get_messages`). Because the main session transport was closed, `get_messages` threw an exception.
+  3. **Silent Producer Exit & False "COMPLETED" Status:** `pipeline_producer` caught the exception in `except Exception: logger.error(...)`, set `producer_done.set()`, and exited. The consumer loop finished the remaining queue items and saw `queue.empty() and producer_done.is_set()`. The loop exited, and `run()` set `self.stats.status = JobStatus.COMPLETED` because `cancel_event` was not set, falsely declaring the migration complete.
+* **Permanent Fix:**
+  1. **Removed Session Reset from Periodic Maintenance:** Main MTProto command sessions do not need arbitrary resets during active migrations. Sockets are already isolated per-file in `fast_save_file` and automatically healed via `safe_restart_session` on actual fatal socket drops (`Broken pipe`, `Connection lost`).
+  2. **Batch Fetch Retry Loop in Producer:** In `pipeline_producer`, wrapped `self.client.get_messages` in a 5-attempt retry loop with exponential backoff (2s, 4s, 6s...). If a transient connection error occurs, it resets sessions on attempt $\ge 2$ and resumes seamlessly without crashing.
+  3. **Guaranteed Completion Status Verification:** In `run()`, `self.stats.status = JobStatus.COMPLETED` is strictly guarded: if `producer_error` was encountered or `processed_count < total_messages`, the job is marked `JobStatus.FAILED` with a descriptive message rather than claiming `COMPLETED`.
+
+
