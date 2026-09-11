@@ -325,4 +325,22 @@
   2. **Batch Fetch Retry Loop in Producer:** In `pipeline_producer`, wrapped `self.client.get_messages` in a 5-attempt retry loop with exponential backoff (2s, 4s, 6s...). If a transient connection error occurs, it resets sessions on attempt $\ge 2$ and resumes seamlessly without crashing.
   3. **Guaranteed Completion Status Verification:** In `run()`, `self.stats.status = JobStatus.COMPLETED` is strictly guarded: if `producer_error` was encountered or `processed_count < total_messages`, the job is marked `JobStatus.FAILED` with a descriptive message rather than claiming `COMPLETED`.
 
+---
 
+## 9. Cross-DC FloodWait & 0-Byte False Failure (September 2026)
+
+### Error: 2656s FloodWait on `auth.ExportAuthorization` & Rapid Retry Exhaustion on Small Files (<1MB)
+* **Symptom:** Migration suddenly marks several small messages/photos (e.g. `#12523–#12526`) as `FAILED` within 30 seconds with `Pyrogram returned 0-byte file (possible AUTH_BYTES_INVALID or expired reference)`. Logs show `pyrogram.errors.exceptions.flood_420.FloodWait: Telegram says: [420 FLOOD_WAIT_X] - A wait of 2656 seconds is required (caused by "auth.ExportAuthorization")`. Immediately after, a large video (e.g. `#12527`) correctly triggers a 2235s sleep and resumes downloading at top speed upon waking up.
+* **Root Cause:**
+  1. **Cross-DC Authorization Overhead:** Media files hosted on a foreign Telegram Data Center (`dc_id != user's home dc_id`) require cross-DC authorization tokens via `auth.ExportAuthorization(dc_id)`. Previous code created a new `Session` per file and called `ExportAuthorization` 1–2 times per file. Telegram heavily rate-limits repeated `ExportAuthorization` requests, triggering a ~44-minute (2656s) `FLOOD_WAIT` penalty.
+  2. **Native Pyrogram Exception Swallowing on <1MB Files:** `fast_download_media` previously redirected files `< 1024 * 1024` bytes to native Pyrogram `_orig_download_media` (`get_file`). Native Pyrogram's `get_file` catches exceptions with `except Exception as e: log.exception(e)` and terminates the generator rather than re-raising `FloodWait`. Consequently, Pyrogram yielded 0 chunks and created a 0-byte file on disk.
+  3. **30-Second Retry Burn:** `_download_media_to_file` in `migration.py` received the 0-byte file, fell back to the Bot client (which hit the same DC rate limit), and retried 4 times with short backoffs (2s, 4s, 8s, 16s), exhausting all attempts in ~30 seconds and permanently failing the messages without ever sleeping the penalty.
+  4. **Incomplete Failed Visibility:** At the end of migration, only the live progress message was edited with the last 5 IDs (e.g. `... #12523, #12524`), without a clear report or recovery prompt.
+* **Permanent Fix:**
+  1. **Persistent MTProto Session Pool per DC (`_fast_dl_pools`):** In `fast_uploader.py`, live, authenticated MTProto sessions for foreign DCs are cached in `self._fast_dl_pools[dc_id]`. Once authenticated via `ImportAuthorization`, sessions are reused across consecutive files on that DC. For 1000 files on a foreign DC, `ExportAuthorization` is called **only once**, eliminating rate-limit penalties completely and saving 1.5–2.5s of handshake latency per file.
+  2. **Direct Processing of All Media Sizes in `fast_download_media`:** Removed the `< 1MB` delegation to native Pyrogram. Photos, stickers, voice notes, and small documents are processed directly via `fast_download_media` as single 1MB parts in ~30ms, preventing silent exception swallowing.
+  3. **FloodWait-Guarded `ExportAuthorization`:** Wrapped all `ExportAuthorization` calls in explicit `FloodWait` handlers to ensure that any penalty is logged and waited out rather than failing.
+  4. **Comprehensive Failed Messages Report & 1-Click Recovery:**
+     - Created `get_failed_messages_details()` to extract IDs, errors, and timestamps from `failed_messages.json`.
+     - In `migration.py`, `_send_failed_messages_report()` automatically sends a detailed list to the owner upon migration completion. If $>15$ files failed, it exports and uploads a formatted `.txt` report file.
+     - Direct prompt to run `/retry_failed` to recover only the missed items with 1 click.

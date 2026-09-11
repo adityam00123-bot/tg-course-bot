@@ -12,10 +12,12 @@ import gc
 import shutil
 import zipfile
 import json
+import html
 import time
 import random
 import asyncio
 import logging
+from datetime import datetime
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -185,6 +187,43 @@ def get_failed_messages(source_id: Any, dest_id: Any) -> List[int]:
             return sorted(list(set(ids)))
     except Exception as e:
         logger.debug(f"Could not get failed messages: {e}")
+    return []
+
+
+def get_failed_messages_details(source_id: Any, dest_id: Any) -> List[Dict[str, Any]]:
+    """Retrieves full details (id, error, time) of all failed messages awaiting backfill."""
+    try:
+        if FAILED_MESSAGES_FILE.exists():
+            with open(FAILED_MESSAGES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            key = _get_checkpoint_key(source_id, dest_id)
+            items = []
+            if key in data and isinstance(data[key], list):
+                for m in data[key]:
+                    if isinstance(m, int):
+                        items.append({"id": m, "error": "Unknown error", "time": 0})
+                    elif isinstance(m, dict) and "id" in m:
+                        items.append(m)
+            if not items:
+                s_str = str(source_id).strip()
+                d_str = str(dest_id).strip()
+                for k, v in data.items():
+                    if (s_str in k or d_str in k) and isinstance(v, list):
+                        for m in v:
+                            if isinstance(m, int):
+                                items.append({"id": m, "error": "Unknown error", "time": 0})
+                            elif isinstance(m, dict) and "id" in m:
+                                items.append(m)
+            seen = set()
+            unique_items = []
+            for it in items:
+                mid = it.get("id")
+                if mid and mid not in seen:
+                    seen.add(mid)
+                    unique_items.append(it)
+            return sorted(unique_items, key=lambda x: x["id"])
+    except Exception as e:
+        logger.debug(f"Could not get failed messages details: {e}")
     return []
 
 
@@ -849,6 +888,89 @@ class MigrationEngine:
                         self.progress_msg_id = sent_msg.id
         except Exception as e:
             logger.warning(f"Failed to send progress notification: {e}")
+
+    async def _send_failed_messages_report(self) -> None:
+        """Sends a dedicated, comprehensive summary report of failed/missed messages to the owner."""
+        try:
+            failed_details = get_failed_messages_details(self.config.source_chat_id, self.config.dest_chat_id)
+            if not failed_details and self.stats.failed_count == 0:
+                return
+
+            total_failed = len(failed_details) if failed_details else self.stats.failed_count
+            logger.info(f"📋 Sending Failed Messages Report to owner ({total_failed} items)...")
+
+            lines = [
+                f"⚠️ <b>Failed / Missed Messages Report</b>",
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                f"📥 <b>Source:</b> {self.config.source_chat_title or self.config.source_chat_id}",
+                f"📤 <b>Destination:</b> {self.config.dest_chat_title or self.config.dest_chat_id}",
+                f"❌ <b>Total Missed:</b> <code>{total_failed}</code> message(s)",
+                f"",
+                f"<b>Missed Messages List:</b>"
+            ]
+
+            display_items = failed_details[:20] if failed_details else []
+            for item in display_items:
+                fid = item.get("id")
+                err = item.get("error") or "Download/Upload error"
+                clean_err = html.escape(str(err)[:60])
+                lines.append(f"• <b>#{fid}</b>: <code>{clean_err}</code>")
+
+            if len(failed_details) > 20:
+                lines.append(f"<i>... and {len(failed_details) - 20} more (see attached report document below)</i>")
+
+            lines.extend([
+                f"",
+                f"💡 <b>1-Click Recovery:</b>",
+                f"Send <code>/retry_failed</code> to automatically re-migrate only these missed messages without re-running the entire channel!"
+            ])
+
+            summary_text = "\n".join(lines)
+            await self._execute_with_flood_retry(
+                self.bot.send_message,
+                chat_id=self.owner_id,
+                text=summary_text,
+                parse_mode=enums.ParseMode.HTML
+            )
+
+            # If more than 15 items, also generate and send a .txt document for complete tracking
+            if len(failed_details) > 15:
+                report_file = Config.DOWNLOAD_DIR / f"failed_messages_{int(time.time())}.txt"
+                report_content = [
+                    "==================================================",
+                    "         FAILED / MISSED MESSAGES REPORT          ",
+                    "==================================================",
+                    f"Source: {self.config.source_chat_title} ({self.config.source_chat_id})",
+                    f"Destination: {self.config.dest_chat_title} ({self.config.dest_chat_id})",
+                    f"Total Missed Messages: {len(failed_details)}",
+                    f"Generated At: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    "==================================================",
+                    "",
+                    f"{'MSG ID':<12} | {'ERROR REASON':<60} | {'TIMESTAMP'}",
+                    f"{'-'*12}-+-{'-'*60}-+-{'-'*20}"
+                ]
+                for item in failed_details:
+                    fid = item.get("id")
+                    err = item.get("error", "Unknown error")
+                    ts = item.get("time", 0)
+                    t_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') if ts else "N/A"
+                    report_content.append(f"#{fid:<11} | {str(err)[:60]:<60} | {t_str}")
+
+                report_file.write_text("\n".join(report_content), encoding="utf-8")
+
+                await self._execute_with_flood_retry(
+                    self.bot.send_document,
+                    chat_id=self.owner_id,
+                    document=str(report_file),
+                    caption=f"📄 Full Failed Messages Log ({len(failed_details)} items)",
+                    file_name=report_file.name
+                )
+                try:
+                    report_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"Could not send failed messages report: {e}")
 
     async def _run_periodic_maintenance(self) -> None:
         """
@@ -2969,6 +3091,7 @@ class MigrationEngine:
             )
             # Send final report
             await self._send_progress_update(is_final=True)
+            await self._send_failed_messages_report()
 
     def cancel_deletion(self) -> bool:
         """Signals the running deletion job to cancel."""

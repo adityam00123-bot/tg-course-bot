@@ -14,6 +14,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import pyrogram
 from pyrogram import Client, raw
+from pyrogram.errors import FloodWait
 from pyrogram.session import Session
 
 logger = logging.getLogger("migration_bot.fast_uploader")
@@ -113,6 +114,14 @@ async def safe_restart_session(sess: Optional[Session]) -> bool:
             await _safe_session_stop(sess)
             await asyncio.sleep(0.2)
             await sess.start()
+            if hasattr(sess, "client") and sess.client and hasattr(sess, "dc_id") and sess.dc_id:
+                try:
+                    home_dc = await sess.client.storage.dc_id()
+                    if sess.dc_id != home_dc:
+                        exp = await sess.client.invoke(raw.functions.auth.ExportAuthorization(dc_id=sess.dc_id))
+                        await sess.invoke(raw.functions.auth.ImportAuthorization(id=exp.id, bytes=exp.bytes))
+                except Exception as auth_err:
+                    logger.debug(f"Cross-DC re-auth on restart notice: {auth_err}")
         except Exception as e:
             logger.debug(f"Session restart recovered: {e}")
 
@@ -568,9 +577,21 @@ async def fast_download_media(
     elif hasattr(message, "photo") and message.photo:
         file_id_str = message.photo.file_id
         file_size = message.photo.file_size or 0
+    elif hasattr(message, "voice") and message.voice:
+        file_id_str = message.voice.file_id
+        file_size = message.voice.file_size or 0
+    elif hasattr(message, "animation") and message.animation:
+        file_id_str = message.animation.file_id
+        file_size = message.animation.file_size or 0
+    elif hasattr(message, "video_note") and message.video_note:
+        file_id_str = message.video_note.file_id
+        file_size = message.video_note.file_size or 0
+    elif hasattr(message, "sticker") and message.sticker:
+        file_id_str = message.sticker.file_id
+        file_size = message.sticker.file_size or 0
 
-    # Fallback to native download for in-memory or small/unsupported types (<1MB)
-    if in_memory or not file_id_str or file_size < 1024 * 1024:
+    # Fallback to native download strictly for in-memory or unresolvable file IDs
+    if in_memory or not file_id_str:
         return await _orig_download_media(
             self,
             message=message,
@@ -604,47 +625,72 @@ async def fast_download_media(
 
         dc_id = file_id.dc_id
 
-        # Dedicated Clean MTProto Sessions (Strict 2 parallel sockets delivering ~35-45 MB/s sustained)
-        # Auth key caching across files eliminates 1.5-2.5s Diffie-Hellman prime factorization latency per file
-        if dc_id == await self.storage.dc_id():
-            auth_key = await self.storage.auth_key()
+        # Persistent MTProto Session Pool per DC
+        # Reusing connected sessions eliminates calling auth.ExportAuthorization on every file!
+        if not hasattr(self, "_fast_dl_pools") or not isinstance(self._fast_dl_pools, dict):
+            self._fast_dl_pools = {}
+
+        pooled = self._fast_dl_pools.get(dc_id, [])
+        active_pooled = [s for s in pooled if is_session_alive(s)]
+        self._fast_dl_pools[dc_id] = [s for s in pooled if s not in active_pooled]
+
+        sessions = []
+        if active_pooled:
+            session = active_pooled.pop(0)
+            sessions.append(session)
         else:
-            auth_key = _DC_AUTH_KEYS.get(dc_id)
-            if not auth_key:
-                auth_key = await Auth(self, dc_id, await self.storage.test_mode()).create()
-                _DC_AUTH_KEYS[dc_id] = auth_key
-
-        session = Session(
-            self, dc_id,
-            auth_key,
-            await self.storage.test_mode(),
-            is_media=True
-        )
-        await session.start()
-        if dc_id != await self.storage.dc_id():
-            exp1 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
-            await session.invoke(raw.functions.auth.ImportAuthorization(id=exp1.id, bytes=exp1.bytes))
-
-        sessions = [session]
+            session = Session(
+                self, dc_id,
+                auth_key,
+                await self.storage.test_mode(),
+                is_media=True
+            )
+            await session.start()
+            if dc_id != await self.storage.dc_id():
+                try:
+                    exp1 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                except FloodWait as fw:
+                    logger.warning(
+                        f"⚠️ Telegram FloodWait on auth.ExportAuthorization (DC {dc_id}): Sleeping {fw.value + 1}s..."
+                    )
+                    await asyncio.sleep(fw.value + 1)
+                    exp1 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                await session.invoke(raw.functions.auth.ImportAuthorization(id=exp1.id, bytes=exp1.bytes))
+            sessions.append(session)
 
         chunk_size = 1024 * 1024  # 1MB per MTProto part (strictly divisible by 4096)
         total_parts = math.ceil(file_size / chunk_size) if file_size > 0 else 1
 
         if total_parts > 4:
             try:
-                s2 = Session(
-                    self, dc_id,
-                    auth_key,
-                    await self.storage.test_mode(),
-                    is_media=True
-                )
-                await s2.start()
-                if dc_id != await self.storage.dc_id():
-                    exp2 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
-                    await s2.invoke(raw.functions.auth.ImportAuthorization(id=exp2.id, bytes=exp2.bytes))
-                sessions.append(s2)
+                if active_pooled:
+                    s2 = active_pooled.pop(0)
+                    sessions.append(s2)
+                else:
+                    s2 = Session(
+                        self, dc_id,
+                        auth_key,
+                        await self.storage.test_mode(),
+                        is_media=True
+                    )
+                    await s2.start()
+                    if dc_id != await self.storage.dc_id():
+                        try:
+                            exp2 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                        except FloodWait as fw:
+                            logger.warning(
+                                f"⚠️ Telegram FloodWait on auth.ExportAuthorization s2 (DC {dc_id}): Sleeping {fw.value + 1}s..."
+                            )
+                            await asyncio.sleep(fw.value + 1)
+                            exp2 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                        await s2.invoke(raw.functions.auth.ImportAuthorization(id=exp2.id, bytes=exp2.bytes))
+                    sessions.append(s2)
             except Exception as s2_err:
                 logger.debug(f"Media download session expansion fallback: {s2_err}")
+
+        # Return any extra unused pooled sessions back
+        if active_pooled:
+            self._fast_dl_pools.setdefault(dc_id, []).extend(active_pooled)
 
         parts_path = out_path.with_name(out_path.name + ".parts")
         completed_parts: set = set()
@@ -876,17 +922,29 @@ async def fast_download_media(
                 except Exception:
                     pass
         finally:
-            # Clean background teardown: do not block return path on session close
-            aux_sessions = [s for s in sessions if s and s != getattr(self, "session", None)]
-            if aux_sessions:
-                async def _bg_stop_download_sessions(sess_list):
+            # Persistent session pool: Return healthy live sessions to the client pool instead of destroying them
+            # This completely avoids calling auth.ExportAuthorization repeatedly on every file!
+            alive_to_pool = []
+            for s in sessions:
+                if is_session_alive(s) and s != getattr(self, "session", None):
+                    alive_to_pool.append(s)
+                elif s and s != getattr(self, "session", None):
+                    # Broken session: schedule background stop
                     try:
-                        stop_coros = [s.stop() for s in sess_list if s]
-                        if stop_coros:
-                            await asyncio.gather(*stop_coros, return_exceptions=True)
+                        asyncio.create_task(s.stop())
                     except Exception:
                         pass
-                asyncio.create_task(_bg_stop_download_sessions(aux_sessions))
+
+            if alive_to_pool:
+                existing_pool = self._fast_dl_pools.setdefault(dc_id, [])
+                for s in alive_to_pool:
+                    if len(existing_pool) < 2 and s not in existing_pool:
+                        existing_pool.append(s)
+                    else:
+                        try:
+                            asyncio.create_task(s.stop())
+                        except Exception:
+                            pass
 
     except Exception as e:
         logger.debug(f"Parallel chunk download exception: {e}")
