@@ -625,6 +625,15 @@ async def fast_download_media(
 
         dc_id = file_id.dc_id
 
+        # Auth key caching across files eliminates 1.5-2.5s Diffie-Hellman prime factorization latency per file
+        if dc_id == await self.storage.dc_id():
+            auth_key = await self.storage.auth_key()
+        else:
+            auth_key = _DC_AUTH_KEYS.get(dc_id)
+            if not auth_key:
+                auth_key = await Auth(self, dc_id, await self.storage.test_mode()).create()
+                _DC_AUTH_KEYS[dc_id] = auth_key
+
         # Persistent MTProto Session Pool per DC
         # Reusing connected sessions eliminates calling auth.ExportAuthorization on every file!
         if not hasattr(self, "_fast_dl_pools") or not isinstance(self._fast_dl_pools, dict):
