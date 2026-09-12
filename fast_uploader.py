@@ -53,8 +53,7 @@ def is_session_alive(sess: Any) -> bool:
     writer = getattr(protocol, "writer", None)
     transport = getattr(writer, "transport", None) if writer else getattr(protocol, "transport", None)
     if transport is None:
-        # If transport cannot be inspected directly, rely on is_started.is_set()
-        return True
+        return False
     if hasattr(transport, "is_closing") and transport.is_closing():
         return False
     if getattr(transport, "_closed", False):
@@ -306,8 +305,8 @@ async def fast_save_file(
             curr = uploaded_bytes
             history.append((now, curr))
 
-            # Keep only entries from the last 60 seconds
-            while history and (now - history[0][0]) > 60.0:
+            # Keep only entries from the last 90 seconds
+            while history and (now - history[0][0]) > 90.0:
                 history.pop(0)
 
             # If client is legitimately waiting out a FloodWait, pause watchdog counter
@@ -328,17 +327,21 @@ async def fast_save_file(
                 else:
                     stall_rounds = 0
 
-                # 2. Cumulative Rolling Average Check: Only evaluate when transmission is actively progressing (stall_rounds == 0)
-                # and after at least 50s of sustained history, to prevent tripping during server ACK pauses
-                if file_size > 30 * 1024 * 1024 and stall_rounds == 0 and len(history) >= 10:
+                # 2. Cumulative Rolling Average Check:
+                # Never abort an upload that is making forward progress. Telegram server token-refill
+                # pauses frequently drop 60s throughput to 0.2-0.4 MB/s. Aborting mid-flight discards all
+                # uploaded megabytes and forces restarting from byte 0.
+                # Only abort if speed has been virtually frozen (<0.02 MB/s / ~20 KB/s) for >90s
+                # AND less than 10% of the file has been uploaded.
+                if file_size > 30 * 1024 * 1024 and len(history) >= 18 and (curr < file_size * 0.10):
                     oldest_t, oldest_b = history[0]
                     span = now - oldest_t
-                    if span >= 50.0:
+                    if span >= 90.0:
                         bytes_moved = curr - oldest_b
                         rolling_mbps = (bytes_moved / (1024 * 1024)) / span
-                        if rolling_mbps < 0.5 and bytes_moved > 0:
+                        if rolling_mbps < 0.02 and bytes_moved >= 0:
                             upload_error = RuntimeError(
-                                f"Upload crawling too slow (rolling 60s avg: {rolling_mbps:.2f} MB/s < 0.5 MB/s) "
+                                f"Upload frozen at near-zero speed (rolling 90s avg: {rolling_mbps:.3f} MB/s) "
                                 f"at {curr / 1048576:.1f}/{file_size / 1048576:.1f} MB. Aborting for fresh reconnect."
                             )
                             break
@@ -460,7 +463,16 @@ async def fast_save_file(
                         part_attempts += 1
                         err_str = str(err).lower()
                         # Auto-recover broken or closed socket without dropping parts
-                        if any(k in err_str for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "operation on", "closed=true", "timed out", "timeout")):
+                        is_transport_err = (
+                            isinstance(err, (AttributeError, ConnectionError, OSError, asyncio.TimeoutError))
+                            or any(k in err_str for k in (
+                                "broken pipe", "connectionreset", "connectionlost",
+                                "handler is closed", "tcptransport", "operation on",
+                                "closed=true", "timed out", "timeout", "nonetype",
+                                "attribute 'send'", "'send'", "closed"
+                            ))
+                        )
+                        if is_transport_err and target_session:
                             try:
                                 asyncio.create_task(safe_restart_session(target_session))
                             except Exception:

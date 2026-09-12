@@ -2252,7 +2252,15 @@ class MigrationEngine:
                             break
                         except Exception as up_err:
                             err_str = str(up_err).lower()
-                            if any(k in err_str for k in ("broken pipe", "connectionreseterror", "connectionlost", "timed out", "timeout", "stalled", "call_exception_handler", "handler is closed", "tcptransport", "could not be uploaded")):
+                            if (
+                                isinstance(up_err, (AttributeError, ConnectionError, OSError))
+                                or any(k in err_str for k in (
+                                    "broken pipe", "connectionreseterror", "connectionlost",
+                                    "timed out", "timeout", "stalled", "call_exception_handler",
+                                    "handler is closed", "tcptransport", "could not be uploaded",
+                                    "nonetype", "attribute 'send'", "frozen"
+                                ))
+                            ):
                                 await reset_client_sessions(active_client)
                             if up_attempt >= max_up_attempts:
                                 raise up_err
@@ -2849,7 +2857,19 @@ class MigrationEngine:
                             if not msg or msg.empty or msg.service:
                                 await queue.put(("skip", msg, target_id))
                                 continue
-                                
+
+                            # Auto-Unpack ZIP archive: route to direct sequential extractor when enabled
+                            is_zip = bool(
+                                getattr(msg, "document", None)
+                                and getattr(msg.document, "file_name", None)
+                                and msg.document.file_name.lower().endswith(".zip")
+                            )
+                            if is_zip and self.config.auto_extract_zip:
+                                done_ev = asyncio.Event()
+                                await queue.put(("direct", msg, done_ev))
+                                await done_ev.wait()
+                                continue
+
                             if pipeline_active and self._msg_needs_pipeline(msg):
                                 slot = _PipelineSlot(seq=msg.id, msg=msg)
                                 
