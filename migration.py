@@ -827,6 +827,8 @@ class MigrationEngine:
             failed_str = f"❌ <b>Errors:</b> {self.stats.failed_count}"
             if self.stats.failed_count > 0:
                 f_ids = get_failed_messages(self.config.source_chat_id, self.config.dest_chat_id)
+                if not f_ids and self.stats.failed_msg_ids:
+                    f_ids = list(self.stats.failed_msg_ids)
                 if f_ids:
                     recent_ids = ", ".join([f"#{i}" for i in f_ids[-5:]])
                     if len(f_ids) > 5:
@@ -893,6 +895,8 @@ class MigrationEngine:
         """Sends a dedicated, comprehensive summary report of failed/missed messages to the owner."""
         try:
             failed_details = get_failed_messages_details(self.config.source_chat_id, self.config.dest_chat_id)
+            if not failed_details and self.stats.failed_msg_ids:
+                failed_details = [{"id": i, "error": "Media transfer failure"} for i in self.stats.failed_msg_ids]
             if not failed_details and self.stats.failed_count == 0:
                 return
 
@@ -1487,8 +1491,13 @@ class MigrationEngine:
                             pass
                         if self.cancel_event.is_set():
                             break
-                        # If bot is legitimately waiting out a Telegram FloodWait, do NOT abort!
-                        if getattr(self, "_is_flood_waiting", False):
+                        # If bot or client is legitimately waiting out a Telegram FloodWait, do NOT abort!
+                        if (
+                            getattr(self, "_is_flood_waiting", False)
+                            or getattr(dl_client, "_is_flood_waiting", False)
+                            or getattr(self.client, "_is_flood_waiting", False)
+                            or (self.userbot and getattr(self.userbot, "_is_flood_waiting", False))
+                        ):
                             dl_progress_tracker["last_time"] = time.time()
                             continue
                         idle = time.time() - dl_progress_tracker["last_time"]
@@ -2578,8 +2587,7 @@ class MigrationEngine:
                 logger.info(f"✅ Migrated poll message #{msg.id} -> Dest Channel")
             except Exception as poll_err:
                 logger.error(f"Failed to migrate poll #{msg.id}: {poll_err}")
-                self.stats.failed_count += 1
-            return
+                raise RuntimeError(f"Failed to migrate poll #{msg.id}: {poll_err}")
 
         # 2. Text-only message OR WebPage Link Previews (Mega links, YouTube, URLs)
         has_media_file = bool(msg.photo or msg.video or msg.document or msg.audio or msg.voice or msg.video_note or msg.animation or msg.sticker)
@@ -2646,11 +2654,7 @@ class MigrationEngine:
         local_path = await self._download_media_to_file(msg)
 
         if not local_path or not local_path.exists():
-            logger.warning(f"Media download returned empty/missing file for message #{msg.id}")
-            self.stats.failed_count += 1
-            self.stats.failed_msg_ids.append(msg.id)
-            record_failed_message(self.config.source_chat_id, self.config.dest_chat_id, msg.id, "Empty or missing media download")
-            return
+            raise RuntimeError(f"Media download returned empty or missing file for message #{msg.id}")
 
         await self._upload_and_post_media(msg, local_path)
 
@@ -2926,7 +2930,8 @@ class MigrationEngine:
                         save_checkpoint(self.config.source_chat_id, self.config.dest_chat_id, msg.id)
                     except Exception as msg_err:
                         self.stats.failed_count += 1
-                        self.stats.failed_msg_ids.append(msg.id)
+                        if msg.id not in self.stats.failed_msg_ids:
+                            self.stats.failed_msg_ids.append(msg.id)
                         self.stats.processed_count += 1
                         record_failed_message(self.config.source_chat_id, self.config.dest_chat_id, msg.id, str(msg_err))
                         save_checkpoint(self.config.source_chat_id, self.config.dest_chat_id, msg.id)
@@ -2971,7 +2976,8 @@ class MigrationEngine:
                         save_checkpoint(self.config.source_chat_id, self.config.dest_chat_id, slot.msg.id)
                     except Exception as msg_err:
                         self.stats.failed_count += 1
-                        self.stats.failed_msg_ids.append(slot.msg.id)
+                        if slot.msg.id not in self.stats.failed_msg_ids:
+                            self.stats.failed_msg_ids.append(slot.msg.id)
                         self.stats.processed_count += 1
                         record_failed_message(self.config.source_chat_id, self.config.dest_chat_id, slot.msg.id, str(msg_err))
                         save_checkpoint(self.config.source_chat_id, self.config.dest_chat_id, slot.msg.id)

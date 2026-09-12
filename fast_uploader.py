@@ -35,6 +35,7 @@ _orig_session_stop = Session.stop
 _orig_session_restart = Session.restart
 _session_restart_lock = asyncio.Lock()
 _DC_AUTH_KEYS: dict = {}
+_DC_EXPORT_FLOOD_UNTIL: dict = {}
 
 
 def is_session_alive(sess: Any) -> bool:
@@ -659,10 +660,26 @@ async def fast_download_media(
                 try:
                     exp1 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
                 except FloodWait as fw:
+                    _DC_EXPORT_FLOOD_UNTIL[dc_id] = time.time() + fw.value
                     logger.warning(
                         f"⚠️ Telegram FloodWait on auth.ExportAuthorization (DC {dc_id}): Sleeping {fw.value + 1}s..."
                     )
-                    await asyncio.sleep(fw.value + 1)
+                    self._is_flood_waiting = True
+                    try:
+                        sleep_left = fw.value + 1
+                        while sleep_left > 0:
+                            step = min(sleep_left, 10.0)
+                            await asyncio.sleep(step)
+                            sleep_left -= step
+                            if progress:
+                                try:
+                                    res_prog = progress(0, file_size, *progress_args)
+                                    if asyncio.iscoroutine(res_prog):
+                                        await res_prog
+                                except Exception:
+                                    pass
+                    finally:
+                        self._is_flood_waiting = False
                     exp1 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
                 await session.invoke(raw.functions.auth.ImportAuthorization(id=exp1.id, bytes=exp1.bytes))
             sessions.append(session)
@@ -675,7 +692,7 @@ async def fast_download_media(
                 if active_pooled:
                     s2 = active_pooled.pop(0)
                     sessions.append(s2)
-                else:
+                elif _DC_EXPORT_FLOOD_UNTIL.get(dc_id, 0.0) <= time.time():
                     s2 = Session(
                         self, dc_id,
                         auth_key,
@@ -687,13 +704,28 @@ async def fast_download_media(
                         try:
                             exp2 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
                         except FloodWait as fw:
-                            logger.warning(
-                                f"⚠️ Telegram FloodWait on auth.ExportAuthorization s2 (DC {dc_id}): Sleeping {fw.value + 1}s..."
-                            )
-                            await asyncio.sleep(fw.value + 1)
-                            exp2 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
-                        await s2.invoke(raw.functions.auth.ImportAuthorization(id=exp2.id, bytes=exp2.bytes))
-                    sessions.append(s2)
+                            _DC_EXPORT_FLOOD_UNTIL[dc_id] = time.time() + fw.value
+                            if fw.value <= 3:
+                                logger.info(f"⏳ [DC {dc_id}] Brief FloodWait ({fw.value}s) on secondary session auth — waiting...")
+                                await asyncio.sleep(fw.value + 1)
+                                exp2 = await self.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                                await s2.invoke(raw.functions.auth.ImportAuthorization(id=exp2.id, bytes=exp2.bytes))
+                                sessions.append(s2)
+                            else:
+                                logger.info(
+                                    f"⚡ [DC {dc_id}] Telegram rate-limited secondary session auth (FloodWait {fw.value}s). "
+                                    f"Skipping secondary session, downloading with primary session at full speed."
+                                )
+                                try:
+                                    asyncio.create_task(s2.stop())
+                                except Exception:
+                                    pass
+                                s2 = None
+                        else:
+                            await s2.invoke(raw.functions.auth.ImportAuthorization(id=exp2.id, bytes=exp2.bytes))
+                            sessions.append(s2)
+                    else:
+                        sessions.append(s2)
             except Exception as s2_err:
                 logger.debug(f"Media download session expansion fallback: {s2_err}")
 

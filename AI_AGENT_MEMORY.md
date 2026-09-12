@@ -119,4 +119,17 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
      - **Discovery:** After 181 GB, Telegram issued a standard 816s FloodWait cooling pause. While `_execute_with_flood_retry` was sleeping, the stall watchdog saw no data for 50s and aborted the sleep!
      - **Safeguard:** Added `self._is_flood_waiting` flag. Watchdogs in both `migration.py` and `fast_uploader.py` now check this flag and pause their stall counters, allowing Telegram rate-limit penalties to elapse naturally and resume automatically without burning retry attempts.
 
+## 12. Cross-DC `auth.ExportAuthorization` FloodWait Immunity & Airtight Failure Tracking
+- **The Issue (Encountered on `#13385–#13402`):**
+  1. Secondary download session `s2` invoked `auth.ExportAuthorization` consecutively after primary session `session` on foreign DC 4, triggering a 2581s FloodWait.
+  2. `fast_uploader.py` blocked the download by sleeping 2581s for the *optional* secondary socket.
+  3. The 90s stall watchdog saw 0 progress and killed the task, repeating 4 times and failing 5 files.
+  4. Prefetch fallback in `_migrate_single_message` returned `None` without raising, causing the caller to immediately call `remove_failed_message`, wiping the failed IDs from `failed_messages.json` and hiding them from the live card (`❌ Errors: 5` with no brackets).
+- **The Permanent Fix:**
+  1. **Secondary Session FloodWait Bypass:** If `s2` hits FloodWait $>3\text{s}$, skip `s2` immediately, store `_DC_EXPORT_FLOOD_UNTIL[dc_id]`, and download at full speed with `session` alone.
+  2. **Multi-Client Watchdog Immunity:** `_dl_stall_watchdog` checks `dl_client._is_flood_waiting` and never aborts during a legitimate rate-limit sleep.
+  3. **Raise-on-Failure:** `_migrate_single_message` raises `RuntimeError` on empty download, ensuring failed messages are permanently tracked in `failed_messages.json` and never prematurely deleted.
+  4. **In-Memory ID Fallback:** `_send_progress_update` and `_send_failed_messages_report` query `self.stats.failed_msg_ids` as fallback, guaranteeing failed IDs are always visible in real time.
+
+
 
