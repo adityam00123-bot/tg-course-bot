@@ -138,6 +138,16 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
   2. **Exponential Backoff Removal:** Chunk retry sleeps were exponentially backing off up to 3.0s, leaving workers idle. Reverted to fixed **0.1s (100ms)** delay.
   3. **Synchronous Upload Socket Healing:** Workers await deduplicated `safe_restart_session(target_session)` on transport errors instead of fire-and-forget `create_task`, eliminating `NoneType` and `closed=True` collision storms.
   4. **Reference:** Complete analysis in `UPLOAD_REGRESSION_RESEARCH.md`.
+  5. **Rollback Baseline for Zero-Error Runs:** Commit `7ad5d51` (proven zero-error 345+ GB baseline).
+
+## 14. High-Latency European Route Optimization Experiment (September 2026)
+- **Objective:** Eliminate the middle-dip (3.7 MB/s) on large files (>1GB) when running from Europe (Brussels/Amsterdam) to Home DC 5 (Singapore, ~200ms ping).
+- **Changes Applied:**
+  1. `fast_save_file` now initializes 5 parallel media sockets for files >30 parts (aligning with `ERRORS_AND_SOLUTIONS.md` Line 150).
+  2. Workers increased to 16 on 4-vCPU systems (Kaggle) to saturate the 200ms pipeline depth.
+  3. Slow-chunk proactive restart threshold relaxed from 4.0s to 8.0s (`chunk_dur > 8.0`) to avoid false-restarting healthy sockets during normal cross-continental WAN jitter.
+- **Rollback Instruction:** If any instability occurs, immediately revert to proven commit `7ad5d51`:
+  `git reset --hard 7ad5d51 && git push origin main --force`
 
 
 
