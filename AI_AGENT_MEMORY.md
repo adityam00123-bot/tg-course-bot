@@ -151,7 +151,18 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
   1. **Socket Pool:** Fixed to **4 parallel media sockets** for files >30 parts (`fast_uploader.py`).
   2. **Worker Concurrency:** Fixed to **12 workers** on 4-vCPU systems (`max(10, min(cpu*3, 16))` in `config.py`).
   3. **Slow-Chunk Threshold:** Restored to **4.0s** (`chunk_dur > 4.0`).
-- **Conclusion:** 12 workers and 4 sockets perfectly match Telegram's edge rate limits without overflowing receiver buffers, sustaining a smooth, uninterrupted 25–35 MB/s upload stream without saw-tooth drops.
+## 15. Elimination of Premature Socket Restarts & Cascading Teardowns (September 2026)
+- **The Incident (Encountered on #2951, 2.0 GB File):**
+  1. After 5h 42m of flawless migration (220.91 GB transferred, 527 media files, 0 errors), file #2951 stalled repeatedly across 10 upload attempts.
+  2. At ~340 MB, Telegram's edge buffer filled up during normal MTProto token refill, causing a healthy chunk to take 4.1s.
+  3. Legacy logic `chunk_dur > 4.0` spawned a background `safe_restart_session(target_session)` on a *successful* chunk.
+  4. Tearing down the active TCP connection mid-flight caused other concurrent workers sharing that socket to crash simultaneously with `[Errno 32] Broken pipe` and `handler is closed`.
+  5. These errors triggered additional `safe_restart_session` calls, plunging all 4 sockets into a restart storm, collapsing speeds to 0.1 MB/s, and tripping the 45s watchdog.
+- **The Permanent Fix:**
+  1. **Never Restart on Success:** Removed `chunk_dur > 4.0` socket restart completely. Sockets are NEVER closed when chunks succeed.
+  2. **Timeout Immunity:** Transient `asyncio.TimeoutError` or `"timed out"` no longer tears down sockets. Workers rotate to the next socket (`session_idx += 1`) and retry cleanly.
+  3. **Guarded Transport Restarts:** Sockets are only restarted if `not is_session_alive(target_session)` on fatal transport disconnects (`broken pipe`, `connectionreset`, `handler is closed`, `closed=true`).
+
 
 
 
