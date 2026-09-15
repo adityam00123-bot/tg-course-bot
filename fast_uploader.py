@@ -53,7 +53,8 @@ def is_session_alive(sess: Any) -> bool:
     writer = getattr(protocol, "writer", None)
     transport = getattr(writer, "transport", None) if writer else getattr(protocol, "transport", None)
     if transport is None:
-        return False
+        # If transport cannot be inspected directly, rely on is_started.is_set()
+        return True
     if hasattr(transport, "is_closing") and transport.is_closing():
         return False
     if getattr(transport, "_closed", False):
@@ -305,8 +306,8 @@ async def fast_save_file(
             curr = uploaded_bytes
             history.append((now, curr))
 
-            # Keep only entries from the last 90 seconds
-            while history and (now - history[0][0]) > 90.0:
+            # Keep only entries from the last 45 seconds
+            while history and (now - history[0][0]) > 45.0:
                 history.pop(0)
 
             # If client is legitimately waiting out a FloodWait, pause watchdog counter
@@ -328,20 +329,18 @@ async def fast_save_file(
                     stall_rounds = 0
 
                 # 2. Cumulative Rolling Average Check:
-                # Never abort an upload that is making forward progress. Telegram server token-refill
-                # pauses frequently drop 60s throughput to 0.2-0.4 MB/s. Aborting mid-flight discards all
-                # uploaded megabytes and forces restarting from byte 0.
-                # Only abort if speed has been virtually frozen (<0.02 MB/s / ~20 KB/s) for >90s
-                # AND less than 10% of the file has been uploaded.
-                if file_size > 30 * 1024 * 1024 and len(history) >= 18 and (curr < file_size * 0.10):
+                # Only evaluate when transmission is actively progressing (stall_rounds == 0)
+                # and after at least 35s of sustained history, to prevent false triggers during DC pauses.
+                # If speed drops below 1.0 MB/s sustained, abort for a clean session reset.
+                if file_size > 30 * 1024 * 1024 and stall_rounds == 0 and len(history) >= 7:
                     oldest_t, oldest_b = history[0]
                     span = now - oldest_t
-                    if span >= 90.0:
+                    if span >= 35.0:
                         bytes_moved = curr - oldest_b
                         rolling_mbps = (bytes_moved / (1024 * 1024)) / span
-                        if rolling_mbps < 0.02 and bytes_moved >= 0:
+                        if rolling_mbps < 1.0 and bytes_moved > 0:
                             upload_error = RuntimeError(
-                                f"Upload frozen at near-zero speed (rolling 90s avg: {rolling_mbps:.3f} MB/s) "
+                                f"Upload crawling too slow (rolling 45s avg: {rolling_mbps:.2f} MB/s < 1.0 MB/s) "
                                 f"at {curr / 1048576:.1f}/{file_size / 1048576:.1f} MB. Aborting for fresh reconnect."
                             )
                             break
@@ -435,11 +434,10 @@ async def fast_save_file(
                             target_session = alive_sessions[session_idx % len(alive_sessions)]
                         else:
                             await safe_restart_session(target_session)
-                            await asyncio.sleep(0.2)
+                            await asyncio.sleep(0.1)
                             if not is_session_alive(target_session):
                                 part_attempts += 1
-                                backoff = min(0.2 * (1.5 ** part_attempts), 3.0)
-                                await asyncio.sleep(backoff)
+                                await asyncio.sleep(0.1)
                                 continue
 
                     t_chunk_start = time.time()
@@ -451,9 +449,9 @@ async def fast_save_file(
                         )
                         if res is True or res:
                             part_ack = True
-                            # If a 512KB chunk took unusually long (>6.0s = <85 KB/s), refresh that socket in background
+                            # If a 512KB chunk took unusually long (>4.0s = <128 KB/s), refresh that socket in background
                             chunk_dur = time.time() - t_chunk_start
-                            if chunk_dur > 6.0 and len(sessions) > 1:
+                            if chunk_dur > 4.0 and len(sessions) > 1:
                                 try:
                                     asyncio.create_task(safe_restart_session(target_session))
                                 except Exception:
@@ -474,16 +472,15 @@ async def fast_save_file(
                         )
                         if is_transport_err and target_session:
                             try:
-                                asyncio.create_task(safe_restart_session(target_session))
+                                await safe_restart_session(target_session)
                             except Exception:
                                 pass
                         session_idx += 1  # rotate to next healthy socket in the pool
-                        backoff = min(0.2 * (1.5 ** part_attempts), 3.0)
                         if part_attempts >= 3:
                             logger.warning(
-                                f"⚠️ Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}. (Backoff {backoff:.1f}s)"
+                                f"⚠️ Part {part_idx + 1}/{total_parts} retry {part_attempts}/{max_part_attempts} due to: {err}"
                             )
-                        await asyncio.sleep(backoff)
+                        await asyncio.sleep(0.1)
 
                 if part_ack and part_idx not in completed_parts:
                     async with parts_lock:

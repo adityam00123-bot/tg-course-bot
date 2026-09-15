@@ -131,5 +131,13 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
   3. **Raise-on-Failure:** `_migrate_single_message` raises `RuntimeError` on empty download, ensuring failed messages are permanently tracked in `failed_messages.json` and never prematurely deleted.
   4. **In-Memory ID Fallback:** `_send_progress_update` and `_send_failed_messages_report` query `self.stats.failed_msg_ids` as fallback, guaranteeing failed IDs are always visible in real time.
 
+## 13. Upload Speed Regression Resolution & Zero-Crawl Guard (September 2026)
+- **The Problem:** On the PTC channel (#686–#698), 1.5 GB uploads degraded to 0.2–0.8 MB/s and took >11 minutes.
+- **Root Causes Discovered & Fixed:**
+  1. **Watchdog Neutering:** Commit `01b46c3` lowered the upload watchdog abort threshold to 0.02 MB/s (20 KB/s) and added `curr < file_size * 0.10`. This disabled the watchdog for 90%+ of an upload, allowing sockets to crawl indefinitely at 0.2 MB/s. Reverted to Golden Commit `2e2cbc5` logic: 45s window, evaluated at `span >= 35.0s` when `stall_rounds == 0`, aborting cleanly at `< 1.0 MB/s`.
+  2. **Exponential Backoff Removal:** Chunk retry sleeps were exponentially backing off up to 3.0s, leaving workers idle. Reverted to fixed **0.1s (100ms)** delay.
+  3. **Synchronous Upload Socket Healing:** Workers await deduplicated `safe_restart_session(target_session)` on transport errors instead of fire-and-forget `create_task`, eliminating `NoneType` and `closed=True` collision storms.
+  4. **Reference:** Complete analysis in `UPLOAD_REGRESSION_RESEARCH.md`.
+
 
 
