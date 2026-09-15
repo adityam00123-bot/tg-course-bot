@@ -256,8 +256,8 @@ async def fast_save_file(
             test_mode = await self.storage.test_mode()
             auth_key = await self.storage.auth_key()
 
-            # 5 Parallel Media TCP sockets = ~25-40 MB/s sustained upload throughput
-            num_sessions = 5 if total_parts > 30 else (3 if total_parts > 4 else 1)
+            # 3-4 Parallel Media TCP sockets = ~25-40 MB/s sustained upload throughput
+            num_sessions = 4 if total_parts > 30 else (3 if total_parts > 4 else 1)
             for _ in range(num_sessions):
                 try:
                     s = Session(
@@ -449,9 +449,9 @@ async def fast_save_file(
                         )
                         if res is True or res:
                             part_ack = True
-                            # If a 512KB chunk took unusually long (>8.0s = <64 KB/s), refresh that socket in background
+                            # If a 512KB chunk took unusually long (>4.0s = <128 KB/s), refresh that socket in background
                             chunk_dur = time.time() - t_chunk_start
-                            if chunk_dur > 8.0 and len(sessions) > 1:
+                            if chunk_dur > 4.0 and len(sessions) > 1:
                                 try:
                                     asyncio.create_task(safe_restart_session(target_session))
                                 except Exception:
@@ -1005,9 +1005,9 @@ async def fast_download_media(
 Client.download_media = fast_download_media
 
 
-def install_fast_uploader(client: Client, max_workers: int = 16) -> None:
+def install_fast_uploader(client: Client, max_workers: int = 12) -> None:
     """Installs high-speed verified parallel uploader and downloader on the Pyrogram client instance."""
-    client.max_concurrent_transmissions = min(max_workers, 18)
+    client.max_concurrent_transmissions = min(max_workers, 16)
     client.save_file = fast_save_file.__get__(client, Client)
     client.download_media = fast_download_media.__get__(client, Client)
     logger.info(f"⚡ Fast Verified MTProto Uploader & Downloader active (max_concurrent_transmissions={client.max_concurrent_transmissions}).")

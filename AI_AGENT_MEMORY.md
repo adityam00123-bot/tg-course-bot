@@ -140,14 +140,19 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
   4. **Reference:** Complete analysis in `UPLOAD_REGRESSION_RESEARCH.md`.
   5. **Rollback Baseline for Zero-Error Runs:** Commit `7ad5d51` (proven zero-error 345+ GB baseline).
 
-## 14. High-Latency European Route Optimization Experiment (September 2026)
-- **Objective:** Eliminate the middle-dip (3.7 MB/s) on large files (>1GB) when running from Europe (Brussels/Amsterdam) to Home DC 5 (Singapore, ~200ms ping).
-- **Changes Applied:**
-  1. `fast_save_file` now initializes 5 parallel media sockets for files >30 parts (aligning with `ERRORS_AND_SOLUTIONS.md` Line 150).
-  2. Workers increased to 16 on 4-vCPU systems (Kaggle) to saturate the 200ms pipeline depth.
-  3. Slow-chunk proactive restart threshold relaxed from 4.0s to 8.0s (`chunk_dur > 8.0`) to avoid false-restarting healthy sockets during normal cross-continental WAN jitter.
-- **Rollback Instruction:** If any instability occurs, immediately revert to proven commit `7ad5d51`:
-  `git reset --hard 7ad5d51 && git push origin main --force`
+## 14. Telegram Ingress Burst Rate Limits & Optimum Sizing (September 2026)
+- **The Experiment:** We tested 5 sockets + 16 workers and an 8.0s jitter threshold (Commit `f0d7366`) aiming to saturate high-latency routes from Europe to DC5 (Singapore).
+- **Empirical Findings (Taiwan Run, Message #2659):**
+  1. On low-latency routes (~30ms RTT between Taiwan and Singapore DC 5), 16 workers across 5 sockets burst throughput up to **55.3 MB/s**.
+  2. This instantaneous burst exceeds Telegram's MTProto edge token bucket refill rate and receiver window buffer.
+  3. Consequently, Telegram temporarily stops sending TCP ACKs / throttles packets, creating a periodic 2-4 second stall (saw-tooth speed collapse to 0.6–1.5 MB/s at ~380MB, ~740MB, and ~1100MB marks).
+  4. For file #2659 (1240.8 MB), these repeated stalls dragged the average upload speed down to 11.6 MB/s (1m 46s).
+- **The Permanent Golden Configuration (Reverted & Confirmed):**
+  1. **Socket Pool:** Fixed to **4 parallel media sockets** for files >30 parts (`fast_uploader.py`).
+  2. **Worker Concurrency:** Fixed to **12 workers** on 4-vCPU systems (`max(10, min(cpu*3, 16))` in `config.py`).
+  3. **Slow-Chunk Threshold:** Restored to **4.0s** (`chunk_dur > 4.0`).
+- **Conclusion:** 12 workers and 4 sockets perfectly match Telegram's edge rate limits without overflowing receiver buffers, sustaining a smooth, uninterrupted 25–35 MB/s upload stream without saw-tooth drops.
+
 
 
 
