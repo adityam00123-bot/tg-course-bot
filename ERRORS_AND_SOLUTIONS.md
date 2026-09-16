@@ -372,5 +372,7 @@
   1. **Carriage Return Buffering:** The ticker task printed progress using only `\r` with `end=""`. Kaggle web UI parses stdout line-by-line using newline `\n`. Without newlines, Kaggle holds the buffer until process termination or cancellation.
   2. **12s MTProto Invoke Timeout:** Telegram DC edge servers flush 24 MB chunks to disk at ~380 MB intervals, delaying RPC ACKs by 12–14s. A 12-second timeout on `Session.invoke()` caused Pyrogram to cancel the chunk right before Telegram replied, re-sending duplicate chunks and choking the pipeline.
 * **Permanent Fix:**
-  1. In `migration.py` (`_ticker_task`), added a periodic 25-second `logger.info(line.strip())` with a real newline. Kaggle's live execution table displays real-time progress every 25s.
-  2. In `fast_uploader.py`, increased MTProto chunk timeout to `timeout=20` with `asyncio.wait_for(..., timeout=25.0)`, preventing premature timeouts during Telegram storage flushes while keeping worker retry sleeps fixed at 0.1s.
+  1. In `migration.py`, restored clean in-place ticker using `\r` and dynamic space-padding, removing any periodic logging from the ticker loop that collided with carriage returns. `_clear_progress_line()` wipes the line with 160 spaces before milestone logs (`[Downloaded #X]`, `[Uploaded #X]`).
+  2. Smoothed the console EMA speed metric from `0.7 * inst + 0.3 * prev` to `0.3 * inst + 0.7 * prev` so momentary 1-second MTProto packet pauses do not visually collapse the displayed speed.
+  3. Formatted sub-second transfers on tiny files (<500 KB) to display `instant` or `KB/s` instead of rounding down to `0.1 MB/s`.
+  4. In `fast_uploader.py`, increased MTProto chunk timeout to `timeout=20` with `asyncio.wait_for(..., timeout=25.0)`, preventing premature timeouts during Telegram storage flushes while keeping worker retry sleeps fixed at 0.1s.
