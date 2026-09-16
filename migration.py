@@ -439,7 +439,7 @@ class MigrationEngine:
                 db = current - entry["last_bytes"]
                 inst_spd = max(0.0, (db / 1048576) / max(dt, 0.1))
                 if entry["speed"] > 0:
-                    entry["speed"] = 0.7 * inst_spd + 0.3 * entry["speed"]
+                    entry["speed"] = 0.3 * inst_spd + 0.7 * entry["speed"]
                 else:
                     entry["speed"] = inst_spd
                 entry["last_bytes"] = current
@@ -466,7 +466,6 @@ class MigrationEngine:
         Uses \\r to overwrite the same line (works on Kaggle with `python -u`).
         No ANSI escape codes — just carriage return and space-padding."""
         _last_line_len = 0
-        _last_heartbeat_time = time.time()
         while not self.cancel_event.is_set():
             try:
                 await asyncio.sleep(1.5)
@@ -510,13 +509,6 @@ class MigrationEngine:
                     sys.stdout.write(f"\r{line}{' ' * pad}")
                     sys.stdout.flush()
                     _last_line_len = len(line)
-
-                    # Periodic newline heartbeat every 25s so Kaggle/Jupyter web UI flushes
-                    # live progress entries and never appears frozen during multi-minute transfers
-                    if now_tick - _last_heartbeat_time >= 25.0:
-                        self._clear_progress_line()
-                        logger.info(line.strip())
-                        _last_heartbeat_time = now_tick
             except asyncio.CancelledError:
                 break
             except Exception:
