@@ -443,10 +443,10 @@ async def fast_save_file(
 
                     t_chunk_start = time.time()
                     try:
-                        # 12s MTProto timeout with retries=1 and 20s wait_for wrapper prevents indefinite hang
+                        # 20s MTProto timeout with retries=1 and 25s wait_for wrapper prevents false timeouts during DC token refill / storage commit
                         res = await asyncio.wait_for(
-                            target_session.invoke(rpc, timeout=12, retries=1, sleep_threshold=60),
-                            timeout=20.0
+                            target_session.invoke(rpc, timeout=20, retries=1, sleep_threshold=60),
+                            timeout=25.0
                         )
                         if res is True or res:
                             part_ack = True

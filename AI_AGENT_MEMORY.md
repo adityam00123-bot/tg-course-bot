@@ -174,6 +174,16 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
   2. **0.5 MB/s Crawl Cutoff:** Abort threshold set to `< 0.5 MB/s` (genuine crawl). A 50 MB burst over 60s is $0.83\text{ MB/s} > 0.5\text{ MB/s}$, completely immune to false triggers.
   3. **Progress Protection:** Abort only applies if `curr < file_size * 0.50`. Never discard >50% completed transfers mid-flight.
 
+## 17. Kaggle UI Heartbeat Logging & MTProto Storage Commit Pause Tolerance (September 2026)
+- **The Incident (Observed on #5567, 1387.5 MB Video):**
+  1. **UI Blindness:** The progress ticker used strictly `\r` (carriage return) without newline `\n`. Kaggle/Jupyter web table views only generate a new log row upon receiving a newline. For 11 minutes while uploading, no newline was output, making the session appear completely frozen on `[Downloaded #5567]`.
+  2. **12s MTProto Premature Chunk Timeout:** At the ~380 MB mark on large files, Telegram DC edge servers flush in-memory chunks to distributed storage, causing RPC acknowledgement pauses of 12–14s. With `timeout=12` on `target_session.invoke()`, Pyrogram threw `TimeoutError` right before Telegram acknowledged, triggering worker retries and duplicate chunk transmissions that throttled progress to 1.6 MB/s.
+- **The Permanent Solutions:**
+  1. **Periodic Ticker Heartbeat:** In `migration.py` (`_ticker_task`), emit a timestamped `logger.info(line.strip())` with a real newline every 25 seconds. Kaggle's live execution table receives regular updates, ensuring the screen is never blind.
+  2. **20s RPC Timeout with 25s Asyncio Wrapper:** In `fast_uploader.py`, increased MTProto invoke timeout to `timeout=20` wrapped in `asyncio.wait_for(..., timeout=25.0)`, safely outlasting DC storage commit pauses without false timeouts or duplicate chunk re-transmissions.
+  3. **Strict Non-Exponential Retry:** Preserved fixed `0.1s` retry delay to avoid idle worker latency (preventing the regression documented in `UPLOAD_REGRESSION_RESEARCH.md`).
+
+
 
 
 

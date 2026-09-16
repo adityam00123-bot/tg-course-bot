@@ -359,3 +359,18 @@
   1. Extended rolling history to **60 seconds** and only evaluate at `span >= 50.0s` (`len(history) >= 10`), comfortably outlasting Telegram's 20–30s token refill pauses.
   2. Set crawl abort threshold to `< 0.5 MB/s` (genuine crawl). A 50 MB burst over 60s is $0.83\text{ MB/s} > 0.5\text{ MB/s}$, completely immune to false triggers.
   3. Added progress guard `curr < file_size * 0.50`, preventing accidental discard of transfers that are already more than half completed.
+
+---
+
+## 11. Kaggle Terminal Invisibility & MTProto Storage Commit Timeouts (September 2026)
+
+### Error: `Upload appears frozen for 10+ minutes after download finishes; 1.4 GB files throttle to 1.6 MB/s due to 12s chunk timeouts.`
+* **Symptom:**
+  1. In Kaggle Notebooks, after a large video finishes downloading, the terminal output does not update for 10–11 minutes. The user cancels thinking the script hung, and upon cancellation, hundreds of upload ticker lines suddenly dump into the log.
+  2. Upload speed drops from 40 MB/s down to 1.6 MB/s after uploading ~380 MB, advancing in 24 MB bursts every 15 seconds.
+* **Root Cause:**
+  1. **Carriage Return Buffering:** The ticker task printed progress using only `\r` with `end=""`. Kaggle web UI parses stdout line-by-line using newline `\n`. Without newlines, Kaggle holds the buffer until process termination or cancellation.
+  2. **12s MTProto Invoke Timeout:** Telegram DC edge servers flush 24 MB chunks to disk at ~380 MB intervals, delaying RPC ACKs by 12–14s. A 12-second timeout on `Session.invoke()` caused Pyrogram to cancel the chunk right before Telegram replied, re-sending duplicate chunks and choking the pipeline.
+* **Permanent Fix:**
+  1. In `migration.py` (`_ticker_task`), added a periodic 25-second `logger.info(line.strip())` with a real newline. Kaggle's live execution table displays real-time progress every 25s.
+  2. In `fast_uploader.py`, increased MTProto chunk timeout to `timeout=20` with `asyncio.wait_for(..., timeout=25.0)`, preventing premature timeouts during Telegram storage flushes while keeping worker retry sleeps fixed at 0.1s.
