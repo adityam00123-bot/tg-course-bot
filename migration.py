@@ -514,6 +514,7 @@ class MigrationEngine:
                     # Periodic newline heartbeat every 25s so Kaggle/Jupyter web UI flushes
                     # live progress entries and never appears frozen during multi-minute transfers
                     if now_tick - _last_heartbeat_time >= 25.0:
+                        self._clear_progress_line()
                         logger.info(line.strip())
                         _last_heartbeat_time = now_tick
             except asyncio.CancelledError:
@@ -1636,10 +1637,14 @@ class MigrationEngine:
                         await asyncio.sleep(wait_sec)
                         continue
 
-                    dur = time.time() - dl_start_t
-                    spd = (actual_size / 1048576) / max(dur, 0.1)
+                    dur = max(time.time() - dl_start_t, 0.01)
+                    if actual_size < 500 * 1024 and dur < 0.5:
+                        spd_display = "instant" if dur < 0.1 else f"{(actual_size / 1024) / dur:.0f} KB/s"
+                    else:
+                        spd = (actual_size / 1048576) / dur
+                        spd_display = f"{spd:.1f} MB/s"
                     self._clear_progress_line()
-                    logger.info(f"✅ [Downloaded #{msg.id}] {file_name_display} ({actual_size / 1048576:.1f} MB) in {format_seconds(dur)} ({spd:.1f} MB/s)")
+                    logger.info(f"✅ [Downloaded #{msg.id}] {file_name_display} ({actual_size / 1048576:.1f} MB) in {format_seconds(dur)} ({spd_display})")
 
                     p = Path(downloaded)
                     # Ensure the downloaded file has a valid photo extension for Telegram send_photo
@@ -2284,10 +2289,14 @@ class MigrationEngine:
                 if os.path.exists(upload_path):
                     file_bytes = Path(upload_path).stat().st_size
                     self.stats.total_bytes_migrated += file_bytes
-                    dur = time.time() - up_start_t
-                    spd = (file_bytes / 1048576) / max(dur, 0.1)
+                    dur = max(time.time() - up_start_t, 0.01)
+                    if file_bytes < 500 * 1024 and dur < 0.5:
+                        spd_display = "instant" if dur < 0.1 else f"{(file_bytes / 1024) / dur:.0f} KB/s"
+                    else:
+                        spd = (file_bytes / 1048576) / dur
+                        spd_display = f"{spd:.1f} MB/s"
                     self._clear_progress_line()
-                    logger.info(f"✅ [Uploaded #{msg.id}] {up_name} ({file_bytes / 1048576:.1f} MB) in {format_seconds(dur)} ({spd:.1f} MB/s) & ready for fast-publish")
+                    logger.info(f"✅ [Uploaded #{msg.id}] {up_name} ({file_bytes / 1048576:.1f} MB) in {format_seconds(dur)} ({spd_display}) & ready for fast-publish")
 
 
         except asyncio.CancelledError:
