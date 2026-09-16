@@ -163,6 +163,17 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
   2. **Timeout Immunity:** Transient `asyncio.TimeoutError` or `"timed out"` no longer tears down sockets. Workers rotate to the next socket (`session_idx += 1`) and retry cleanly.
   3. **Guarded Transport Restarts:** Sockets are only restarted if `not is_session_alive(target_session)` on fatal transport disconnects (`broken pipe`, `connectionreset`, `handler is closed`, `closed=true`).
 
+## 16. Elimination of ~50 MB Early Upload Watchdog False Aborts (September 2026)
+- **The Incident (Observed on #4376, #4382, #4398, #4405, #4423, #4564):**
+  1. With 12 workers uploading at 30–37 MB/s, the first ~50 MB is delivered in just 2–3 seconds.
+  2. This rapid burst temporarily saturates Telegram's MTProto edge-server ingress token bucket, prompting a 20–30s RPC acknowledgement pause while server-side storage commits chunks.
+  3. The upload watchdog evaluated speed after only 35s (`span >= 35.0s`, `rolling_mbps < 1.0`). Over that 45s window, the 40–50 MB burst calculated to $0.85\text{--}0.91\text{ MB/s}$.
+  4. Because $0.87 < 1.0\text{ MB/s}$, the watchdog falsely aborted healthy uploads as "crawling too slow", wiped the progress, and forced Attempt 2 (which passed immediately at 25–35 MB/s once Telegram's token pause ended).
+- **The Permanent Safeguard:**
+  1. **60-Second Window:** Increased rolling history to 60s and evaluate at `span >= 50.0s` (`len(history) >= 10`), comfortably outlasting Telegram's 20–30s token refill pauses.
+  2. **0.5 MB/s Crawl Cutoff:** Abort threshold set to `< 0.5 MB/s` (genuine crawl). A 50 MB burst over 60s is $0.83\text{ MB/s} > 0.5\text{ MB/s}$, completely immune to false triggers.
+  3. **Progress Protection:** Abort only applies if `curr < file_size * 0.50`. Never discard >50% completed transfers mid-flight.
+
 
 
 

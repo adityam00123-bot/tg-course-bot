@@ -344,3 +344,18 @@
      - Created `get_failed_messages_details()` to extract IDs, errors, and timestamps from `failed_messages.json`.
      - In `migration.py`, `_send_failed_messages_report()` automatically sends a detailed list to the owner upon migration completion. If $>15$ files failed, it exports and uploads a formatted `.txt` report file.
      - Direct prompt to run `/retry_failed` to recover only the missed items with 1 click.
+
+---
+
+## 10. Early Upload Watchdog False Aborts at ~50 MB (September 2026)
+
+### Error: `Upload crawling too slow (rolling 45s avg: 0.87 MB/s < 1.0 MB/s) at ~50 MB. Aborting for fresh reconnect.`
+* **Symptom:** Files burst to 35 MB/s, pause at ~50 MB for 20–30s, and then get aborted on Attempt 1 by the stall watchdog. Attempt 2 starts 2s later and immediately succeeds at 25–35 MB/s without issues.
+* **Root Cause:**
+  1. Telegram's MTProto edge-server ingress token bucket (~120–150 MB) empties rapidly when 12 workers push at 35 MB/s.
+  2. Telegram pauses RPC acknowledgements for 20–30 seconds to commit chunks and refill tokens.
+  3. The upload watchdog evaluated average speed after only 35 seconds (`span >= 35.0s`, `rolling_mbps < 1.0`). Over 45 seconds, the initial 40–50 MB burst calculated to $0.85\text{--}0.91\text{ MB/s}$, falsely tripping the 1.0 MB/s cutoff.
+* **Permanent Fix:**
+  1. Extended rolling history to **60 seconds** and only evaluate at `span >= 50.0s` (`len(history) >= 10`), comfortably outlasting Telegram's 20–30s token refill pauses.
+  2. Set crawl abort threshold to `< 0.5 MB/s` (genuine crawl). A 50 MB burst over 60s is $0.83\text{ MB/s} > 0.5\text{ MB/s}$, completely immune to false triggers.
+  3. Added progress guard `curr < file_size * 0.50`, preventing accidental discard of transfers that are already more than half completed.

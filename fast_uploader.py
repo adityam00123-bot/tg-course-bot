@@ -306,8 +306,8 @@ async def fast_save_file(
             curr = uploaded_bytes
             history.append((now, curr))
 
-            # Keep only entries from the last 45 seconds
-            while history and (now - history[0][0]) > 45.0:
+            # Keep only entries from the last 60 seconds
+            while history and (now - history[0][0]) > 60.0:
                 history.pop(0)
 
             # If client is legitimately waiting out a FloodWait, pause watchdog counter
@@ -329,18 +329,19 @@ async def fast_save_file(
                     stall_rounds = 0
 
                 # 2. Cumulative Rolling Average Check:
-                # Only evaluate when transmission is actively progressing (stall_rounds == 0)
-                # and after at least 35s of sustained history, to prevent false triggers during DC pauses.
-                # If speed drops below 1.0 MB/s sustained, abort for a clean session reset.
-                if file_size > 30 * 1024 * 1024 and stall_rounds == 0 and len(history) >= 7:
+                # Evaluated over a full 50-60s window (span >= 50.0s, len >= 10 samples)
+                # to comfortably outlast Telegram's 20-30s token bucket refill / DC commit pauses.
+                # Only abort early in the upload (curr < 50% of file) if speed is a genuine crawl (< 0.5 MB/s).
+                # Never abort an upload that is already >50% completed or moving at healthy speed.
+                if file_size > 30 * 1024 * 1024 and stall_rounds == 0 and len(history) >= 10 and (curr < file_size * 0.50):
                     oldest_t, oldest_b = history[0]
                     span = now - oldest_t
-                    if span >= 35.0:
+                    if span >= 50.0:
                         bytes_moved = curr - oldest_b
                         rolling_mbps = (bytes_moved / (1024 * 1024)) / span
-                        if rolling_mbps < 1.0 and bytes_moved > 0:
+                        if rolling_mbps < 0.5 and bytes_moved > 0:
                             upload_error = RuntimeError(
-                                f"Upload crawling too slow (rolling 45s avg: {rolling_mbps:.2f} MB/s < 1.0 MB/s) "
+                                f"Upload crawling too slow (rolling 60s avg: {rolling_mbps:.2f} MB/s < 0.5 MB/s) "
                                 f"at {curr / 1048576:.1f}/{file_size / 1048576:.1f} MB. Aborting for fresh reconnect."
                             )
                             break
