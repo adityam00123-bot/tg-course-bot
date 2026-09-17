@@ -306,8 +306,8 @@ async def fast_save_file(
             curr = uploaded_bytes
             history.append((now, curr))
 
-            # Keep only entries from the last 60 seconds
-            while history and (now - history[0][0]) > 60.0:
+            # Keep only entries from the last 45 seconds
+            while history and (now - history[0][0]) > 45.0:
                 history.pop(0)
 
             # If client is legitimately waiting out a FloodWait, pause watchdog counter
@@ -329,19 +329,18 @@ async def fast_save_file(
                     stall_rounds = 0
 
                 # 2. Cumulative Rolling Average Check:
-                # Evaluated over a full 50-60s window (span >= 50.0s, len >= 10 samples)
-                # to comfortably outlast Telegram's 20-30s token bucket refill / DC commit pauses.
-                # Only abort early in the upload (curr < 50% of file) if speed is a genuine crawl (< 0.5 MB/s).
-                # Never abort an upload that is already >50% completed or moving at healthy speed.
-                if file_size > 30 * 1024 * 1024 and stall_rounds == 0 and len(history) >= 10 and (curr < file_size * 0.50):
+                # Only evaluate when transmission is actively progressing (stall_rounds == 0)
+                # and after at least 35s of sustained history, to prevent false triggers during DC pauses.
+                # If speed drops below 1.0 MB/s sustained, abort for a clean session reset.
+                if file_size > 30 * 1024 * 1024 and stall_rounds == 0 and len(history) >= 7:
                     oldest_t, oldest_b = history[0]
                     span = now - oldest_t
-                    if span >= 50.0:
+                    if span >= 35.0:
                         bytes_moved = curr - oldest_b
                         rolling_mbps = (bytes_moved / (1024 * 1024)) / span
-                        if rolling_mbps < 0.5 and bytes_moved > 0:
+                        if rolling_mbps < 1.0 and bytes_moved > 0:
                             upload_error = RuntimeError(
-                                f"Upload crawling too slow (rolling 60s avg: {rolling_mbps:.2f} MB/s < 0.5 MB/s) "
+                                f"Upload crawling too slow (rolling 45s avg: {rolling_mbps:.2f} MB/s < 1.0 MB/s) "
                                 f"at {curr / 1048576:.1f}/{file_size / 1048576:.1f} MB. Aborting for fresh reconnect."
                             )
                             break
@@ -443,28 +442,35 @@ async def fast_save_file(
 
                     t_chunk_start = time.time()
                     try:
-                        # 20s MTProto timeout with retries=1 and 25s wait_for wrapper prevents false timeouts during DC token refill / storage commit
+                        # 12s MTProto timeout with retries=1 and 20s wait_for wrapper prevents indefinite hang
                         res = await asyncio.wait_for(
-                            target_session.invoke(rpc, timeout=20, retries=1, sleep_threshold=60),
-                            timeout=25.0
+                            target_session.invoke(rpc, timeout=12, retries=1, sleep_threshold=60),
+                            timeout=20.0
                         )
                         if res is True or res:
                             part_ack = True
+                            # If a 512KB chunk took unusually long (>4.0s = <128 KB/s), refresh that socket in background
+                            chunk_dur = time.time() - t_chunk_start
+                            if chunk_dur > 4.0 and len(sessions) > 1:
+                                try:
+                                    asyncio.create_task(safe_restart_session(target_session))
+                                except Exception:
+                                    pass
                             break
                     except Exception as err:
                         part_attempts += 1
                         err_str = str(err).lower()
-                        # Auto-recover genuinely broken or closed socket without dropping parts
-                        # Do NOT restart session on transient timeouts (restarting tears down socket for all other workers!)
-                        is_transport_dead = (
-                            isinstance(err, (ConnectionError, OSError))
+                        # Auto-recover broken or closed socket without dropping parts
+                        is_transport_err = (
+                            isinstance(err, (AttributeError, ConnectionError, OSError, asyncio.TimeoutError))
                             or any(k in err_str for k in (
                                 "broken pipe", "connectionreset", "connectionlost",
                                 "handler is closed", "tcptransport", "operation on",
-                                "closed=true", "attribute 'send'", "'send'", "closed"
+                                "closed=true", "timed out", "timeout", "nonetype",
+                                "attribute 'send'", "'send'", "closed"
                             ))
                         )
-                        if is_transport_dead and target_session and not is_session_alive(target_session):
+                        if is_transport_err and target_session:
                             try:
                                 await safe_restart_session(target_session)
                             except Exception:
@@ -887,12 +893,11 @@ async def fast_download_media(
                                 if any(k in err_l for k in ("file_reference_expired", "filereferenceexpired")):
                                     dl_error = err
                                     break
-                                if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "handler is closed", "tcptransport", "operation on", "closed=true")):
-                                    if target_session and not is_session_alive(target_session):
-                                        try:
-                                            asyncio.create_task(safe_restart_session(target_session))
-                                        except Exception:
-                                            pass
+                                if any(k in err_l for k in ("broken pipe", "connectionreset", "connectionlost", "timed out", "timeout", "handler is closed", "tcptransport", "operation on", "closed=true")):
+                                    try:
+                                        asyncio.create_task(safe_restart_session(target_session))
+                                    except Exception:
+                                        pass
                                 session_idx += 1  # rotate to next healthy socket immediately
                                 if part_attempts >= max_part_attempts:
                                     dl_error = err

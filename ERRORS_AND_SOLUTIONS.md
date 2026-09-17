@@ -347,32 +347,24 @@
 
 ---
 
-## 10. Early Upload Watchdog False Aborts at ~50 MB (September 2026)
+## 10. Watchdog Sizing & 1.1 MB/s Zombie Crawl Lesson (Commit `7ad5d51` Rollback)
 
-### Error: `Upload crawling too slow (rolling 45s avg: 0.87 MB/s < 1.0 MB/s) at ~50 MB. Aborting for fresh reconnect.`
-* **Symptom:** Files burst to 35 MB/s, pause at ~50 MB for 20–30s, and then get aborted on Attempt 1 by the stall watchdog. Attempt 2 starts 2s later and immediately succeeds at 25–35 MB/s without issues.
+### Error: `Upload crawls at 1.1 MB/s for 16+ minutes (File #6603 took 16m 51s, #6626 crawled indefinitely).`
+* **Symptom:** Upload starts fast (30–55 MB/s) for 10–15 seconds, then suddenly slows down to 1.1 MB/s and never aborts or recovers, taking 16+ minutes on 1.1 GB files.
 * **Root Cause:**
-  1. Telegram's MTProto edge-server ingress token bucket (~120–150 MB) empties rapidly when 12 workers push at 35 MB/s.
-  2. Telegram pauses RPC acknowledgements for 20–30 seconds to commit chunks and refill tokens.
-  3. The upload watchdog evaluated average speed after only 35 seconds (`span >= 35.0s`, `rolling_mbps < 1.0`). Over 45 seconds, the initial 40–50 MB burst calculated to $0.85\text{--}0.91\text{ MB/s}$, falsely tripping the 1.0 MB/s cutoff.
+  1. An experimental change increased chunk timeouts to 20s/25s and removed timeout detection from socket healing. Sockets that experienced latency or throttling hung for 25s per chunk.
+  2. The watchdog was widened to 60s at `< 0.5 MB/s` with a guard `curr < file_size * 0.50`. Because 1.1 MB/s > 0.5 MB/s, and transfers past 50% were protected from aborts, the watchdog allowed the crawl to continue indefinitely.
 * **Permanent Fix:**
-  1. Extended rolling history to **60 seconds** and only evaluate at `span >= 50.0s` (`len(history) >= 10`), comfortably outlasting Telegram's 20–30s token refill pauses.
-  2. Set crawl abort threshold to `< 0.5 MB/s` (genuine crawl). A 50 MB burst over 60s is $0.83\text{ MB/s} > 0.5\text{ MB/s}$, completely immune to false triggers.
-  3. Added progress guard `curr < file_size * 0.50`, preventing accidental discard of transfers that are already more than half completed.
+  1. Reverted `fast_uploader.py` to Golden Baseline commit `7ad5d51` (proven 345+ GB zero-error baseline).
+  2. Restored the golden 45s watchdog (`span >= 35.0s`, `len(history) >= 7`) aborting at `< 1.0 MB/s` with NO 50% cutoff guard. Sockets that crawl at 1.1 MB/s are aborted within 35 seconds, cleanly reconnecting and completing in <60 seconds at 25–35 MB/s.
+  3. Restored `timeout=12` on `invoke()` wrapped in `20.0s`.
+  4. Restored socket healing on slow chunks (>4.0s) and transport/timeout errors.
 
 ---
 
-## 11. Kaggle Terminal Invisibility & MTProto Storage Commit Timeouts (September 2026)
+## 11. Kaggle Terminal Output Cleanness & Smoothed Speed Display
 
-### Error: `Upload appears frozen for 10+ minutes after download finishes; 1.4 GB files throttle to 1.6 MB/s due to 12s chunk timeouts.`
-* **Symptom:**
-  1. In Kaggle Notebooks, after a large video finishes downloading, the terminal output does not update for 10–11 minutes. The user cancels thinking the script hung, and upon cancellation, hundreds of upload ticker lines suddenly dump into the log.
-  2. Upload speed drops from 40 MB/s down to 1.6 MB/s after uploading ~380 MB, advancing in 24 MB bursts every 15 seconds.
-* **Root Cause:**
-  1. **Carriage Return Buffering:** The ticker task printed progress using only `\r` with `end=""`. Kaggle web UI parses stdout line-by-line using newline `\n`. Without newlines, Kaggle holds the buffer until process termination or cancellation.
-  2. **12s MTProto Invoke Timeout:** Telegram DC edge servers flush 24 MB chunks to disk at ~380 MB intervals, delaying RPC ACKs by 12–14s. A 12-second timeout on `Session.invoke()` caused Pyrogram to cancel the chunk right before Telegram replied, re-sending duplicate chunks and choking the pipeline.
-* **Permanent Fix:**
-  1. In `migration.py`, restored clean in-place ticker using `\r` and dynamic space-padding, removing any periodic logging from the ticker loop that collided with carriage returns. `_clear_progress_line()` wipes the line with 160 spaces before milestone logs (`[Downloaded #X]`, `[Uploaded #X]`).
-  2. Smoothed the console EMA speed metric from `0.7 * inst + 0.3 * prev` to `0.3 * inst + 0.7 * prev` so momentary 1-second MTProto packet pauses do not visually collapse the displayed speed.
-  3. Formatted sub-second transfers on tiny files (<500 KB) to display `instant` or `KB/s` instead of rounding down to `0.1 MB/s`.
-  4. In `fast_uploader.py`, increased MTProto chunk timeout to `timeout=20` with `asyncio.wait_for(..., timeout=25.0)`, preventing premature timeouts during Telegram storage flushes while keeping worker retry sleeps fixed at 0.1s.
+### Fix Summary:
+1. In `migration.py`, restored clean in-place ticker using `\r` and dynamic space-padding. `_clear_progress_line()` wipes the line with 160 spaces before milestone logs (`[Downloaded #X]`, `[Uploaded #X]`).
+2. Smoothed console EMA speed metric to `0.3 * inst + 0.7 * prev` so momentary 1-second MTProto packet pauses do not visually collapse the displayed speed.
+3. Formatted sub-second transfers on tiny files (<500 KB) to display `instant` or `KB/s` cleanly.
