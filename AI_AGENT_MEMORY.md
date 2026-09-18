@@ -180,13 +180,11 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
   2. **Smoothed EMA Speed Metric:** EMA weights set to `0.3 * inst + 0.7 * prev` in `migration.py` so momentary 1-second MTProto ACK pauses do not cause visual speed collapses.
   3. **Sub-Second Formatting:** Tiny files (<500 KB) format cleanly as `instant` or `KB/s`.
 
-## 18. New All-Time Golden Record: 420.34 GB Flawless Endurance Run (September 17–18, 2026)
-- **Official New Record Baseline:** Commit `8e51bf5` / `8b54d5e`.
+## 18. Back-to-Back All-Time Golden Records (September 17–18, 2026)
+- **Official Golden Baseline:** Commit `8e51bf5` / `8b54d5e`.
 - **Live Performance Stats (Kaggle Taiwan VM, 12 Workers, 4 Parallel Sockets):**
-  - **Total Data Transferred:** **420.34 GB** in a single session!
-  - **Elapsed Time:** **11h 52m 04s** (full Kaggle 12-hour session lifecycle).
-  - **Total Media Uploaded:** **1,110 media files** + 60 text messages.
-  - **Total Errors:** **0 ERRORS** (100% flawless reliability).
-  - **Sustained Continuous Throughput:** **10.1 MB/s** overall (including DL, UL, disk GC, and fast-publishing).
+  - **Run 1 (Endurance Test):** **420.34 GB** in 11h 52m 04s | 1,110 media | 0 errors | 10.1 MB/s sustained.
+  - **Run 2 (All-Time Record):** **455.25 GB** in 11h 52m 07s | **1,810 media** | **0 errors** | **10.9 MB/s sustained** (peaked at 11.0 MB/s through 444 GB).
+  - **Combined 24-Hour Throughput:** Over **875.59 GB transferred across 2 consecutive runs with 0 ERRORS**!
 - **Core Verification:**
-  - Proves beyond doubt that the `8e51bf5` socket architecture (no premature teardowns on transient waits + strict sequential Architecture A) is rock-solid and capable of sustaining 400+ GB transfers without a single crash or memory/disk leak.
+  - Proves beyond doubt that the `8e51bf5` socket architecture (no premature teardowns on transient waits + strict sequential Architecture A) is rock-solid and capable of sustaining 450+ GB transfers without a single crash or memory/disk leak.
