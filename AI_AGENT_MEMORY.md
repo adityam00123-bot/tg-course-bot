@@ -209,3 +209,19 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
   - Live tested on message #12450 against `-1004415024185` with `CaptionMode.REMOVE` active:
   - Result: `text_count = 1, skipped = 0`. Destination message verified with identical blockquote bar, bold formatting, and text content!
 
+## 20. In-Chat `/update` & `/restart` Remote Management Architecture (September 19, 2026)
+- **Background & Problem:**
+  - In cloud/remote notebook environments (such as Kaggle or Google Cloud Shell), `python main.py` runs as a persistent long-running process in RAM.
+  - When new commits or bug fixes are pushed to GitHub `origin/main`, the running process does NOT magically reload or fetch code.
+  - If a user triggers a test run in Telegram while Kaggle is still running the old RAM process, the old code executes, causing already-fixed issues to appear as recurring bugs.
+  - Furthermore, having to manually interrupt Kaggle cells, type `git pull`, and re-run cells wastes time and interrupts workflow.
+- **Solution:**
+  - Added Super Admin `/update`, `/gitpull`, and `/restart` commands directly into `handlers.py` and `main.py`.
+  - When the Owner issues `/update` in Telegram:
+    1. The bot executes `git pull origin main` via asynchronous subprocess.
+    2. Reports the exact git pull commit diff / summary in Telegram.
+    3. Gracefully unlinks `.bot.lock` to prevent startup lock conflicts.
+    4. Replaces the current process image in-place via `os.execv(sys.executable, [sys.executable] + sys.argv)`.
+    5. On restart, `main.py` broadcasts the online welcome card.
+
+

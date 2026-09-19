@@ -136,6 +136,7 @@ async def main() -> None:
                 BotCommand("scan", "Scan Channel & Calculate Total Size (GB)"),
                 BotCommand("run", "Start/Resume Migration Job"),
                 BotCommand("stop", "Stop Active Migration Job"),
+                BotCommand("update", "Pull Latest Code & Restart Bot (Owner Only)"),
                 BotCommand("help", "View Step-by-Step Guide & Link Formats"),
                 BotCommand("cancel", "Cancel Current Input Step")
             ])

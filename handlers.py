@@ -6,6 +6,8 @@ Action Hubs (Forwarding vs Channel Deletion), Super Admin Panel, and Comparison 
 """
 
 import os
+import sys
+import asyncio
 import shutil
 import logging
 from pathlib import Path
@@ -1309,6 +1311,63 @@ def register_handlers(bot: Client) -> None:
         )
 
     # -------------------------------------------------------------
+    # /update, /gitpull, /restart Command Handlers (Super Admin Only)
+    # -------------------------------------------------------------
+    @bot.on_message(filters.private & filters.command(["update", "gitpull", "restart"]))
+    async def handle_update_restart_command(_, message: Message):
+        user_id = message.from_user.id
+        if not is_admin(user_id):
+            await message.reply_text("⛔ <b>Unauthorized:</b> This command is restricted to the Bot Owner.", parse_mode=enums.ParseMode.HTML)
+            return
+
+        cmd = (message.command[0] if message.command else "update").lower()
+        status_msg = await message.reply_text(
+            f"🔄 <b>Executing <code>/{cmd}</code>...</b>",
+            parse_mode=enums.ParseMode.HTML
+        )
+
+        git_output = ""
+        if cmd in ("update", "gitpull"):
+            try:
+                await status_msg.edit_text("⏳ <i>Running git pull origin main...</i>", parse_mode=enums.ParseMode.HTML)
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "pull", "origin", "main",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await proc.communicate()
+                git_output = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
+            except Exception as ge:
+                git_output = f"Git pull error: {ge}"
+
+        summary_text = (
+            f"🔄 <b>System Update / Restart</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 <b>Git Output:</b>\n<pre>{git_output or 'Direct Process Restart'}</pre>\n\n"
+            f"🚀 <i>Restarting bot process in 2 seconds...</i>"
+        )
+        await status_msg.edit_text(summary_text, parse_mode=enums.ParseMode.HTML)
+        await asyncio.sleep(2)
+
+        # Release lock file so new process can acquire it without conflict
+        try:
+            lock_path = Config.BASE_DIR / Config.LOCK_FILE_NAME
+            if lock_path.exists():
+                lock_path.unlink()
+        except Exception:
+            pass
+
+        # Stop bot client gracefully
+        try:
+            await bot.stop()
+        except Exception:
+            pass
+
+        # In-place process restart
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+    # -------------------------------------------------------------
     # Photo & Document Upload Handler (Custom Thumbnail Cover)
     # -------------------------------------------------------------
     @bot.on_message(filters.private & (filters.photo | filters.document))
@@ -1372,7 +1431,7 @@ def register_handlers(bot: Client) -> None:
     # -------------------------------------------------------------
     # Interactive Text Input State Machine (Links, Watermarks, Captions, Deletion)
     # -------------------------------------------------------------
-    @bot.on_message(filters.private & filters.incoming & ~filters.bot & ~filters.me & filters.text & ~filters.command(["start", "dashboard", "forward", "settings", "bots", "help", "cancel", "run", "stop", "range", "setrange", "scan", "audit", "size"]))
+    @bot.on_message(filters.private & filters.incoming & ~filters.bot & ~filters.me & filters.text & ~filters.command(["start", "dashboard", "forward", "settings", "bots", "help", "cancel", "run", "stop", "range", "setrange", "scan", "audit", "size", "update", "gitpull", "restart", "failed", "retry_failed", "recover"]))
     async def handle_user_text_input(_, message: Message):
         if not message.from_user or message.from_user.is_bot:
             return
