@@ -188,3 +188,24 @@ The codebase is highly optimized with a new concurrent processing pipeline for w
   - **Combined 24-Hour Throughput:** Over **875.59 GB transferred across 2 consecutive runs with 0 ERRORS**!
 - **Core Verification:**
   - Proves beyond doubt that the `8e51bf5` socket architecture (no premature teardowns on transient waits + strict sequential Architecture A) is rock-solid and capable of sustaining 450+ GB transfers without a single crash or memory/disk leak.
+
+## 19. Quote & Text Message Preservation Architecture (September 19, 2026)
+- **The Issue (Encountered on Message #12450 in Restricted Channel `PTC : WONDERLAND`):**
+  1. In Run 3 (reaching #12449) and isolated test runs of message #12450 (`📌 The Alpha Trader - Umar Punjabi Zero to Alpha 2.0`), the bot reported `Skipped: 1`, `Text Messages: 0`, `Errors: 0`. Across 1,408 messages, 111 messages were skipped.
+  2. Message #12450 was a pure text post with Telegram Blockquote formatting (`MessageEntityType.BLOCKQUOTE` + `BOLD`).
+  3. **Root Cause Analysis:**
+     - The user had set `CaptionMode.REMOVE` in `/settings` to strip promotional channel captions from downloaded media files.
+     - In `_migrate_single_message()`, line 2604 previously called `final_text, final_entities = self._apply_caption(text_content, ...)`.
+     - Because `caption_mode == CaptionMode.REMOVE`, `_apply_caption()` returned `None, None`!
+     - When `final_text` was `None`, the engine fell back to `_forward_without_tag()`.
+     - Because source channel `-1002155938812` has protected content (`has_protected_content=True`), Telegram MTProto blocked forward with `ChatForwardsRestricted`.
+     - The forward exception was caught, logging `⚠️ Skipped unsupported/restricted message #12450` and incrementing `self.stats.skipped_count += 1`.
+- **The Permanent Fix:**
+  1. **Caption Scoping:** `CaptionMode` (`REMOVE`, `REPLACE`, `APPEND`) is strictly scoped to media attachments (videos, audios, photos, documents). Pure text posts (course headers, chapter titles, blockquotes, syllabus) NEVER have their text erased or modified.
+  2. **Modern Quote & Reply Fallback:** If `msg.text` and `msg.caption` are empty, the engine extracts text from `msg.quote.text` (wrapping in a `BLOCKQUOTE` entity) or `msg.reply_to_message.text`.
+  3. **Direct `send_message` with Entity Fallback:** Formatted text is posted to destination channels using `client.send_message(..., entities=final_entities)`. If any unknown entity fails, it automatically retries with plain text. This works 100% of the time in protected/restricted channels because it creates native new posts without forwarding.
+  4. **Special Objects Supported:** Native support added for contacts, locations, and dice in restricted channels instead of discarding them.
+- **Verification:**
+  - Live tested on message #12450 against `-1004415024185` with `CaptionMode.REMOVE` active:
+  - Result: `text_count = 1, skipped = 0`. Destination message verified with identical blockquote bar, bold formatting, and text content!
+

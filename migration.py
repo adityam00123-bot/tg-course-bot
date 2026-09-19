@@ -2597,25 +2597,51 @@ class MigrationEngine:
                 logger.error(f"Failed to migrate poll #{msg.id}: {poll_err}")
                 raise RuntimeError(f"Failed to migrate poll #{msg.id}: {poll_err}")
 
-        # 2. Text-only message OR WebPage Link Previews (Mega links, YouTube, URLs)
+        # 2. Text-only message OR WebPage Link Previews OR Quotes (Blockquotes, Replies)
         has_media_file = bool(msg.photo or msg.video or msg.document or msg.audio or msg.voice or msg.video_note or msg.animation or msg.sticker)
         if not has_media_file:
+            # Extract text from text, caption, or modern quote / reply
             text_content = msg.text or msg.caption
-            final_text, final_entities = self._apply_caption(text_content, msg.entities or msg.caption_entities)
+            final_entities = msg.entities or msg.caption_entities
+
+            if not text_content:
+                # Modern Telegram 10.2+ Quote message where text might be in quote or reply
+                if getattr(msg, "quote", None) and getattr(msg.quote, "text", None):
+                    text_content = msg.quote.text
+                    final_entities = msg.quote.entities or [
+                        enums.MessageEntity(type=enums.MessageEntityType.BLOCKQUOTE, offset=0, length=len(text_content))
+                    ]
+                elif getattr(msg, "reply_to_message", None) and getattr(msg.reply_to_message, "text", None):
+                    text_content = msg.reply_to_message.text
+                    final_entities = msg.reply_to_message.entities
+
+            final_text = text_content
+            # NOTE: Caption transformations (REMOVE/REPLACE/APPEND) strictly apply to media attachments (videos/documents).
+            # Pure text/quote posts (course headers, chapter titles, blockquotes) must NEVER have their text erased!
+
             if final_text:
-                sent_txt = await self._execute_with_flood_retry(
-                    self.client.send_message,
-                    chat_id=dest_chat,
-                    text=final_text,
-                    entities=final_entities,
-                    disable_web_page_preview=False
-                )
+                try:
+                    sent_txt = await self._execute_with_flood_retry(
+                        self.client.send_message,
+                        chat_id=dest_chat,
+                        text=final_text,
+                        entities=final_entities,
+                        disable_web_page_preview=False
+                    )
+                except Exception as send_err:
+                    logger.warning(f"⚠️ Sending text with entities failed for #{msg.id} ({send_err}). Retrying plain text...")
+                    sent_txt = await self._execute_with_flood_retry(
+                        self.client.send_message,
+                        chat_id=dest_chat,
+                        text=final_text,
+                        disable_web_page_preview=False
+                    )
                 if sent_txt and hasattr(sent_txt, 'id'):
                     record_message_map(self.config.source_chat_id, dest_chat, msg.id, sent_txt.id)
                 self.stats.text_count += 1
-                logger.debug(f"Migrated text/link message #{msg.id}")
+                logger.info(f"✅ Migrated text/quote message #{msg.id}")
             else:
-                # Try smart forward for Telegram Premium modern layers (without 'Forwarded from' tag)
+                # Try smart clean forward for any non-text objects without media files
                 try:
                     fwd_ok = await self._forward_without_tag(
                         dest_chat=dest_chat,
@@ -2624,12 +2650,12 @@ class MigrationEngine:
                     )
                     if fwd_ok:
                         self.stats.media_count += 1
-                        logger.info(f"⚡ [Smart Clean Forward] Migrated premium message #{msg.id} without forward tag!")
+                        logger.info(f"⚡ [Smart Clean Forward] Migrated message #{msg.id} without forward tag!")
                         return
                     else:
-                        raise ValueError("Forward failed (restricted channel or unsupported media)")
+                        raise ValueError("Forward failed (restricted channel or unsupported message)")
                 except Exception as err:
-                    logger.warning(f"?? Skipped unsupported/restricted message #{msg.id}")
+                    logger.warning(f"⚠️ Skipped unsupported/restricted message #{msg.id}: {err}")
                     self.stats.skipped_count += 1
             return
 
@@ -2651,7 +2677,47 @@ class MigrationEngine:
             if await self._try_instant_server_copy(msg, dest_chat):
                 return
 
-        # 4. Special non-downloadable objects (Dice, Contact, Location)
+        # 4. Special non-downloadable objects (Contact, Location, Venue, Dice)
+        if msg.contact:
+            try:
+                await self._execute_with_flood_retry(
+                    self.client.send_contact,
+                    chat_id=dest_chat,
+                    phone_number=msg.contact.phone_number,
+                    first_name=msg.contact.first_name,
+                    last_name=msg.contact.last_name or "",
+                    vcard=msg.contact.vcard
+                )
+                self.stats.text_count += 1
+                return
+            except Exception as e:
+                logger.warning(f"Failed to migrate contact #{msg.id}: {e}")
+        elif msg.location or msg.venue:
+            try:
+                loc = msg.location or (msg.venue.location if msg.venue else None)
+                if loc:
+                    await self._execute_with_flood_retry(
+                        self.client.send_location,
+                        chat_id=dest_chat,
+                        latitude=loc.latitude,
+                        longitude=loc.longitude
+                    )
+                    self.stats.text_count += 1
+                    return
+            except Exception as e:
+                logger.warning(f"Failed to migrate location #{msg.id}: {e}")
+        elif msg.dice:
+            try:
+                await self._execute_with_flood_retry(
+                    self.client.send_dice,
+                    chat_id=dest_chat,
+                    emoji=msg.dice.emoji
+                )
+                self.stats.text_count += 1
+                return
+            except Exception as e:
+                logger.warning(f"Failed to migrate dice #{msg.id}: {e}")
+
         if msg.dice or msg.contact or msg.location or msg.venue:
             logger.info(f"Special object #{msg.id} processed.")
             self.stats.skipped_count += 1
