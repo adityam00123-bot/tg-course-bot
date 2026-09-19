@@ -41,6 +41,17 @@ try:
 except Exception:
     pass
 
+# Verify Pyrofork is installed (required for modern Telegram Layer 167+ blockquotes & media)
+try:
+    from pyrogram import enums
+    if not hasattr(enums.MessageEntityType, "BLOCKQUOTE"):
+        import subprocess
+        print("⚠️ Standard Pyrogram detected without modern Layer support. Auto-installing pyrofork==2.3.69...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "pyrofork==2.3.69", "--force-reinstall"])
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+except Exception:
+    pass
+
 from pyrogram import idle
 from pyrogram.types import BotCommand
 from pyrogram.errors import (

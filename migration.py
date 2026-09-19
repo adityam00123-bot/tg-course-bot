@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional, Union, Callable, Awaitable, List, Any, Dict, Tuple
 
 from pyrogram import Client, enums, raw
-from pyrogram.types import Message
+from pyrogram.types import Message, MessageEntity
 from pyrogram.errors import (
     RPCError,
     FloodWait,
@@ -2600,12 +2600,12 @@ class MigrationEngine:
         # 2. Text-only message OR WebPage Link Previews OR Quotes (Blockquotes, Replies)
         has_media_file = bool(msg.photo or msg.video or msg.document or msg.audio or msg.voice or msg.video_note or msg.animation or msg.sticker)
         if not has_media_file:
-            # Extract text from text, caption, or modern quote / reply
+            # Extract text from text, caption, modern quote, raw TL object, or direct MTProto invoke
             text_content = msg.text or msg.caption
             final_entities = msg.entities or msg.caption_entities
 
             if not text_content:
-                # Modern Telegram 10.2+ Quote message where text might be in quote or reply
+                # 1. Modern Telegram 10.2+ Quote message where text might be in quote or reply
                 if getattr(msg, "quote", None) and getattr(msg.quote, "text", None):
                     text_content = msg.quote.text
                     final_entities = msg.quote.entities or [
@@ -2614,6 +2614,44 @@ class MigrationEngine:
                 elif getattr(msg, "reply_to_message", None) and getattr(msg.reply_to_message, "text", None):
                     text_content = msg.reply_to_message.text
                     final_entities = msg.reply_to_message.entities
+
+            if not text_content:
+                # 2. Raw MTProto message fallback (direct from raw TL object)
+                raw_m = getattr(msg, "raw", None)
+                if raw_m and getattr(raw_m, "message", None):
+                    text_content = raw_m.message
+                    if getattr(raw_m, "entities", None) and not final_entities:
+                        try:
+                            final_entities = [
+                                MessageEntity._parse(self.client, e, {})
+                                for e in raw_m.entities
+                            ]
+                        except Exception:
+                            final_entities = None
+
+            if not text_content:
+                # 3. Direct MTProto invoke fallback (bypasses any high-level Pyrogram layer parsing gaps)
+                try:
+                    peer = await self._resolve_peer_cached(self.config.source_chat_id)
+                    res = await self.client.invoke(
+                        raw.functions.channels.GetMessages(
+                            channel=peer,
+                            id=[raw.types.InputMessageID(id=msg.id)]
+                        )
+                    )
+                    if res and res.messages and getattr(res.messages[0], "message", None):
+                        raw_msg_obj = res.messages[0]
+                        text_content = raw_msg_obj.message
+                        if getattr(raw_msg_obj, "entities", None) and not final_entities:
+                            try:
+                                final_entities = [
+                                    MessageEntity._parse(self.client, e, {})
+                                    for e in raw_msg_obj.entities
+                                ]
+                            except Exception:
+                                final_entities = None
+                except Exception as raw_fetch_err:
+                    logger.debug(f"Direct raw MTProto fetch for #{msg.id} failed: {raw_fetch_err}")
 
             final_text = text_content
             # NOTE: Caption transformations (REMOVE/REPLACE/APPEND) strictly apply to media attachments (videos/documents).
@@ -2641,22 +2679,24 @@ class MigrationEngine:
                 self.stats.text_count += 1
                 logger.info(f"✅ Migrated text/quote message #{msg.id}")
             else:
-                # Try smart clean forward for any non-text objects without media files
-                try:
-                    fwd_ok = await self._forward_without_tag(
-                        dest_chat=dest_chat,
-                        source_chat=self.config.source_chat_id,
-                        msg_id=msg.id
-                    )
-                    if fwd_ok:
-                        self.stats.media_count += 1
-                        logger.info(f"⚡ [Smart Clean Forward] Migrated message #{msg.id} without forward tag!")
-                        return
-                    else:
-                        raise ValueError("Forward failed (restricted channel or unsupported message)")
-                except Exception as err:
-                    logger.warning(f"⚠️ Skipped unsupported/restricted message #{msg.id}: {err}")
-                    self.stats.skipped_count += 1
+                # For non-text objects in UNRESTRICTED channels, try clean forward
+                is_restricted = getattr(self, "_chat_forwards_restricted", False)
+                if not is_restricted:
+                    try:
+                        fwd_ok = await self._forward_without_tag(
+                            dest_chat=dest_chat,
+                            source_chat=self.config.source_chat_id,
+                            msg_id=msg.id
+                        )
+                        if fwd_ok:
+                            self.stats.media_count += 1
+                            logger.info(f"⚡ [Smart Clean Forward] Migrated message #{msg.id} without forward tag!")
+                            return
+                    except Exception as fwd_err:
+                        logger.debug(f"Forward failed for #{msg.id}: {fwd_err}")
+
+                logger.warning(f"⚠️ Skipped empty or unsupported non-media message #{msg.id}")
+                self.stats.skipped_count += 1
             return
 
         # 3. Try Instant Server-Side Copy (Bypassed if video needs watermark/thumb/remux, or zip needs extraction)
